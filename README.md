@@ -1,47 +1,51 @@
 # server-infra
 
-Reusable infrastructure repository for one or more VPS servers.
+Reusable server infrastructure managed as code.
 
-The repository does not know about application projects. It only contains infrastructure modules, environment declarations, and operational scripts.
+This repository owns server-level infrastructure only. It does not own application code, application databases, or project-specific deployment logic.
 
-## Core idea
+## Goals
 
-```text
-module + environment + script = configured server
-```
-
-Examples:
-
-```bash
-./scripts/deploy.sh prod-app
-./scripts/health.sh prod-app
-./scripts/logs.sh prod-app monitoring
-```
+- Keep server configuration reproducible.
+- Keep infrastructure independent from applications.
+- Deploy infrastructure modules from explicit environment configuration.
+- Prefer simple shell and Docker Compose over hidden automation.
+- Make every operation safe to repeat.
 
 ## Repository layout
 
 ```text
-AGENTS.md            AI agent instructions
-ARCHITECTURE.md      repository architecture
-bootstrap/           first-time server setup docs/scripts
-proxy/               reverse proxy module
-monitoring/          uptime/log monitoring module
-database/            database module/security backup docs
-security/            security module/docs
-environments/        server declarations and config examples
-scripts/             operational commands
+server-infra/
+├── AGENTS.md
+├── ARCHITECTURE.md
+├── STYLE.md
+├── README.md
+├── rfc/
+├── scripts/
+├── environments/
+├── proxy/
+└── monitoring/
 ```
 
-## Workflow
+## Core model
 
-1. Change files locally.
-2. Commit and push.
-3. On the server:
+- **Environment** describes a server role.
+- **Module** provides one infrastructure capability.
+- **Scripts** apply environments and operate modules.
+- **Applications are outside this repository.**
+
+## Quick start
 
 ```bash
-cd ~/projects/server-infra
-git pull
+./scripts/health.sh prod-app
 ./scripts/deploy.sh prod-app
 ```
 
-Git is the source of truth. The server is not.
+Current scripts are foundation stubs. They validate repository conventions and prepare the deployment flow; service deployment is implemented incrementally.
+
+## Documentation
+
+- `ARCHITECTURE.md` explains the system model.
+- `STYLE.md` defines repository style rules.
+- `AGENTS.md` gives AI-agent instructions.
+- Each module has its own `README.md`.

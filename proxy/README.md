@@ -2,25 +2,44 @@
 
 ## Purpose
 
-Public reverse proxy for HTTP/HTTPS traffic.
+Public reverse proxy for server-level services.
 
 ## Components
 
 - Caddy
 
-## Responsibilities
-
-- terminate HTTPS
-- route public domains to internal services
-- keep service ports closed from the public internet
-
 ## Configuration
 
-- `Caddyfile` contains routes.
-- environment values live in `environments/<env>/proxy/config.env`.
+Environment-specific values belong in:
+
+```text
+environments/<environment>/proxy/config.env
+```
+
+Native Caddy configuration lives in:
+
+```text
+proxy/Caddyfile
+```
 
 ## Deployment
 
+This module is deployed through the environment deploy script:
+
 ```bash
-./scripts/deploy.sh <environment>
+scripts/deploy.sh prod-app
 ```
+
+## Operations
+
+Show logs:
+
+```bash
+scripts/logs.sh prod-app proxy
+```
+
+## Troubleshooting
+
+- Check that ports 80 and 443 are free.
+- Check DNS records for public domains.
+- Check Caddy logs if certificates fail.

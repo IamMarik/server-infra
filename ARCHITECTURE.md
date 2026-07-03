@@ -1,139 +1,96 @@
 # Architecture
 
-## Purpose
+## Mission
 
-`server-infra` is a reusable infrastructure repository for VPS servers.
+`server-infra` manages reusable server-level infrastructure.
 
-It owns:
+It is intentionally independent from applications. The same repository should be able to configure an application server, a database-only server, a monitoring server, or a future staging server by changing only the selected environment.
 
-- reverse proxy
-- monitoring
-- database infrastructure
-- security configuration
-- backup/restore scripts
-- operational scripts
+## Boundaries
 
-It does not own application code.
+This repository owns:
 
-## Main model
+- reverse proxy infrastructure;
+- server monitoring and operational tools;
+- server bootstrap and health scripts;
+- reusable infrastructure module definitions;
+- environment-level infrastructure configuration.
 
-```text
-Infrastructure modules + environment declaration + operational scripts
-```
+This repository does not own:
 
-A module describes what can run.
+- application source code;
+- application business logic;
+- application-specific Docker Compose files;
+- application database schemas or migrations;
+- application-specific deployment scripts.
 
-An environment describes what should run on a specific server.
+## Core concepts
 
-A script applies the environment to the server.
+### Environment
 
-## Repository boundaries
+An environment describes a server role.
 
-This repository should not know about concrete applications by default.
-
-Examples of forbidden hardcoding in scripts:
-
-```text
-ai-tutor-monorepo
-en-mentor
-aevo-ios
-```
-
-Application-specific details may exist only in environment values if they are needed for deployment or routing.
-
-## Modules
-
-Each top-level subsystem is a module:
+Example:
 
 ```text
-proxy/
-monitoring/
-database/
-security/
+environments/prod-app/
+├── server.env
+├── modules.env
+├── proxy/
+└── monitoring/
 ```
 
-A module may contain:
+The environment decides which modules are enabled and provides environment-specific values.
 
-```text
-README.md
-docker-compose.yml
-config/
-scripts/
-```
+### Module
 
-The module must be usable independently through Docker Compose.
-
-## Environments
-
-An environment is a declaration of one server role.
+A module is a reusable server capability.
 
 Examples:
 
-```text
-environments/prod-app
-environments/prod-db
-```
+- `proxy` - public HTTP/HTTPS routing;
+- `monitoring` - uptime checks and container log viewing.
 
-Each environment has:
+A module must not know which application is running on the server.
 
-```text
-environment.yaml
-<module>/config.env.example
-<module>/config.env       # local/server only
-```
+### Script
 
-`environment.yaml` enables modules:
+A script performs one operational action, such as deploy, health, logs, or bootstrap.
 
-```yaml
-name: prod-app
-enabledModules:
-  - proxy
-  - monitoring
-  - security
-```
+Scripts must be idempotent and deterministic. Running the same script multiple times should converge to the same server state.
 
 ## Deployment flow
 
 ```text
-server
+Environment
   ↓
-cd ~/projects/server-infra
+Enabled modules
   ↓
-git pull
+Module docker-compose.yml + environment config
   ↓
-./scripts/deploy.sh <environment>
+Docker Compose
   ↓
-read environment.yaml
-  ↓
-deploy enabled modules
+Running infrastructure services
 ```
 
-## Configuration rules
+The deployment engine should deploy modules generically. It should not contain module-specific branches unless there is a repository-level architectural decision to do so.
 
-- `config.env.example` is committed.
-- `config.env` is not committed.
-- Use native config files where appropriate.
-- Do not put all values into one global env file.
-- Keep module configuration close to the module, and environment values in `environments/`.
+## Configuration model
 
-## Script rules
+Configuration belongs to environments.
 
-Scripts must be:
+Modules define reusable structure. Environments provide concrete values.
 
-- idempotent
-- non-interactive
-- readable
-- safe by default
-- explicit about what they are doing
+Secrets and machine-specific values must not be committed. Commit `*.example` files instead.
 
-A script should be safe to run repeatedly.
+## Engineering principles
 
-## Current direction
-
-The first production setup is expected to use:
-
-- Caddy as reverse proxy
-- Uptime Kuma for availability monitoring
-- Dozzle for Docker logs
-- PostgreSQL/Redis infrastructure if needed
-- simple shell scripts for deploy, health, logs, backup, restore
+1. Git is the source of truth.
+2. Infrastructure never knows applications.
+3. Environments describe servers.
+4. Modules are reusable capabilities.
+5. Scripts are idempotent.
+6. Documentation lives close to the thing it describes.
+7. Prefer explicit configuration over implicit behavior.
+8. Prefer simple shell and Docker Compose before heavier tools.
+9. Ask before changing repository structure.

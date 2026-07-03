@@ -2,20 +2,37 @@
 
 ## Purpose
 
-Operational visibility for the server.
+Server-level monitoring and operational visibility.
 
 ## Components
 
-- Uptime Kuma - availability monitoring
-- Dozzle - Docker log viewer
+- Uptime Kuma - uptime checks and alerts.
+- Dozzle - Docker container logs in a web UI.
 
-## Public routes
+## Configuration
 
-Expected through proxy:
+Environment-specific values belong in:
 
-- status domain -> Uptime Kuma
-- logs domain -> Dozzle
+```text
+environments/<environment>/monitoring/config.env
+```
 
-## Security note
+## Deployment
 
-Dozzle must not be left publicly accessible without authentication or access control.
+```bash
+scripts/deploy.sh prod-app
+```
+
+## Operations
+
+Show logs:
+
+```bash
+scripts/logs.sh prod-app monitoring
+```
+
+## Troubleshooting
+
+- Uptime Kuma listens internally on port `3001`.
+- Dozzle listens internally on port `8080`.
+- Public routing belongs to the proxy module.

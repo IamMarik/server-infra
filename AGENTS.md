@@ -1,39 +1,41 @@
 # AI Agent Instructions
 
-This repository contains infrastructure only.
+This repository contains server-level infrastructure only.
 
-## Scope
-
-- Do not add application code.
-- Do not add project-specific business logic.
-- Do not hardcode application repositories or application names in scripts.
-- Application-specific values belong in environment config files, not in infrastructure code.
-
-## Read first
-
-Before changing anything:
+## Before changing files
 
 1. Read `README.md`.
 2. Read `ARCHITECTURE.md`.
-3. Read the local `README.md` of the subsystem you are changing.
+3. Read `STYLE.md`.
+4. If changing a module, read that module's `README.md`.
+
+## Scope
+
+Do not add application code here.
+Do not add application-specific deployment logic here.
+Do not hardcode project names into infrastructure modules.
+
+Applications belong to their own repositories.
 
 ## Rules
 
-- Git is the source of truth.
+- Keep infrastructure reusable.
 - Keep scripts idempotent.
-- One subsystem owns one `docker-compose.yml`.
-- Do not create new top-level directories without confirmation.
-- Do not introduce a new deployment workflow without confirmation.
-- Prefer extending an existing module over creating a new one.
-- If unsure where a change belongs, stop and ask.
+- Keep modules independent from applications.
+- Do not create new top-level directories without approval.
+- Do not introduce new deployment workflows without approval.
+- Do not duplicate configuration across modules.
+- Prefer extending the existing module contract.
 
-## Configuration
+## Change process
 
-- Environment declarations live in `environments/<env>/environment.yaml`.
-- Module values live in `environments/<env>/<module>/config.env`.
-- Only `config.env.example` files are committed.
-- Real `config.env` files are not committed.
+For non-trivial changes, state the plan first:
 
-## Deployment
+```text
+Plan
+- What changes.
+- What does not change.
+- Which architecture rules are affected.
+```
 
-Scripts must read the selected environment and enabled modules. Scripts must not contain a hardcoded list of servers, apps, or enabled modules.
+If unsure where a change belongs, stop and ask.

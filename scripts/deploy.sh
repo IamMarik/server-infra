@@ -1,92 +1,99 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_NAME="${1:-}"
+set -Eeuo pipefail
 
-if [[ -z "$ENV_NAME" ]]; then
-  echo "Usage: $0 <environment>"
-  echo "Example: $0 prod-app"
-  exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common.sh
+source "$SCRIPT_DIR/common.sh"
 
-ENV_DIR="$ROOT_DIR/environments/$ENV_NAME"
-ENV_FILE="$ENV_DIR/environment.yaml"
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/deploy.sh <environment>
 
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "Environment not found: $ENV_FILE"
-  exit 1
-fi
+Example:
+  scripts/deploy.sh prod-app
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required"
-  exit 1
-fi
+Deploys all enabled infrastructure modules for the selected environment.
+USAGE
+}
 
-mapfile -t MODULES < <(python3 - "$ENV_FILE" <<'PY'
-import sys
-from pathlib import Path
+verify_required_env() {
+  local required_env="$1"
+  local missing=0
 
-path = Path(sys.argv[1])
-lines = path.read_text().splitlines()
-in_modules = False
-for line in lines:
-    stripped = line.strip()
-    if stripped == "enabledModules:":
-        in_modules = True
-        continue
-    if in_modules:
-        if stripped.startswith("-"):
-            print(stripped[1:].strip())
-        elif stripped and not line.startswith(" "):
-            break
-PY
-)
+  for variable_name in $required_env; do
+    if [[ -z "${!variable_name:-}" ]]; then
+      warn "Missing required env variable: $variable_name"
+      missing=1
+    fi
+  done
 
-if [[ ${#MODULES[@]} -eq 0 ]]; then
-  echo "No enabled modules found in $ENV_FILE"
-  exit 1
-fi
+  [[ "$missing" == "0" ]] || fail "Required environment variables are missing"
+}
 
-ensure_network() {
-  local network_name="server-public"
-  if ! docker network inspect "$network_name" >/dev/null 2>&1; then
-    echo "Creating Docker network: $network_name"
-    docker network create "$network_name" >/dev/null
+deploy_module() {
+  local environment_name="$1"
+  local environment_dir="$2"
+  local module_name="$3"
+
+  local module_dir
+  local compose_file
+  local module_env
+  local project_name
+
+  module_dir="$(load_module "$module_name")"
+  compose_file="$module_dir/docker-compose.yml"
+  module_env="$(module_env_file "$environment_dir" "$module_name")"
+  project_name="server_infra_${environment_name}_${module_name}"
+
+  if [[ -n "${REQUIRED_ENV:-}" ]]; then
+    [[ -f "$module_env" ]] || fail "Missing module config: $module_env"
+    set -a
+    # shellcheck source=/dev/null
+    source "$module_env"
+    set +a
+    verify_required_env "$REQUIRED_ENV"
+  fi
+
+  log "Deploying module: $module_name"
+
+  if [[ -f "$module_env" ]]; then
+    MODULE_ENV_FILE="$module_env" docker compose \
+      --env-file "$module_env" \
+      -p "$project_name" \
+      -f "$compose_file" \
+      up -d
+  else
+    MODULE_ENV_FILE="$module_env" docker compose \
+      -p "$project_name" \
+      -f "$compose_file" \
+      up -d
   fi
 }
 
-ensure_network
-
-for module in "${MODULES[@]}"; do
-  MODULE_DIR="$ROOT_DIR/$module"
-  COMPOSE_FILE="$MODULE_DIR/docker-compose.yml"
-  MODULE_ENV_FILE="$ENV_DIR/$module/config.env"
-
-  if [[ ! -f "$COMPOSE_FILE" ]]; then
-    echo "Skipping module '$module': compose file not found"
-    continue
+main() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
   fi
 
-  if [[ ! -f "$MODULE_ENV_FILE" ]]; then
-    EXAMPLE_FILE="$ENV_DIR/$module/config.env.example"
-    if [[ -f "$EXAMPLE_FILE" ]]; then
-      echo "Missing $MODULE_ENV_FILE"
-      echo "Create it from $EXAMPLE_FILE"
-      exit 1
-    fi
-    MODULE_ENV_FILE="/dev/null"
-  fi
+  local environment_name="${1:-}"
+  [[ -n "$environment_name" ]] || { usage; exit 1; }
 
-  echo "Deploying module: $module"
-  (
-    cd "$MODULE_DIR"
-    MODULE_ENV_FILE="$MODULE_ENV_FILE" docker compose \
-      --project-name "server-${module}" \
-      --env-file "$MODULE_ENV_FILE" \
-      -f "$COMPOSE_FILE" \
-      up -d
-  )
-done
+  require_command docker
 
-echo "Deployment finished: $ENV_NAME"
+  local environment_dir
+  environment_dir="$(load_environment "$environment_name")"
+
+  log "Deploying environment: $environment_name"
+  ensure_docker_network "server-infra"
+
+  for module_name in $ENABLED_MODULES; do
+    deploy_module "$environment_name" "$environment_dir" "$module_name"
+  done
+
+  log "Deployment complete: $environment_name"
+}
+
+main "$@"

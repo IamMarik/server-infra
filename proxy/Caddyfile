@@ -1,11 +1,11 @@
 {
-    email {$CADDY_EMAIL}
+  email {$CADDY_EMAIL}
 }
 
 {$STATUS_DOMAIN} {
-    reverse_proxy uptime-kuma:3001
+  reverse_proxy uptime-kuma:3001
 }
 
 {$LOGS_DOMAIN} {
-    reverse_proxy dozzle:8080
+  reverse_proxy dozzle:8080
 }

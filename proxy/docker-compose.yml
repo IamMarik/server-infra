@@ -1,7 +1,6 @@
 services:
   caddy:
     image: caddy:2-alpine
-    container_name: caddy
     restart: unless-stopped
     env_file:
       - ${MODULE_ENV_FILE}
@@ -14,13 +13,13 @@ services:
       - caddy-data:/data
       - caddy-config:/config
     networks:
-      - public
+      - server-infra
 
 volumes:
   caddy-data:
   caddy-config:
 
 networks:
-  public:
-    name: server-public
+  server-infra:
+    name: server-infra
     external: true
