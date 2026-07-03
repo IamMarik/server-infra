@@ -42,8 +42,10 @@ deploy_module() {
   local module_env
   local project_name
 
-  module_dir="$(load_module "$module_name")"
-  compose_file="$module_dir/docker-compose.yml"
+  load_module "$module_name"
+
+  local module_dir="$MODULE_DIR"
+  local compose_file="$module_dir/docker-compose.yml"
   module_env="$(module_env_file "$environment_dir" "$module_name")"
   project_name="server_infra_${environment_name}_${module_name}"
 
@@ -83,8 +85,8 @@ main() {
 
   require_command docker
 
-  local environment_dir
-  environment_dir="$(load_environment "$environment_name")"
+  load_environment "$environment_name"
+  local environment_dir="$ENVIRONMENT_DIR"
 
   log "Deploying environment: $environment_name"
   ensure_docker_network "server-infra"

@@ -20,9 +20,7 @@ USAGE
 
 check_module() {
   local module_name="$1"
-  local module_dir
-
-  module_dir="$(load_module "$module_name")"
+  load_module "$module_name"
   ok "module: $module_name"
 }
 
@@ -37,8 +35,8 @@ main() {
 
   require_command docker
 
-  local environment_dir
-  environment_dir="$(load_environment "$environment_name")"
+  load_environment "$environment_name"
+  local environment_dir="$ENVIRONMENT_DIR"
 
   ok "repository: $REPO_ROOT"
   ok "environment: $environment_name"

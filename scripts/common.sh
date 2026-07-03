@@ -39,18 +39,16 @@ require_environment() {
 }
 
 load_environment() {
-  local environment_name="$1"
-  local environment_dir
-  environment_dir="$(require_environment "$environment_name")"
+  ENVIRONMENT_DIR="$(require_environment "$1")"
 
   # shellcheck source=/dev/null
-  source "$environment_dir/server.env"
+  source "$ENVIRONMENT_DIR/server.env"
+
   # shellcheck source=/dev/null
-  source "$environment_dir/modules.env"
+  source "$ENVIRONMENT_DIR/modules.env"
 
-  [[ -n "${ENABLED_MODULES:-}" ]] || fail "ENABLED_MODULES is empty in $environment_dir/modules.env"
-
-  printf '%s\n' "$environment_dir"
+  [[ -n "${ENABLED_MODULES:-}" ]] || \
+    fail "ENABLED_MODULES is empty in $ENVIRONMENT_DIR/modules.env"
 }
 
 require_module() {
@@ -64,20 +62,17 @@ require_module() {
 }
 
 load_module() {
-  local module_name="$1"
-  local module_dir
-  module_dir="$(require_module "$module_name")"
+  MODULE_DIR="$(require_module "$1")"
 
   MODULE_DESCRIPTION=""
   MODULE_VERSION=""
   REQUIRED_ENV=""
 
   # shellcheck source=/dev/null
-  source "$module_dir/module.env"
+  source "$MODULE_DIR/module.env"
 
-  [[ -f "$module_dir/docker-compose.yml" ]] || fail "Compose file not found: $module_dir/docker-compose.yml"
-
-  printf '%s\n' "$module_dir"
+  [[ -f "$MODULE_DIR/docker-compose.yml" ]] || \
+    fail "Compose file not found: $MODULE_DIR/docker-compose.yml"
 }
 
 
