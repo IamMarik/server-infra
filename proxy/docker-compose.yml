@@ -1,0 +1,26 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    env_file:
+      - ${MODULE_ENV_FILE}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - public
+
+volumes:
+  caddy-data:
+  caddy-config:
+
+networks:
+  public:
+    name: server-public
+    external: true

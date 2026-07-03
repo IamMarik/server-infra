@@ -1,0 +1,18 @@
+# Local environment values
+config.env
+*.local.env
+
+# Secrets
+*.secret
+*.key
+*.pem
+
+# Runtime data
+data/
+logs/
+backups/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

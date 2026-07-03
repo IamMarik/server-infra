@@ -1,0 +1,6 @@
+name: prod-db
+
+enabledModules:
+  - database
+  - monitoring
+  - security
