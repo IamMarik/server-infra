@@ -12,3 +12,7 @@ environments/**/config.env
 # Runtime
 *.log
 backups/
+proxy/runtime.env
+proxy/Caddyfile.backup*
+proxy/Caddyfile.before-*
+

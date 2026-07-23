@@ -1,11 +1,39 @@
 {
-  email {$CADDY_EMAIL}
+	email {$CADDY_EMAIL}
 }
 
 {$STATUS_DOMAIN} {
-  reverse_proxy uptime-kuma:3001
+	reverse_proxy uptime-kuma:3001
 }
 
 {$LOGS_DOMAIN} {
-  reverse_proxy dozzle:8080
+	basic_auth {
+		{$LOGS_AUTH_USER} {$LOGS_AUTH_PASSWORD_HASH}
+	}
+	reverse_proxy dozzle:8080
 }
+
+pathetic.gay, www.pathetic.gay {
+	reverse_proxy pathetic:3000
+}
+
+*.pathetic.gay {
+	tls {
+		dns porkbun {
+			api_key {$PORKBUN_API_KEY}
+			api_secret_key {$PORKBUN_API_SECRET_KEY}
+		}
+	}
+
+	reverse_proxy pathetic:3000
+}
+
+# BEGIN SAVEPROOF
+saveproof.app {
+	reverse_proxy saveproof:3000
+}
+
+www.saveproof.app, saveproof.org, www.saveproof.org {
+	redir https://saveproof.app{uri} permanent
+}
+# END SAVEPROOF
