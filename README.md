@@ -115,6 +115,16 @@ Preview or install the host tools required by the backup module:
 sudo ./scripts/install-restic.sh --apply
 ```
 
+Create the initial server and backup configuration with hidden secret prompts:
+
+```bash
+sudo ./scripts/backup-setup.sh
+```
+
+The wizard creates root-owned active configuration, preserves existing base
+path lists, keeps retention disabled, and validates the result. Secrets are
+never accepted as command-line arguments.
+
 Initialize a PostgreSQL Compose backup source from an application repository:
 
 ```bash

@@ -43,6 +43,7 @@ Usage:
   server-infra-backup [--config-root <absolute-path>] restore \
     --kind <config|data> --target <absolute-path> [--snapshot <latest|id>]
   server-infra-backup [--config-root <absolute-path>] restore-test
+  server-infra-backup setup [--config-root <absolute-path>]
   server-infra-backup project <init|install|validate|list|remove> [options]
 
 Operations:
@@ -54,6 +55,7 @@ Operations:
   restore    Restore one tagged snapshot into an absent or empty directory.
   restore-test
              Restore and validate the latest configuration snapshot.
+  setup      Interactively create initial server and backup configuration.
   project    Manage application file and PostgreSQL backup sources.
 
 Scheduled operations never initialize a missing repository. Restore never
@@ -1147,6 +1149,20 @@ parse_arguments() {
 }
 
 main() {
+  if [[ "${1:-}" == "setup" ]]; then
+    local setup_helper="${SERVER_INFRA_BACKUP_SETUP_EXECUTABLE:-}"
+
+    shift
+    [[ -n "$setup_helper" ]] || \
+      setup_helper="$SCRIPT_DIR/server-infra-backup-setup"
+    if [[ ! -x "$setup_helper" && \
+      -x "/usr/local/libexec/server-infra/backup/server-infra-backup-setup" ]]; then
+      setup_helper="/usr/local/libexec/server-infra/backup/server-infra-backup-setup"
+    fi
+    [[ -x "$setup_helper" ]] || fail "Backup setup helper is not installed"
+    exec "$setup_helper" "$@"
+  fi
+
   if [[ "${1:-}" == "project" ]]; then
     local project_helper="${SERVER_INFRA_BACKUP_PROJECT_EXECUTABLE:-}"
 

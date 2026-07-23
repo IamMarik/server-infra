@@ -14,6 +14,8 @@ data snapshot in a server-owned restic repository.
 - native systemd services with daily, weekly, and monthly timers;
 - a standalone runner installed under
   `/usr/local/libexec/server-infra/backup/`;
+- an interactive server setup wizard that writes secrets without terminal
+  echo or command-line arguments;
 - separate Uptime Kuma push reporting for backup, repository check, and
   restore-test jobs.
 
@@ -70,12 +72,6 @@ recoverable copy of the password outside the server failure domain.
 
 ## Deployment
 
-Prepare the configuration layout and examples:
-
-```bash
-sudo ./scripts/install.sh --module backup --apply --install-examples
-```
-
 Preview backup tool installation:
 
 ```bash
@@ -94,18 +90,47 @@ already available. If the distribution package is too old for a future module
 requirement, use an official restic binary as a separately reviewed
 installation change.
 
-Create active files from the examples, replace every placeholder, then
-validate without changing the host:
+Create and validate the active server configuration interactively:
 
 ```bash
-./scripts/deploy.sh --config-root /etc/server-infra --check
+sudo ./scripts/backup-setup.sh
 ```
 
-Add `backup` to `/etc/server-infra/modules.env` only when configuration is
-ready. Apply installs the runner and systemd units, then enables the timer:
+The wizard:
+
+- proposes the hostname, `acceptance`, and the current timezone as defaults;
+- constructs the restic repository URL from the Backblaze endpoint, bucket,
+  and repository prefix;
+- reads the Backblaze secret and restic password without terminal echo;
+- adds `backup` while preserving other explicitly configured modules;
+- creates active files atomically with root ownership and required modes;
+- preserves existing `paths`, `excludes`, and `freshness`;
+- keeps retention and prune disabled;
+- validates the result and does not contact Backblaze.
+
+It never accepts secrets as command-line arguments. Existing files are changed
+only after the final confirmation. If the complete configuration is already
+valid, rerunning the wizard only validates it.
+
+The generic layout installer remains available when only examples are wanted:
 
 ```bash
+sudo ./scripts/install.sh --module backup --apply --install-examples
+```
+
+Run deployment preflight, then apply the host module:
+
+```bash
+sudo ./scripts/deploy.sh --config-root /etc/server-infra --check
 sudo ./scripts/deploy.sh --config-root /etc/server-infra --apply
+```
+
+Apply installs the public CLI, internal helpers, and systemd units. Initialize
+the remote repository explicitly and create the first backup:
+
+```bash
+sudo server-infra-backup init
+sudo server-infra-backup run
 ```
 
 The default schedules use the server timezone:
@@ -356,6 +381,7 @@ or monitor:
 ```bash
 ./backup/tests/test-runner.sh
 ./backup/tests/test-project-wizard.sh
+./backup/tests/test-setup-wizard.sh
 ```
 
 The generic restore test proves that encrypted configuration files can be

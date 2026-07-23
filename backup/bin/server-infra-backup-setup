@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_ROOT="/etc/server-infra"
+LOCK_ROOT="${SERVER_INFRA_BACKUP_LOCK_ROOT:-/run/server-infra}"
+RUNNER="${SERVER_INFRA_BACKUP_EXECUTABLE:-$SCRIPT_DIR/server-infra-backup}"
+INSTANCE=""
+ENVIRONMENT="acceptance"
+TIMEZONE=""
+S3_ENDPOINT=""
+BUCKET=""
+REPOSITORY_PREFIX=""
+APPLICATION_KEY_ID=""
+APPLICATION_KEY=""
+RESTIC_PASSWORD=""
+BACKUP_PUSH_URL=""
+CHECK_PUSH_URL=""
+RESTORE_PUSH_URL=""
+ENABLED_MODULES=""
+SETUP_LOCK=""
+TEMP_ROOT=""
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  server-infra-backup setup [--config-root <absolute-path>]
+  scripts/backup-setup.sh [--config-root <absolute-path>]
+
+Interactively creates the initial server and backup configuration. Secrets are
+read without terminal echo and are never accepted as command-line arguments.
+Existing files are changed only after an explicit confirmation.
+USAGE
+}
+
+log() {
+  printf '[server-infra][backup-setup] %s\n' "$*"
+}
+
+ok() {
+  printf '[server-infra][backup-setup][ok] %s\n' "$*"
+}
+
+warn() {
+  printf '[server-infra][backup-setup][warn] %s\n' "$*" >&2
+}
+
+fail() {
+  printf '[server-infra][backup-setup][error] %s\n' "$*" >&2
+  exit 1
+}
+
+validate_absolute_path() {
+  [[ "$1" == /* ]] || fail "$2 must be an absolute path"
+  [[ "$1" != *".."* && "$1" != *"//"* ]] || \
+    fail "$2 contains an unsafe path component"
+  case "${1%/}" in
+    "" | / | /etc | /var | /run | /usr | /opt | /root | /home | /tmp)
+      fail "Refusing broad path for $2: $1"
+      ;;
+  esac
+}
+
+read_env_value() {
+  local env_file="$1"
+  local requested_key="$2"
+  local line=""
+  local key
+  local value
+
+  [[ -f "$env_file" && ! -L "$env_file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    if [[ "$key" == "$requested_key" ]]; then
+      if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+        value="${BASH_REMATCH[1]}"
+      fi
+      printf '%s' "$value"
+      return 0
+    fi
+  done < "$env_file"
+  return 1
+}
+
+prompt_value() {
+  local variable_name="$1"
+  local label="$2"
+  local default_value="$3"
+  local entered=""
+
+  if [[ -n "$default_value" ]]; then
+    printf '%s [%s]: ' "$label" "$default_value" >&2
+  else
+    printf '%s: ' "$label" >&2
+  fi
+  IFS= read -r entered
+  [[ -n "$entered" ]] || entered="$default_value"
+  printf -v "$variable_name" '%s' "$entered"
+}
+
+prompt_secret() {
+  local variable_name="$1"
+  local label="$2"
+  local entered=""
+
+  printf '%s: ' "$label" >&2
+  IFS= read -r -s entered
+  printf '\n' >&2
+  [[ -n "$entered" ]] || fail "$label must not be empty"
+  [[ "$entered" != *$'\n'* && "$entered" != *$'\r'* ]] || \
+    fail "$label contains an invalid line break"
+  printf -v "$variable_name" '%s' "$entered"
+}
+
+confirm() {
+  local label="$1"
+  local answer=""
+
+  printf '%s [y/N]: ' "$label" >&2
+  IFS= read -r answer
+  [[ "$answer" == "y" || "$answer" == "Y" || \
+    "$answer" == "yes" || "$answer" == "YES" ]]
+}
+
+default_instance() {
+  local candidate
+
+  candidate="$(hostname -s 2>/dev/null || true)"
+  candidate="$(
+    printf '%s' "$candidate" |
+      tr '[:upper:]_.' '[:lower:]--' |
+      sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-|-$//g'
+  )"
+  [[ "$candidate" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || candidate="server"
+  printf '%s' "$candidate"
+}
+
+default_timezone() {
+  local candidate=""
+
+  if [[ -f /etc/timezone ]]; then
+    IFS= read -r candidate < /etc/timezone || true
+  fi
+  [[ -n "$candidate" ]] || candidate="Etc/UTC"
+  printf '%s' "$candidate"
+}
+
+load_existing_defaults() {
+  local server_file="$CONFIG_ROOT/server.env"
+  local modules_file="$CONFIG_ROOT/modules.env"
+  local template_config=0
+  local value
+
+  INSTANCE="$(default_instance)"
+  TIMEZONE="$(default_timezone)"
+
+  value="$(read_env_value "$server_file" "SERVER_INFRA_INSTANCE" || true)"
+  if [[ "$value" == "example" ]]; then
+    template_config=1
+  elif [[ -n "$value" ]]; then
+    INSTANCE="$value"
+  fi
+  value="$(read_env_value "$server_file" "SERVER_INFRA_ENVIRONMENT" || true)"
+  [[ -z "$value" || "$value" == "example" ]] || ENVIRONMENT="$value"
+  value="$(read_env_value "$server_file" "SERVER_INFRA_TIMEZONE" || true)"
+  [[ -z "$value" ]] || TIMEZONE="$value"
+  ENABLED_MODULES="$(read_env_value "$modules_file" "ENABLED_MODULES" || true)"
+  if [[ "$template_config" == "1" && "$ENABLED_MODULES" == "proxy" ]]; then
+    ENABLED_MODULES=""
+  fi
+}
+
+add_backup_module() {
+  local module
+  local modules=()
+
+  for module in $ENABLED_MODULES; do
+    [[ "$module" == "backup" ]] && continue
+    modules+=("$module")
+  done
+  modules+=("backup")
+  ENABLED_MODULES="${modules[*]}"
+}
+
+collect_values() {
+  local password_confirmation=""
+
+  load_existing_defaults
+  prompt_value INSTANCE "Server instance" "$INSTANCE"
+  prompt_value ENVIRONMENT "Environment" "$ENVIRONMENT"
+  prompt_value TIMEZONE "Timezone" "$TIMEZONE"
+  prompt_value S3_ENDPOINT "Backblaze S3 endpoint" ""
+  S3_ENDPOINT="${S3_ENDPOINT#https://}"
+  S3_ENDPOINT="${S3_ENDPOINT%/}"
+  prompt_value BUCKET "Backblaze bucket" ""
+  prompt_value REPOSITORY_PREFIX "Repository prefix" "$INSTANCE"
+  prompt_value APPLICATION_KEY_ID "Backblaze Application Key ID" ""
+  prompt_secret APPLICATION_KEY "Backblaze Application Key"
+  prompt_secret RESTIC_PASSWORD "Restic repository password"
+  prompt_secret password_confirmation "Repeat restic repository password"
+  [[ "$RESTIC_PASSWORD" == "$password_confirmation" ]] || \
+    fail "Restic repository passwords do not match"
+  prompt_value BACKUP_PUSH_URL "Uptime Kuma backup push URL" ""
+  prompt_value CHECK_PUSH_URL "Uptime Kuma check push URL" ""
+  prompt_value RESTORE_PUSH_URL "Uptime Kuma restore-test push URL" ""
+  add_backup_module
+}
+
+validate_values() {
+  local region
+  local timezone_file="/usr/share/zoneinfo/$TIMEZONE"
+  local push_url
+
+  [[ "$INSTANCE" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
+    fail "Server instance must use lowercase kebab-case"
+  [[ "$ENVIRONMENT" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
+    fail "Environment must use lowercase kebab-case"
+  [[ "$TIMEZONE" != /* && "$TIMEZONE" != *".."* ]] || \
+    fail "Timezone must be an IANA timezone name"
+  [[ -f "$timezone_file" ]] || fail "Unknown timezone: $TIMEZONE"
+  [[ "$S3_ENDPOINT" =~ ^s3\.([a-z0-9-]+)\.backblazeb2\.com$ ]] || \
+    fail "Backblaze endpoint must look like s3.<region>.backblazeb2.com"
+  region="${BASH_REMATCH[1]}"
+  [[ "$BUCKET" =~ ^[A-Za-z0-9][A-Za-z0-9-]{4,61}[A-Za-z0-9]$ ]] || \
+    fail "Backblaze bucket name has an invalid format"
+  [[ "$REPOSITORY_PREFIX" =~ ^[a-z0-9]+([a-z0-9/-]*[a-z0-9])?$ ]] || \
+    fail "Repository prefix has an invalid format"
+  [[ "$REPOSITORY_PREFIX" != *".."* && \
+    "$REPOSITORY_PREFIX" != *"//"* ]] || \
+    fail "Repository prefix contains an unsafe path component"
+  [[ "$APPLICATION_KEY_ID" =~ ^[A-Za-z0-9_-]+$ ]] || \
+    fail "Application Key ID has an invalid format"
+  [[ "$APPLICATION_KEY" != *[[:space:]]* ]] || \
+    fail "Application Key must not contain whitespace"
+  ((${#RESTIC_PASSWORD} >= 20)) || \
+    fail "Restic repository password must contain at least 20 characters"
+  for push_url in "$BACKUP_PUSH_URL" "$CHECK_PUSH_URL" "$RESTORE_PUSH_URL"; do
+    [[ "$push_url" == https://* ]] || fail "Push monitor URLs must use HTTPS"
+    [[ "$push_url" != *"?"* && "$push_url" != *"#"* ]] || \
+      fail "Push monitor URLs must not contain query strings or fragments"
+  done
+  AWS_DEFAULT_REGION="$region"
+}
+
+ensure_layout() {
+  local managed_path
+
+  validate_absolute_path "$CONFIG_ROOT" "Configuration root"
+  validate_absolute_path "$LOCK_ROOT" "Runtime lock root"
+  [[ ! -L "$CONFIG_ROOT" ]] || fail "Configuration root must not be a symlink"
+  [[ ! -L "$CONFIG_ROOT/backup" ]] || \
+    fail "Backup configuration directory must not be a symlink"
+  [[ ! -L "$LOCK_ROOT" ]] || fail "Runtime lock root must not be a symlink"
+
+  for managed_path in \
+    "$CONFIG_ROOT/server.env" \
+    "$CONFIG_ROOT/modules.env" \
+    "$CONFIG_ROOT/backup/runtime.env" \
+    "$CONFIG_ROOT/backup/restic-password" \
+    "$CONFIG_ROOT/backup/paths" \
+    "$CONFIG_ROOT/backup/excludes" \
+    "$CONFIG_ROOT/backup/freshness"; do
+    [[ ! -L "$managed_path" ]] || \
+      fail "Managed configuration file must not be a symlink: $managed_path"
+  done
+
+  if [[ "${CONFIG_ROOT%/}" == "/etc/server-infra" ]]; then
+    [[ "$(uname -s)" == "Linux" ]] || fail "Default setup requires Linux"
+    [[ "$EUID" == "0" ]] || fail "Default setup requires root privileges"
+  fi
+
+  mkdir -p "$CONFIG_ROOT/backup" "$LOCK_ROOT"
+  chmod 0750 "$CONFIG_ROOT" "$CONFIG_ROOT/backup" "$LOCK_ROOT"
+  if [[ "$EUID" == "0" ]]; then
+    chown root:root "$CONFIG_ROOT" "$CONFIG_ROOT/backup" "$LOCK_ROOT"
+  fi
+
+  SETUP_LOCK="$LOCK_ROOT/operation.lock"
+  mkdir "$SETUP_LOCK" 2>/dev/null || \
+    fail "Another server-infra setup, install, or deployment is running"
+}
+
+cleanup() {
+  if [[ -n "$TEMP_ROOT" && -d "$TEMP_ROOT" ]]; then
+    rm -f -- "$TEMP_ROOT"/*
+    rmdir "$TEMP_ROOT" 2>/dev/null || true
+  fi
+  if [[ -n "$SETUP_LOCK" && -d "$SETUP_LOCK" ]]; then
+    rmdir "$SETUP_LOCK" 2>/dev/null || true
+  fi
+}
+
+write_staged_file() {
+  local filename="$1"
+  local mode="$2"
+  shift 2
+
+  printf '%s\n' "$@" > "$TEMP_ROOT/$filename"
+  chmod "$mode" "$TEMP_ROOT/$filename"
+}
+
+install_staged_file() {
+  local filename="$1"
+  local destination="$2"
+  local mode="$3"
+  local temporary_file
+
+  temporary_file="$(mktemp "${destination%/*}/.${destination##*/}.tmp.XXXXXX")"
+  if [[ "$EUID" == "0" ]]; then
+    install -o root -g root -m "$mode" "$TEMP_ROOT/$filename" "$temporary_file"
+  else
+    install -m "$mode" "$TEMP_ROOT/$filename" "$temporary_file"
+  fi
+  mv -f -- "$temporary_file" "$destination"
+}
+
+write_configuration() {
+  local runtime_file="$CONFIG_ROOT/backup/runtime.env"
+  local password_file="$CONFIG_ROOT/backup/restic-password"
+
+  TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/server-infra-backup-setup.XXXXXX")"
+  chmod 0700 "$TEMP_ROOT"
+
+  write_staged_file server.env 0640 \
+    "SERVER_INFRA_CONFIG_VERSION=1" \
+    "SERVER_INFRA_INSTANCE=$INSTANCE" \
+    "SERVER_INFRA_ENVIRONMENT=$ENVIRONMENT" \
+    "SERVER_INFRA_TIMEZONE=$TIMEZONE"
+  write_staged_file modules.env 0640 \
+    "ENABLED_MODULES=\"$ENABLED_MODULES\""
+  write_staged_file runtime.env 0600 \
+    "RESTIC_REPOSITORY=s3:https://$S3_ENDPOINT/$BUCKET/$REPOSITORY_PREFIX" \
+    "RESTIC_PASSWORD_FILE=$password_file" \
+    "AWS_ACCESS_KEY_ID=$APPLICATION_KEY_ID" \
+    "AWS_SECRET_ACCESS_KEY=$APPLICATION_KEY" \
+    "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION" \
+    "UPTIME_KUMA_BACKUP_PUSH_URL=$BACKUP_PUSH_URL" \
+    "UPTIME_KUMA_CHECK_PUSH_URL=$CHECK_PUSH_URL" \
+    "UPTIME_KUMA_RESTORE_TEST_PUSH_URL=$RESTORE_PUSH_URL" \
+    "BACKUP_KEEP_DAILY=14" \
+    "BACKUP_KEEP_WEEKLY=8" \
+    "BACKUP_KEEP_MONTHLY=12" \
+    "BACKUP_RETENTION_ENABLED=false" \
+    "BACKUP_PRUNE_ENABLED=false"
+  write_staged_file restic-password 0600 "$RESTIC_PASSWORD"
+
+  install_staged_file server.env "$CONFIG_ROOT/server.env" 0640
+  install_staged_file modules.env "$CONFIG_ROOT/modules.env" 0640
+  install_staged_file runtime.env "$runtime_file" 0600
+  install_staged_file restic-password "$password_file" 0600
+
+  if [[ ! -e "$CONFIG_ROOT/backup/paths" ]]; then
+    write_staged_file paths 0640 "/var/lib/server-infra/backup/staging"
+    install_staged_file paths "$CONFIG_ROOT/backup/paths" 0640
+  fi
+  if [[ ! -e "$CONFIG_ROOT/backup/excludes" ]]; then
+    write_staged_file excludes 0640 "*.tmp" "*.partial" "cache/"
+    install_staged_file excludes "$CONFIG_ROOT/backup/excludes" 0640
+  fi
+  if [[ ! -e "$CONFIG_ROOT/backup/freshness" ]]; then
+    write_staged_file freshness 0640 \
+      "# Optional: <maximum-age-seconds> <absolute-marker-path>"
+    install_staged_file freshness "$CONFIG_ROOT/backup/freshness" 0640
+  fi
+
+  chmod 0640 \
+    "$CONFIG_ROOT/server.env" \
+    "$CONFIG_ROOT/modules.env" \
+    "$CONFIG_ROOT/backup/paths" \
+    "$CONFIG_ROOT/backup/excludes" \
+    "$CONFIG_ROOT/backup/freshness"
+  chmod 0600 "$runtime_file" "$password_file"
+  if [[ "$EUID" == "0" ]]; then
+    chown root:root \
+      "$CONFIG_ROOT/server.env" \
+      "$CONFIG_ROOT/modules.env" \
+      "$CONFIG_ROOT/backup/paths" \
+      "$CONFIG_ROOT/backup/excludes" \
+      "$CONFIG_ROOT/backup/freshness" \
+      "$runtime_file" \
+      "$password_file"
+  fi
+}
+
+resolve_runner() {
+  if [[ ! -x "$RUNNER" && \
+    -x /usr/local/libexec/server-infra/backup/server-infra-backup ]]; then
+    RUNNER="/usr/local/libexec/server-infra/backup/server-infra-backup"
+  fi
+  [[ -x "$RUNNER" ]] || fail "Backup validator executable not found"
+}
+
+configuration_is_complete() {
+  local required_file
+
+  for required_file in \
+    "$CONFIG_ROOT/server.env" \
+    "$CONFIG_ROOT/modules.env" \
+    "$CONFIG_ROOT/backup/runtime.env" \
+    "$CONFIG_ROOT/backup/restic-password" \
+    "$CONFIG_ROOT/backup/paths" \
+    "$CONFIG_ROOT/backup/excludes" \
+    "$CONFIG_ROOT/backup/freshness"; do
+    [[ -f "$required_file" && ! -L "$required_file" ]] || return 1
+  done
+}
+
+parse_arguments() {
+  while (($# > 0)); do
+    case "$1" in
+      --config-root)
+        (($# >= 2)) || fail "Missing value for --config-root"
+        CONFIG_ROOT="$2"
+        shift 2
+        ;;
+      --help | -h)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "Unknown argument: $1"
+        ;;
+    esac
+  done
+}
+
+main() {
+  parse_arguments "$@"
+  resolve_runner
+
+  if configuration_is_complete && \
+    "$RUNNER" --config-root "$CONFIG_ROOT" validate >/dev/null 2>&1; then
+    "$RUNNER" --config-root "$CONFIG_ROOT" validate
+    ok "backup configuration is already complete"
+    return
+  fi
+
+  if configuration_is_complete; then
+    warn "Existing configuration is incomplete or invalid"
+  fi
+
+  collect_values
+  validate_values
+
+  log "Server instance: $INSTANCE"
+  log "Environment: $ENVIRONMENT"
+  log "Timezone: $TIMEZONE"
+  log "Repository: s3:https://$S3_ENDPOINT/$BUCKET/$REPOSITORY_PREFIX"
+  log "Enabled modules: $ENABLED_MODULES"
+  log "Retention and prune will remain disabled"
+  confirm "Write active server and backup configuration?" || \
+    fail "Setup cancelled; no changes made"
+
+  ensure_layout
+  trap cleanup EXIT
+  write_configuration
+  "$RUNNER" --config-root "$CONFIG_ROOT" validate
+  ok "active backup configuration created and validated"
+  log "Store an independent copy of the restic password before repository init"
+}
+
+main "$@"

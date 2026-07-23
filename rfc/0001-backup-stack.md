@@ -80,6 +80,13 @@ The host driver owns generic operations such as:
 
 Systemd must not execute backup code directly from a mutable Git checkout.
 
+Initial backup configuration may be created by a module-owned interactive
+setup helper. The helper must not accept secrets as command-line arguments,
+must disable terminal echo for secret input, must write active files with the
+declared ownership and modes, must require confirmation before replacing
+existing configuration, and must validate locally without initializing or
+contacting the remote repository.
+
 ### Repository and Host Ownership
 
 Git owns reusable implementation, module metadata, systemd unit templates,
