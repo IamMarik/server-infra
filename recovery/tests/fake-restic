@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+[[ "${RESTIC_REPOSITORY:-}" == \
+  "s3:https://s3.example.test/test-bucket/acceptance" ]]
+[[ "${RESTIC_PASSWORD:-}" == "test-restic-password" ]]
+[[ "${AWS_ACCESS_KEY_ID:-}" == "test-access-key" ]]
+[[ "${AWS_SECRET_ACCESS_KEY:-}" == "test-secret-key" ]]
+[[ "${AWS_DEFAULT_REGION:-}" == "us-west-004" ]]
+
+printf '%s ' "$@" >> "$FAKE_RESTIC_LOG"
+printf '\n' >> "$FAKE_RESTIC_LOG"
+
+if [[ "${1:-}" == "--no-cache" ]]; then
+  shift
+fi
+
+case "${1:-}" in
+  snapshots)
+    printf '%s\n' \
+      "ID        Time                 Host        Tags" \
+      "abcdef12  2026-07-24 00:00:00  acceptance  server-infra-config"
+    ;;
+  restore)
+    target=""
+    shift
+    while (($# > 0)); do
+      case "$1" in
+        --target)
+          target="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    [[ -n "$target" ]]
+
+    restored_root="$target$FAKE_CONFIG_ROOT"
+    mkdir -p "$restored_root/backup"
+    printf '%s\n' \
+      "SERVER_INFRA_CONFIG_VERSION=1" \
+      "SERVER_INFRA_INSTANCE=acceptance" \
+      "SERVER_INFRA_ENVIRONMENT=acceptance" \
+      "SERVER_INFRA_TIMEZONE=Etc/UTC" \
+      > "$restored_root/server.env"
+    printf '%s\n' "ENABLED_MODULES=backup" > "$restored_root/modules.env"
+    printf '%s\n' \
+      "RESTIC_REPOSITORY=s3:https://s3.example.test/test-bucket/acceptance" \
+      "RESTIC_PASSWORD_FILE=$FAKE_CONFIG_ROOT/backup/restic-password" \
+      "AWS_ACCESS_KEY_ID=test-access-key" \
+      "AWS_SECRET_ACCESS_KEY=test-secret-key" \
+      "AWS_DEFAULT_REGION=us-west-004" \
+      "UPTIME_KUMA_BACKUP_PUSH_URL=" \
+      "UPTIME_KUMA_CHECK_PUSH_URL=" \
+      "UPTIME_KUMA_RESTORE_TEST_PUSH_URL=" \
+      "BACKUP_KEEP_DAILY=14" \
+      "BACKUP_KEEP_WEEKLY=8" \
+      "BACKUP_KEEP_MONTHLY=12" \
+      "BACKUP_RETENTION_ENABLED=false" \
+      "BACKUP_PRUNE_ENABLED=false" \
+      > "$restored_root/backup/runtime.env"
+    printf '%s\n' "/srv/test-data" > "$restored_root/backup/paths"
+    : > "$restored_root/backup/excludes"
+    : > "$restored_root/backup/freshness"
+    if [[ "${FAKE_RESTORE_INVALID:-0}" != "1" ]]; then
+      printf '%s\n' "test-restic-password" \
+        > "$restored_root/backup/restic-password"
+      chmod 0600 "$restored_root/backup/restic-password"
+    fi
+
+    chmod 0750 "$restored_root" "$restored_root/backup"
+    chmod 0640 \
+      "$restored_root/server.env" \
+      "$restored_root/modules.env" \
+      "$restored_root/backup/paths" \
+      "$restored_root/backup/excludes" \
+      "$restored_root/backup/freshness"
+    chmod 0600 "$restored_root/backup/runtime.env"
+    ;;
+  *)
+    exit 1
+    ;;
+esac

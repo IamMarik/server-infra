@@ -11,9 +11,16 @@ source "$REPOSITORY_ROOT/scripts/common.sh"
 STATE_VERSION=1
 STATE_ROOT="/var/lib/server-infra/recovery"
 STATE_FILE=""
+CONFIG_ROOT="/etc/server-infra"
+WORK_ROOT="/var/cache/server-infra/recovery"
 OPERATION=""
 BREAK_GLASS_FILE=""
+SNAPSHOT_ID=""
 TEMP_FILE=""
+LOCK_DIR=""
+RESTORE_TARGET=""
+INSTALL_TEMP=""
+CONFIG_INSTALLED_BY_RUN=0
 
 recovery_log() {
   printf '[server-infra][recovery] %s\n' "$*"
@@ -34,6 +41,11 @@ Usage:
     init --break-glass <absolute-path>
   server-infra-recovery [--state-root <absolute-path>] plan
   server-infra-recovery [--state-root <absolute-path>] status
+  server-infra-recovery [--state-root <absolute-path>] \
+    config-snapshots --break-glass <absolute-path>
+  server-infra-recovery [--state-root <absolute-path>] \
+    [--config-root <absolute-path>] [--work-root <absolute-path>] \
+    restore-config --break-glass <absolute-path> --snapshot <exact-id>
 
 Operations:
   init
@@ -43,12 +55,20 @@ Operations:
     Show the ordered recovery phases and the next incomplete phase.
   status
     Show recovery session metadata and phase state.
+  config-snapshots
+    List configuration snapshots for the recorded server without changing
+    recovery state.
+  restore-config
+    Restore one exact configuration snapshot, validate it, and install it only
+    when the active configuration root is absent.
 
-The initial implementation does not restore data, deploy infrastructure, or
-start traffic. Follow backup/RECOVERY.md for those manual phases.
+The implementation does not yet restore project data, deploy infrastructure,
+or start traffic. Follow backup/RECOVERY.md for those phases.
 
 Defaults to:
   --state-root /var/lib/server-infra/recovery
+  --config-root /etc/server-infra
+  --work-root /var/cache/server-infra/recovery
 USAGE
 }
 
@@ -421,35 +441,38 @@ validate_state_file() {
     "$RECOVERY_PHASE_DATA" \
     "$RECOVERY_PHASE_PROJECTS" \
     "$RECOVERY_PHASE_FINALIZE"; do
-    [[ "$phase" == "pending" || "$phase" == "complete" ]] || \
+    [[ "$phase" == "pending" || "$phase" == "in-progress" || \
+      "$phase" == "complete" ]] || \
       fail "Invalid recovery phase state"
   done
 
   [[ "$RECOVERY_PHASE_REPOSITORY" == "complete" ]] || \
     fail "Repository phase must be complete in an initialized session"
-  if [[ "$RECOVERY_PHASE_CONFIG" == "complete" ]]; then
-    [[ "$RECOVERY_CONFIG_SNAPSHOT" =~ ^[0-9a-f]{8,64}$ ]] || \
-      fail "Completed configuration phase requires an exact snapshot ID"
-  else
+  if [[ "$RECOVERY_PHASE_CONFIG" == "pending" ]]; then
     [[ -z "$RECOVERY_CONFIG_SNAPSHOT" ]] || \
       fail "Pending configuration phase must not have a snapshot ID"
-  fi
-  if [[ "$RECOVERY_PHASE_DATA" == "complete" ]]; then
-    [[ "$RECOVERY_PHASE_CONFIG" == "complete" ]] || \
-      fail "Data phase requires completed configuration"
-    [[ "$RECOVERY_DATA_SNAPSHOT" =~ ^[0-9a-f]{8,64}$ ]] || \
-      fail "Completed data phase requires an exact snapshot ID"
   else
+    [[ "$RECOVERY_CONFIG_SNAPSHOT" =~ ^[0-9a-f]{8,64}$ ]] || \
+      fail "Started configuration phase requires an exact snapshot ID"
+  fi
+  if [[ "$RECOVERY_PHASE_DATA" == "pending" ]]; then
     [[ -z "$RECOVERY_DATA_SNAPSHOT" ]] || \
       fail "Pending data phase must not have a snapshot ID"
+  else
+    [[ "$RECOVERY_PHASE_CONFIG" == "complete" ]] || \
+      fail "Started data phase requires completed configuration"
+    [[ "$RECOVERY_DATA_SNAPSHOT" =~ ^[0-9a-f]{8,64}$ ]] || \
+      fail "Started data phase requires an exact snapshot ID"
   fi
-  if [[ "$RECOVERY_PHASE_PROJECTS" == "complete" ]]; then
+  if [[ "$RECOVERY_PHASE_PROJECTS" != "pending" ]]; then
     [[ "$RECOVERY_PHASE_DATA" == "complete" ]] || \
-      fail "Projects phase requires a completed data phase"
+      fail "Started projects phase requires a completed data phase"
+  fi
+  if [[ "$RECOVERY_PHASE_FINALIZE" != "pending" ]]; then
+    [[ "$RECOVERY_PHASE_PROJECTS" == "complete" ]] || \
+      fail "Started finalize phase requires completed projects"
   fi
   if [[ "$RECOVERY_PHASE_FINALIZE" == "complete" ]]; then
-    [[ "$RECOVERY_PHASE_PROJECTS" == "complete" ]] || \
-      fail "Finalize phase requires completed projects"
     [[ "$RECOVERY_STATUS" == "complete" ]] || \
       fail "Completed finalization requires complete overall status"
   else
@@ -491,10 +514,116 @@ locate_state_root() {
   STATE_FILE="$STATE_ROOT/session.env"
 }
 
+write_state_file() {
+  local active_state_file="$STATE_FILE"
+
+  [[ -f "$active_state_file" && ! -L "$active_state_file" ]] || \
+    fail "Recovery state file is not a regular file"
+  umask 077
+  TEMP_FILE="$(mktemp "$STATE_ROOT/.session.env.XXXXXX")"
+
+  {
+    printf '%s\n' "RECOVERY_STATE_VERSION=$RECOVERY_STATE_VERSION"
+    printf '%s\n' "RECOVERY_SESSION_ID=$RECOVERY_SESSION_ID"
+    printf '%s\n' "RECOVERY_INSTANCE=$RECOVERY_INSTANCE"
+    printf '%s\n' "RECOVERY_STARTED_AT=$RECOVERY_STARTED_AT"
+    printf '%s\n' \
+      "RECOVERY_BREAK_GLASS_GENERATED_AT=$RECOVERY_BREAK_GLASS_GENERATED_AT"
+    printf '%s\n' \
+      "RECOVERY_INFRA_REPOSITORY_URL=$RECOVERY_INFRA_REPOSITORY_URL"
+    printf '%s\n' \
+      "RECOVERY_INFRA_REPOSITORY_REF=$RECOVERY_INFRA_REPOSITORY_REF"
+    printf '%s\n' "RECOVERY_STATUS=$RECOVERY_STATUS"
+    printf '%s\n' "RECOVERY_PHASE_REPOSITORY=$RECOVERY_PHASE_REPOSITORY"
+    printf '%s\n' "RECOVERY_PHASE_CONFIG=$RECOVERY_PHASE_CONFIG"
+    printf '%s\n' "RECOVERY_CONFIG_SNAPSHOT=$RECOVERY_CONFIG_SNAPSHOT"
+    printf '%s\n' "RECOVERY_PHASE_DATA=$RECOVERY_PHASE_DATA"
+    printf '%s\n' "RECOVERY_DATA_SNAPSHOT=$RECOVERY_DATA_SNAPSHOT"
+    printf '%s\n' "RECOVERY_PHASE_PROJECTS=$RECOVERY_PHASE_PROJECTS"
+    printf '%s\n' "RECOVERY_PHASE_FINALIZE=$RECOVERY_PHASE_FINALIZE"
+  } > "$TEMP_FILE"
+  chmod 0600 "$TEMP_FILE"
+
+  STATE_FILE="$TEMP_FILE"
+  validate_state_file
+  STATE_FILE="$active_state_file"
+  mv -f -- "$TEMP_FILE" "$STATE_FILE"
+  TEMP_FILE=""
+}
+
+release_recovery_lock() {
+  if [[ -n "$LOCK_DIR" && -d "$LOCK_DIR" ]]; then
+    if [[ -f "$LOCK_DIR/pid" && ! -L "$LOCK_DIR/pid" ]]; then
+      rm -f -- "$LOCK_DIR/pid"
+    fi
+    rmdir "$LOCK_DIR" 2>/dev/null || \
+      recovery_warn "Unable to release recovery operation lock"
+  fi
+  LOCK_DIR=""
+}
+
+acquire_recovery_lock() {
+  local lock_pid=""
+
+  LOCK_DIR="$STATE_ROOT/operation.lock"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    [[ -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]] || \
+      fail "Recovery operation lock is not a regular directory"
+    if [[ -f "$LOCK_DIR/pid" && ! -L "$LOCK_DIR/pid" ]]; then
+      IFS= read -r lock_pid < "$LOCK_DIR/pid" || true
+    fi
+    if [[ "$lock_pid" =~ ^[1-9][0-9]*$ ]] && \
+      kill -0 "$lock_pid" 2>/dev/null; then
+      fail "Another recovery operation is running"
+    fi
+    recovery_warn "Removing stale recovery operation lock"
+    [[ ! -e "$LOCK_DIR/pid" || \
+      (-f "$LOCK_DIR/pid" && ! -L "$LOCK_DIR/pid") ]] || \
+      fail "Recovery operation lock contains an unsafe PID file"
+    rm -f -- "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || \
+      fail "Recovery operation lock contains unexpected data"
+    mkdir "$LOCK_DIR" || fail "Unable to acquire recovery operation lock"
+  fi
+  chmod 0700 "$LOCK_DIR"
+  umask 077
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+  chmod 0600 "$LOCK_DIR/pid"
+}
+
 cleanup() {
+  local cleanup_status=0
+
+  if [[ "$CONFIG_INSTALLED_BY_RUN" == "1" && \
+    -n "$CONFIG_ROOT" && -d "$CONFIG_ROOT" && \
+    -n "$INSTALL_TEMP" && ! -e "$INSTALL_TEMP" ]]; then
+    if ! mv -- "$CONFIG_ROOT" "$INSTALL_TEMP"; then
+      recovery_warn "Unable to roll back configuration installed by failed recovery"
+      cleanup_status=1
+    fi
+  fi
+  CONFIG_INSTALLED_BY_RUN=0
+
+  if [[ -n "$INSTALL_TEMP" && -d "$INSTALL_TEMP" && \
+    "$INSTALL_TEMP" == "${CONFIG_ROOT%/*}/.${CONFIG_ROOT##*/}.recovery-"* && \
+    ! -L "$INSTALL_TEMP" ]]; then
+    rm -rf -- "$INSTALL_TEMP"
+  fi
+  INSTALL_TEMP=""
+
+  if [[ -n "$RESTORE_TARGET" && -d "$RESTORE_TARGET" && \
+    "$RESTORE_TARGET" == "$WORK_ROOT/config-restore-"* && \
+    ! -L "$RESTORE_TARGET" ]]; then
+    rm -rf -- "$RESTORE_TARGET"
+  fi
+  RESTORE_TARGET=""
+
   if [[ -n "$TEMP_FILE" && -f "$TEMP_FILE" ]]; then
     rm -f -- "$TEMP_FILE"
   fi
+  TEMP_FILE=""
+  release_recovery_lock || cleanup_status=1
+  return "$cleanup_status"
 }
 
 run_init() {
@@ -563,6 +692,298 @@ run_init() {
   recovery_warn "The break-glass file was not copied; keep it available for the restore phase"
 }
 
+load_recovery_context() {
+  [[ -n "$BREAK_GLASS_FILE" ]] || \
+    fail "$OPERATION requires --break-glass"
+  validate_secret_record_file "$BREAK_GLASS_FILE"
+  read_break_glass "$BREAK_GLASS_FILE"
+  validate_current_repository
+  locate_state_root
+  validate_state_file
+
+  [[ "$RECOVERY_INSTANCE" == "$BREAK_GLASS_INSTANCE" ]] || \
+    fail "Recovery session belongs to another server"
+  [[ "$RECOVERY_BREAK_GLASS_GENERATED_AT" == \
+    "$BREAK_GLASS_GENERATED_AT" ]] || \
+    fail "Recovery session uses another break-glass record"
+  [[ "$RECOVERY_INFRA_REPOSITORY_URL" == \
+    "$BREAK_GLASS_REPOSITORY_URL" ]] || \
+    fail "Recovery session uses another infrastructure repository"
+  [[ "$RECOVERY_INFRA_REPOSITORY_REF" == \
+    "$BREAK_GLASS_REPOSITORY_REF" ]] || \
+    fail "Recovery session uses another infrastructure commit"
+}
+
+paths_overlap() {
+  local first="${1%/}"
+  local second="${2%/}"
+
+  [[ "$first" == "$second" || "$first" == "$second"/* || \
+    "$second" == "$first"/* ]]
+}
+
+validate_config_destination() {
+  local config_parent="${CONFIG_ROOT%/*}"
+  local physical_repository_root
+
+  [[ -n "$config_parent" ]] || config_parent="/"
+  validate_config_root_path "$CONFIG_ROOT"
+  validate_absolute_path "$CONFIG_ROOT" "Configuration root"
+  validate_no_symlink_components "$CONFIG_ROOT" "Configuration root"
+  [[ -d "$config_parent" && ! -L "$config_parent" ]] || \
+    fail "Configuration parent directory not found: $config_parent"
+
+  physical_repository_root="$(cd "$REPOSITORY_ROOT" && pwd -P)"
+  ! paths_overlap "$CONFIG_ROOT" "$physical_repository_root" || \
+    fail "Configuration root must be outside the server-infra repository"
+  ! paths_overlap "$CONFIG_ROOT" "$STATE_ROOT" || \
+    fail "Configuration root must not overlap recovery state"
+
+  if [[ "$(uname -s)" == "Linux" && \
+    "${CONFIG_ROOT%/}" == "/etc/server-infra" && "$(id -u)" != "0" ]]; then
+    fail "Default configuration restore must run as root"
+  fi
+}
+
+validate_work_root() {
+  local normalized_root="${WORK_ROOT%/}"
+  local physical_repository_root
+
+  validate_absolute_path "$WORK_ROOT" "Recovery work root"
+  case "$normalized_root" in
+    "" | / | /var | /var/cache | /etc | /run | /tmp | /home | /root | /usr | /opt)
+      fail "Refusing unsafe recovery work root: $WORK_ROOT"
+      ;;
+  esac
+  validate_no_symlink_components "$WORK_ROOT" "Recovery work root"
+  physical_repository_root="$(cd "$REPOSITORY_ROOT" && pwd -P)"
+  ! paths_overlap "$WORK_ROOT" "$physical_repository_root" || \
+    fail "Recovery work root must be outside the server-infra repository"
+  ! paths_overlap "$WORK_ROOT" "$STATE_ROOT" || \
+    fail "Recovery work root must not overlap recovery state"
+  ! paths_overlap "$WORK_ROOT" "$CONFIG_ROOT" || \
+    fail "Recovery work root must not overlap active configuration"
+}
+
+ensure_work_root() {
+  validate_work_root
+  if [[ -e "$WORK_ROOT" || -L "$WORK_ROOT" ]]; then
+    [[ -d "$WORK_ROOT" && ! -L "$WORK_ROOT" ]] || \
+      fail "Recovery work root is not a regular directory"
+    [[ "$(file_owner_id "$WORK_ROOT")" == "$(id -u)" ]] || \
+      fail "Recovery work root must belong to the invoking user"
+  else
+    mkdir -p "$WORK_ROOT"
+  fi
+  chmod 0700 "$WORK_ROOT"
+  [[ "$(file_mode "$WORK_ROOT")" == "700" ]] || \
+    fail "Recovery work root must have mode 0700"
+}
+
+run_break_glass_restic() {
+  if [[ -n "${ACTIVE_RESTIC_CACHE:-}" ]]; then
+    RESTIC_REPOSITORY="$BREAK_GLASS_RESTIC_REPOSITORY" \
+    RESTIC_PASSWORD="$BREAK_GLASS_RESTIC_PASSWORD" \
+    AWS_ACCESS_KEY_ID="$BREAK_GLASS_AWS_ACCESS_KEY_ID" \
+    AWS_SECRET_ACCESS_KEY="$BREAK_GLASS_AWS_SECRET_ACCESS_KEY" \
+    AWS_DEFAULT_REGION="$BREAK_GLASS_AWS_DEFAULT_REGION" \
+    RESTIC_CACHE_DIR="$ACTIVE_RESTIC_CACHE" \
+      restic "$@"
+  else
+    RESTIC_REPOSITORY="$BREAK_GLASS_RESTIC_REPOSITORY" \
+    RESTIC_PASSWORD="$BREAK_GLASS_RESTIC_PASSWORD" \
+    AWS_ACCESS_KEY_ID="$BREAK_GLASS_AWS_ACCESS_KEY_ID" \
+    AWS_SECRET_ACCESS_KEY="$BREAK_GLASS_AWS_SECRET_ACCESS_KEY" \
+    AWS_DEFAULT_REGION="$BREAK_GLASS_AWS_DEFAULT_REGION" \
+      restic "$@"
+  fi
+}
+
+read_single_line_secret() {
+  local file_path="$1"
+  local line_count
+  local value=""
+
+  [[ -f "$file_path" && ! -L "$file_path" && -r "$file_path" ]] || \
+    fail "Restored restic password file is missing or unsafe"
+  line_count="$(awk 'END { print NR }' "$file_path")"
+  [[ "$line_count" == "1" ]] || \
+    fail "Restored restic password file must contain exactly one line"
+  IFS= read -r value < "$file_path" || [[ -n "$value" ]] || \
+    fail "Restored restic password file is empty"
+  printf '%s' "$value"
+}
+
+validate_recovered_configuration() {
+  local recovered_root="$1"
+  local runtime_file="$recovered_root/backup/runtime.env"
+  local password_file="$recovered_root/backup/restic-password"
+  local unsafe_entry
+  local restored_instance
+  local configured_password_file
+  local restored_password
+
+  [[ -d "$recovered_root" && ! -L "$recovered_root" ]] || \
+    fail "Restored configuration root not found"
+  unsafe_entry="$(
+    find "$recovered_root" ! -type d ! -type f -print -quit
+  )"
+  [[ -z "$unsafe_entry" ]] || \
+    fail "Restored configuration contains a symlink or special file"
+
+  "$REPOSITORY_ROOT/scripts/validate-config.sh" \
+    --config-root "$recovered_root" >/dev/null
+
+  restored_instance="$(
+    read_required_env_value "$recovered_root/server.env" "SERVER_INFRA_INSTANCE"
+  )"
+  [[ "$restored_instance" == "$BREAK_GLASS_INSTANCE" ]] || \
+    fail "Restored configuration belongs to another server"
+
+  [[ "$(read_required_env_value "$runtime_file" "RESTIC_REPOSITORY")" == \
+    "$BREAK_GLASS_RESTIC_REPOSITORY" ]] || \
+    fail "Restored RESTIC_REPOSITORY differs from the break-glass record"
+  [[ "$(read_required_env_value "$runtime_file" "AWS_ACCESS_KEY_ID")" == \
+    "$BREAK_GLASS_AWS_ACCESS_KEY_ID" ]] || \
+    fail "Restored AWS_ACCESS_KEY_ID differs from the break-glass record"
+  [[ "$(read_required_env_value "$runtime_file" "AWS_SECRET_ACCESS_KEY")" == \
+    "$BREAK_GLASS_AWS_SECRET_ACCESS_KEY" ]] || \
+    fail "Restored AWS_SECRET_ACCESS_KEY differs from the break-glass record"
+  [[ "$(read_required_env_value "$runtime_file" "AWS_DEFAULT_REGION")" == \
+    "$BREAK_GLASS_AWS_DEFAULT_REGION" ]] || \
+    fail "Restored AWS_DEFAULT_REGION differs from the break-glass record"
+
+  configured_password_file="$(
+    read_required_env_value "$runtime_file" "RESTIC_PASSWORD_FILE"
+  )"
+  [[ "$configured_password_file" == \
+    "${CONFIG_ROOT%/}/backup/restic-password" ]] || \
+    fail "Restored RESTIC_PASSWORD_FILE does not match the active configuration path"
+  [[ "$(file_mode "$password_file")" == "600" ]] || \
+    fail "Restored restic password file must have mode 0600"
+  [[ "$(file_owner_id "$password_file")" == "$(id -u)" ]] || \
+    fail "Restored restic password file must belong to the invoking user"
+  restored_password="$(read_single_line_secret "$password_file")"
+  [[ "$restored_password" == "$BREAK_GLASS_RESTIC_PASSWORD" ]] || \
+    fail "Restored restic password differs from the break-glass record"
+}
+
+validate_live_configuration() {
+  validate_recovered_configuration "$CONFIG_ROOT"
+  "$REPOSITORY_ROOT/backup/bin/server-infra-backup" \
+    --config-root "$CONFIG_ROOT" validate >/dev/null
+}
+
+run_config_snapshots() {
+  load_recovery_context
+  require_command restic
+
+  recovery_log "Configuration snapshots for $RECOVERY_INSTANCE"
+  run_break_glass_restic \
+    --no-cache \
+    snapshots \
+    --host "$RECOVERY_INSTANCE" \
+    --tag server-infra-config
+}
+
+run_restore_config() {
+  local restored_config
+  local restic_cache
+
+  [[ "$SNAPSHOT_ID" =~ ^[0-9a-f]{8,64}$ ]] || \
+    fail "restore-config requires an exact 8-64 character lowercase hex snapshot ID"
+  load_recovery_context
+  validate_config_destination
+  validate_work_root
+  require_command awk
+  require_command cp
+  require_command find
+  require_command restic
+
+  acquire_recovery_lock
+  trap cleanup EXIT
+  validate_state_file
+
+  if [[ "$RECOVERY_PHASE_CONFIG" == "complete" ]]; then
+    [[ "$RECOVERY_CONFIG_SNAPSHOT" == "$SNAPSHOT_ID" ]] || \
+      fail "Configuration was already restored from another snapshot"
+    [[ -d "$CONFIG_ROOT" && ! -L "$CONFIG_ROOT" ]] || \
+      fail "Completed recovery state is missing active configuration"
+    validate_live_configuration
+    recovery_ok "configuration snapshot already restored: $SNAPSHOT_ID"
+    return
+  fi
+
+  if [[ "$RECOVERY_PHASE_CONFIG" == "pending" ]]; then
+    [[ ! -e "$CONFIG_ROOT" && ! -L "$CONFIG_ROOT" ]] || \
+      fail "Active configuration already exists; refusing to overwrite it"
+    RECOVERY_PHASE_CONFIG="in-progress"
+    RECOVERY_CONFIG_SNAPSHOT="$SNAPSHOT_ID"
+    write_state_file
+  else
+    [[ "$RECOVERY_PHASE_CONFIG" == "in-progress" ]] || \
+      fail "Configuration restore is in an unsupported state"
+    [[ "$RECOVERY_CONFIG_SNAPSHOT" == "$SNAPSHOT_ID" ]] || \
+      fail "Configuration restore is already pinned to another snapshot"
+  fi
+
+  if [[ -e "$CONFIG_ROOT" || -L "$CONFIG_ROOT" ]]; then
+    [[ -d "$CONFIG_ROOT" && ! -L "$CONFIG_ROOT" ]] || \
+      fail "Active configuration path is not a regular directory"
+    validate_live_configuration
+    RECOVERY_PHASE_CONFIG="complete"
+    write_state_file
+    recovery_ok "existing installed configuration validated after resume"
+    return
+  fi
+
+  ensure_work_root
+  RESTORE_TARGET="$WORK_ROOT/config-restore-$RECOVERY_SESSION_ID"
+  INSTALL_TEMP="${CONFIG_ROOT%/*}/.${CONFIG_ROOT##*/}.recovery-$RECOVERY_SESSION_ID"
+  if [[ -e "$RESTORE_TARGET" || -L "$RESTORE_TARGET" ]]; then
+    [[ -d "$RESTORE_TARGET" && ! -L "$RESTORE_TARGET" ]] || \
+      fail "Managed restore target is not a regular directory"
+    rm -rf -- "$RESTORE_TARGET"
+  fi
+  if [[ -e "$INSTALL_TEMP" || -L "$INSTALL_TEMP" ]]; then
+    [[ -d "$INSTALL_TEMP" && ! -L "$INSTALL_TEMP" ]] || \
+      fail "Managed configuration staging path is not a regular directory"
+    rm -rf -- "$INSTALL_TEMP"
+  fi
+  mkdir -m 0700 "$RESTORE_TARGET"
+  restic_cache="$WORK_ROOT/restic-cache"
+  mkdir -p "$restic_cache"
+  chmod 0700 "$restic_cache"
+  ACTIVE_RESTIC_CACHE="$restic_cache"
+
+  recovery_log "Restoring configuration snapshot $SNAPSHOT_ID"
+  run_break_glass_restic \
+    restore "$SNAPSHOT_ID" \
+    --host "$RECOVERY_INSTANCE" \
+    --tag server-infra-config \
+    --target "$RESTORE_TARGET"
+
+  restored_config="$RESTORE_TARGET$CONFIG_ROOT"
+  validate_recovered_configuration "$restored_config"
+  cp -a "$restored_config" "$INSTALL_TEMP"
+  validate_recovered_configuration "$INSTALL_TEMP"
+
+  [[ ! -e "$CONFIG_ROOT" && ! -L "$CONFIG_ROOT" ]] || \
+    fail "Active configuration appeared during restore; refusing to overwrite it"
+  mv -n -- "$INSTALL_TEMP" "$CONFIG_ROOT"
+  [[ -d "$CONFIG_ROOT" && ! -e "$INSTALL_TEMP" ]] || \
+    fail "Unable to install configuration without overwriting existing data"
+  CONFIG_INSTALLED_BY_RUN=1
+
+  validate_live_configuration
+  RECOVERY_PHASE_CONFIG="complete"
+  write_state_file
+  CONFIG_INSTALLED_BY_RUN=0
+
+  recovery_ok "configuration restored and validated from snapshot $SNAPSHOT_ID"
+  recovery_warn "Project data and public traffic remain untouched"
+}
+
 print_phase() {
   local phase_number="$1"
   local phase_state="$2"
@@ -589,24 +1010,18 @@ run_plan() {
     "Validate applications, deploy Caddy, open traffic, and create a new backup"
 
   printf '\n'
-  case "pending" in
-    "$RECOVERY_PHASE_CONFIG")
-      printf '%s\n' \
-        "Next: restore host configuration using backup/RECOVERY.md."
-      ;;
-    "$RECOVERY_PHASE_DATA")
-      printf '%s\n' "Next: select and record one exact data snapshot."
-      ;;
-    "$RECOVERY_PHASE_PROJECTS")
-      printf '%s\n' "Next: restore projects in dependency order."
-      ;;
-    "$RECOVERY_PHASE_FINALIZE")
-      printf '%s\n' "Next: verify services before enabling public traffic."
-      ;;
-    *)
-      printf '%s\n' "Next: no incomplete automated phase was found."
-      ;;
-  esac
+  if [[ "$RECOVERY_PHASE_CONFIG" != "complete" ]]; then
+    printf '%s\n' \
+      "Next: list config-snapshots and run restore-config with one exact ID."
+  elif [[ "$RECOVERY_PHASE_DATA" != "complete" ]]; then
+    printf '%s\n' "Next: select and record one exact data snapshot."
+  elif [[ "$RECOVERY_PHASE_PROJECTS" != "complete" ]]; then
+    printf '%s\n' "Next: restore projects in dependency order."
+  elif [[ "$RECOVERY_PHASE_FINALIZE" != "complete" ]]; then
+    printf '%s\n' "Next: verify services before enabling public traffic."
+  else
+    printf '%s\n' "Next: no incomplete recovery phase was found."
+  fi
 }
 
 run_status() {
@@ -629,6 +1044,9 @@ run_status() {
 parse_arguments() {
   local state_root_set=0
   local break_glass_set=0
+  local config_root_set=0
+  local work_root_set=0
+  local snapshot_set=0
 
   while (($# > 0)); do
     case "$1" in
@@ -664,11 +1082,59 @@ parse_arguments() {
         break_glass_set=1
         shift
         ;;
+      --config-root)
+        (($# >= 2)) || fail "Missing value for --config-root"
+        [[ "$config_root_set" == "0" ]] || \
+          fail "--config-root may be specified only once"
+        CONFIG_ROOT="$2"
+        config_root_set=1
+        shift 2
+        ;;
+      --config-root=*)
+        [[ "$config_root_set" == "0" ]] || \
+          fail "--config-root may be specified only once"
+        CONFIG_ROOT="${1#*=}"
+        [[ -n "$CONFIG_ROOT" ]] || fail "Missing value for --config-root"
+        config_root_set=1
+        shift
+        ;;
+      --work-root)
+        (($# >= 2)) || fail "Missing value for --work-root"
+        [[ "$work_root_set" == "0" ]] || \
+          fail "--work-root may be specified only once"
+        WORK_ROOT="$2"
+        work_root_set=1
+        shift 2
+        ;;
+      --work-root=*)
+        [[ "$work_root_set" == "0" ]] || \
+          fail "--work-root may be specified only once"
+        WORK_ROOT="${1#*=}"
+        [[ -n "$WORK_ROOT" ]] || fail "Missing value for --work-root"
+        work_root_set=1
+        shift
+        ;;
+      --snapshot)
+        (($# >= 2)) || fail "Missing value for --snapshot"
+        [[ "$snapshot_set" == "0" ]] || \
+          fail "--snapshot may be specified only once"
+        SNAPSHOT_ID="$2"
+        snapshot_set=1
+        shift 2
+        ;;
+      --snapshot=*)
+        [[ "$snapshot_set" == "0" ]] || \
+          fail "--snapshot may be specified only once"
+        SNAPSHOT_ID="${1#*=}"
+        [[ -n "$SNAPSHOT_ID" ]] || fail "Missing value for --snapshot"
+        snapshot_set=1
+        shift
+        ;;
       --help | -h)
         usage
         exit 0
         ;;
-      init | plan | status)
+      init | plan | status | config-snapshots | restore-config)
         [[ -z "$OPERATION" ]] || fail "Specify exactly one operation"
         OPERATION="$1"
         shift
@@ -680,8 +1146,26 @@ parse_arguments() {
   done
 
   [[ -n "$OPERATION" ]] || { usage; exit 1; }
-  if [[ "$OPERATION" != "init" && -n "$BREAK_GLASS_FILE" ]]; then
-    fail "--break-glass is supported only by init"
+  case "$OPERATION" in
+    init | config-snapshots)
+      [[ -z "$SNAPSHOT_ID" ]] || \
+        fail "--snapshot is supported only by restore-config"
+      [[ "$config_root_set" == "0" && "$work_root_set" == "0" ]] || \
+        fail "--config-root and --work-root are supported only by restore-config"
+      ;;
+    restore-config)
+      [[ -n "$SNAPSHOT_ID" ]] || fail "restore-config requires --snapshot"
+      ;;
+    plan | status)
+      [[ -z "$BREAK_GLASS_FILE" && -z "$SNAPSHOT_ID" ]] || \
+        fail "Break-glass and snapshot options are not supported by $OPERATION"
+      [[ "$config_root_set" == "0" && "$work_root_set" == "0" ]] || \
+        fail "--config-root and --work-root are supported only by restore-config"
+      ;;
+  esac
+  if [[ "$OPERATION" != "plan" && "$OPERATION" != "status" && \
+    -z "$BREAK_GLASS_FILE" ]]; then
+    fail "$OPERATION requires --break-glass"
   fi
 }
 
@@ -698,6 +1182,12 @@ main() {
       ;;
     status)
       run_status
+      ;;
+    config-snapshots)
+      run_config_snapshots
+      ;;
+    restore-config)
+      run_restore_config
       ;;
   esac
 }

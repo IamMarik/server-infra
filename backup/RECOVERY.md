@@ -103,22 +103,29 @@ sudo ./scripts/install-restic.sh --apply
 
 ### 3. Restore host configuration
 
-Use the break-glass values to list snapshots tagged
-`server-infra-config`. Restore a selected configuration snapshot into a new,
-empty temporary directory. Never restore directly over `/etc`.
+List only the configuration snapshots belonging to this server:
 
-Verify that the restored tree contains:
-
-```text
-etc/server-infra/server.env
-etc/server-infra/modules.env
-etc/server-infra/backup/runtime.env
-etc/server-infra/backup/restic-password
+```bash
+sudo ./recovery/bin/server-infra-recovery config-snapshots \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
 ```
 
-Copy the reviewed `etc/server-infra` tree to `/etc/server-infra`, preserving
-ownership and permissions. Recovery phase transitions are not automated yet;
-use `server-infra-recovery plan` together with this runbook.
+Choose one explicit snapshot ID. Do not use a moving `latest` selector:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery restore-config \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --snapshot <config-snapshot-id>
+```
+
+The command pins the ID in recovery state before contacting restic, restores
+into root-only temporary storage, rejects symlinks and special files, validates
+the complete host configuration, and verifies that its server identity and
+backup credentials match the break-glass record. It installs only when
+`/etc/server-infra` is absent and does not start services or traffic.
+
+If the operation is interrupted, rerun the same command with the same snapshot
+ID. Another snapshot is rejected for that recovery session.
 
 ### 4. Validate restored configuration
 

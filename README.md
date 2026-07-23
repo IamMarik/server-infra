@@ -175,8 +175,18 @@ sudo ./recovery/bin/server-infra-recovery plan
 sudo ./recovery/bin/server-infra-recovery status
 ```
 
-The current recovery CLI validates the entry conditions and records progress;
-restore and deployment phases remain operator-guided. See `recovery/README.md`.
+It can then list and restore one explicitly selected configuration snapshot:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery config-snapshots \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery restore-config \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --snapshot <config-snapshot-id>
+```
+
+Project data and deployment phases remain operator-guided. See
+`recovery/README.md`.
 
 ## Documentation
 

@@ -10,6 +10,11 @@ STATE_ROOT="$TEST_ROOT/state/recovery"
 ABSENT_STATE_ROOT="$TEST_ROOT/absent/recovery"
 WRONG_STATE_ROOT="$TEST_ROOT/wrong/state"
 UNSAFE_STATE_ROOT="$TEST_ROOT/unsafe/state"
+RESUME_STATE_ROOT="$TEST_ROOT/resume/state"
+CONFIG_ROOT="$TEST_ROOT/etc/server-infra"
+WORK_ROOT="$TEST_ROOT/cache/recovery"
+RESUME_CONFIG_ROOT="$TEST_ROOT/resume/etc/server-infra"
+RESUME_WORK_ROOT="$TEST_ROOT/resume/cache/recovery"
 BREAK_GLASS_FILE="$TEST_ROOT/server-infra-break-glass.txt"
 WRONG_BREAK_GLASS_FILE="$TEST_ROOT/wrong-break-glass.txt"
 UNSAFE_BREAK_GLASS_FILE="$TEST_ROOT/unsafe-break-glass.txt"
@@ -18,6 +23,8 @@ TEST_BIN="$TEST_ROOT/bin"
 COMMAND_OUTPUT="$TEST_ROOT/command.log"
 PLAN_OUTPUT="$TEST_ROOT/plan.log"
 STATUS_OUTPUT="$TEST_ROOT/status.log"
+SNAPSHOTS_OUTPUT="$TEST_ROOT/snapshots.log"
+RESTIC_LOG="$TEST_ROOT/restic.log"
 RECOVERY="$REPOSITORY_ROOT/recovery/bin/server-infra-recovery"
 TEST_REPOSITORY_URL="git@github.com:example/server-infra.git"
 TEST_REPOSITORY_REF="0123456789abcdef0123456789abcdef01234567"
@@ -98,6 +105,8 @@ printf '%s\n' \
   'esac' \
   > "$TEST_BIN/git"
 chmod 0755 "$TEST_BIN/git"
+ln -s "$REPOSITORY_ROOT/recovery/tests/fake-restic" "$TEST_BIN/restic"
+export FAKE_RESTIC_LOG="$RESTIC_LOG"
 
 write_break_glass \
   "$BREAK_GLASS_FILE" \
@@ -153,10 +162,119 @@ assert_contains "$PLAN_OUTPUT" \
 assert_contains "$PLAN_OUTPUT" \
   "2. [pending] Restore and validate /etc/server-infra"
 assert_contains "$PLAN_OUTPUT" \
-  "Next: restore host configuration using backup/RECOVERY.md."
+  "Next: list config-snapshots and run restore-config with one exact ID."
 assert_contains "$STATUS_OUTPUT" "Instance: acceptance"
 assert_contains "$STATUS_OUTPUT" "Configuration snapshot: not-selected"
 assert_contains "$STATUS_OUTPUT" "Data snapshot: not-selected"
+
+PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  config-snapshots \
+  --break-glass "$BREAK_GLASS_FILE" > "$SNAPSHOTS_OUTPUT"
+assert_contains "$SNAPSHOTS_OUTPUT" \
+  "abcdef12  2026-07-24 00:00:00  acceptance  server-infra-config"
+assert_contains "$RESTIC_LOG" \
+  "--no-cache snapshots --host acceptance --tag server-infra-config"
+
+mkdir -p "${CONFIG_ROOT%/*}"
+FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  --work-root "$WORK_ROOT" \
+  restore-config \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --snapshot abcdef12 >> "$COMMAND_OUTPUT" 2>&1
+
+[[ -d "$CONFIG_ROOT/backup" ]] || \
+  fail_test "Configuration snapshot was not installed"
+assert_contains "$CONFIG_ROOT/server.env" \
+  "SERVER_INFRA_INSTANCE=acceptance"
+assert_contains "$STATE_FILE" "RECOVERY_PHASE_CONFIG=complete"
+assert_contains "$STATE_FILE" "RECOVERY_CONFIG_SNAPSHOT=abcdef12"
+assert_contains "$RESTIC_LOG" \
+  "restore abcdef12 --host acceptance --tag server-infra-config"
+if find "$WORK_ROOT" -maxdepth 1 -type d -name 'config-restore-*' \
+  -print -quit | grep -q .; then
+  fail_test "Successful restore left plaintext configuration staging data"
+fi
+
+RESTIC_LINES_BEFORE="$(wc -l < "$RESTIC_LOG")"
+mkdir "$STATE_ROOT/operation.lock"
+printf '%s\n' "99999999" > "$STATE_ROOT/operation.lock/pid"
+chmod 0700 "$STATE_ROOT/operation.lock"
+chmod 0600 "$STATE_ROOT/operation.lock/pid"
+FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  --work-root "$WORK_ROOT" \
+  restore-config \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --snapshot abcdef12 >> "$COMMAND_OUTPUT" 2>&1
+RESTIC_LINES_AFTER="$(wc -l < "$RESTIC_LOG")"
+[[ "$RESTIC_LINES_BEFORE" == "$RESTIC_LINES_AFTER" ]] || \
+  fail_test "Repeated completed restore contacted restic again"
+[[ ! -e "$STATE_ROOT/operation.lock" ]] || \
+  fail_test "Stale recovery lock was not reclaimed and released"
+
+if FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  --work-root "$WORK_ROOT" \
+  restore-config \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --snapshot 12345678 >/dev/null 2>&1; then
+  fail_test "Completed configuration phase accepted another snapshot"
+fi
+
+PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$RESUME_STATE_ROOT" \
+  init --break-glass "$BREAK_GLASS_FILE" >/dev/null 2>&1
+mkdir -p "${RESUME_CONFIG_ROOT%/*}"
+if FAKE_RESTORE_INVALID=1 \
+  FAKE_CONFIG_ROOT="$RESUME_CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$RESUME_STATE_ROOT" \
+  --config-root "$RESUME_CONFIG_ROOT" \
+  --work-root "$RESUME_WORK_ROOT" \
+  restore-config \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --snapshot abcdef12 >/dev/null 2>&1; then
+  fail_test "Invalid restored configuration was accepted"
+fi
+[[ ! -e "$RESUME_CONFIG_ROOT" ]] || \
+  fail_test "Failed restore left active configuration behind"
+assert_contains "$RESUME_STATE_ROOT/session.env" \
+  "RECOVERY_PHASE_CONFIG=in-progress"
+assert_contains "$RESUME_STATE_ROOT/session.env" \
+  "RECOVERY_CONFIG_SNAPSHOT=abcdef12"
+
+FAKE_CONFIG_ROOT="$RESUME_CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$RESUME_STATE_ROOT" \
+  --config-root "$RESUME_CONFIG_ROOT" \
+  --work-root "$RESUME_WORK_ROOT" \
+  restore-config \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --snapshot abcdef12 >/dev/null 2>&1
+[[ -d "$RESUME_CONFIG_ROOT/backup" ]] || \
+  fail_test "Interrupted configuration restore did not resume"
+assert_contains "$RESUME_STATE_ROOT/session.env" \
+  "RECOVERY_PHASE_CONFIG=complete"
+
+for secret_value in \
+  "test-restic-password" \
+  "test-access-key" \
+  "test-secret-key"; do
+  if grep -F "$secret_value" \
+    "$STATE_FILE" \
+    "$RESUME_STATE_ROOT/session.env" \
+    "$COMMAND_OUTPUT" \
+    "$PLAN_OUTPUT" \
+    "$STATUS_OUTPUT" \
+    "$SNAPSHOTS_OUTPUT" \
+    "$RESTIC_LOG" >/dev/null; then
+    fail_test "Secret value escaped from the break-glass record"
+  fi
+done
 
 write_break_glass \
   "$WRONG_BREAK_GLASS_FILE" \
@@ -189,4 +307,4 @@ if PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   fail_test "Recovery accepted a symlinked break-glass record"
 fi
 
-printf '[recovery-test][ok] secure initialization, plan, status, and rerun passed\n'
+printf '[recovery-test][ok] secure session and resumable configuration restore passed\n'

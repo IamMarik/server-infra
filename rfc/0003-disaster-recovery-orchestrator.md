@@ -123,9 +123,9 @@ must not blindly copy a restored tree over Git checkouts, run arbitrary hooks
 from host configuration, promote databases, change DNS, or make application
 schema decisions.
 
-## Initial implementation
+## Delivery increments
 
-The accepted first increment implements only:
+The first increment implements:
 
 - `init --break-glass`;
 - `plan`;
@@ -133,9 +133,20 @@ The accepted first increment implements only:
 - strict state and input validation;
 - isolated tests with fake Git responses.
 
-Configuration restoration, snapshot selection, project reconstruction,
-resume transitions, and finalization remain documented manual operations until
-their contracts are separately implemented and tested.
+The second increment implements:
+
+- `config-snapshots --break-glass`;
+- `restore-config --break-glass --snapshot`;
+- snapshot pinning before remote access;
+- an `in-progress` state that can resume after interruption;
+- extraction into root-only temporary storage;
+- validation against repository contracts and break-glass identity;
+- installation only when `/etc/server-infra` is absent;
+- rollback of configuration installed by a handled failed invocation.
+
+Data snapshot selection, project reconstruction, application validation,
+deployment, and finalization remain documented manual operations until their
+contracts are separately implemented and tested.
 
 ## Consequences
 

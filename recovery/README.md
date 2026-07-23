@@ -17,14 +17,16 @@ the manual disaster-recovery runbook.
 
 ## Current scope
 
-The first version provides:
+The current implementation provides:
 
 - `init` to validate the break-glass record against the current repository;
 - a root-owned, resumable, non-secret recovery session;
 - `plan` to display ordered recovery phases;
 - `status` to inspect pinned metadata and phase state.
+- `config-snapshots` to list matching configuration snapshots;
+- `restore-config` to pin, restore, validate, and install one snapshot.
 
-It does not yet restore configuration or data, clone projects, deploy
+It does not yet select or restore the data snapshot, clone projects, deploy
 infrastructure, or start public traffic.
 
 ## Security model
@@ -44,6 +46,12 @@ Provider credentials and the restic password are validated but never copied to
 the session state or printed. The operator retains and removes the break-glass
 file separately.
 
+`restore-config` passes those values to restic through the child process
+environment, never as command-line arguments or a generated shell file. It
+rejects symlinks and special files in restored configuration, verifies that
+the restored credentials and server identity match the break-glass record,
+and refuses to overwrite an existing active configuration.
+
 ## Session state
 
 Default state:
@@ -59,11 +67,18 @@ only:
 - server instance and recovery session timestamps;
 - break-glass generation timestamp;
 - server-infra repository URL and exact commit;
-- selected snapshot IDs when future phases implement selection;
+- the pinned configuration snapshot and, later, data snapshot;
 - phase statuses.
 
 `init` never overwrites an existing session. Re-running it with the same
 break-glass record validates and reuses that session. A mismatch fails.
+
+Configuration restore changes its phase to `in-progress` and pins the selected
+snapshot before contacting restic. A retry must use the same snapshot. After a
+crash, the command either resumes the restore or validates an already
+installed configuration before marking the phase complete. Recovery mutations
+are serialized with a PID lock; a lock whose process no longer exists is
+reclaimed on retry.
 
 ## Operations
 
@@ -78,8 +93,26 @@ sudo ./recovery/bin/server-infra-recovery plan
 sudo ./recovery/bin/server-infra-recovery status
 ```
 
+List matching configuration snapshots, choose one explicit ID, then restore
+it:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery config-snapshots \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
+
+sudo ./recovery/bin/server-infra-recovery restore-config \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --snapshot <config-snapshot-id>
+```
+
+The restore uses `/var/cache/server-infra/recovery` for a root-only restic
+cache and temporary extraction. Plaintext extraction is removed on success or
+handled failure. The cache can remain because restic stores repository cache
+data, not plaintext configuration secrets.
+
 Use `--state-root` only for tests or an explicitly reviewed non-standard host
-layout.
+layout. `--config-root` and `--work-root` exist for tests and reviewed
+non-standard hosts; production recovery uses their defaults.
 
 The break-glass path is not saved. Keep it available for the future
 configuration restore phase, import the authoritative copy into the password
@@ -115,5 +148,11 @@ Run without contacting GitHub, Backblaze, or a real restic repository:
   exactly; restore or commit the changes before initialization.
 - `session is not initialized` means `init` has not completed for the selected
   state root.
+- `already restored from another snapshot` protects a pinned recovery from
+  mixing configuration points.
+- `active configuration already exists` protects a server that is not a clean
+  recovery target.
+- A failed configuration extraction remains pinned as `in-progress`; rerun
+  `restore-config` with the same snapshot ID.
 - An existing session is never silently replaced. Session reset will be a
   separate, explicitly destructive operation if it is introduced later.
