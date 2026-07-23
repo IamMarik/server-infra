@@ -139,9 +139,24 @@ the traffic path until projects and databases are restored and validated.
 
 ### 5. Freeze one data snapshot
 
-Select one exact snapshot tagged `server-infra-data`. Record its ID and use
-that same ID for every project. Do not use a moving `latest` selector during a
-long recovery.
+List data snapshots only after configuration recovery has completed:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery data-snapshots \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
+```
+
+Select one snapshot tagged `server-infra-data`. The command verifies its host
+and tag, then pins its ID in recovery state:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery select-data \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --snapshot <data-snapshot-id>
+```
+
+Use that same ID for every project. The recovery session rejects changing it.
+Do not use a moving `latest` selector during a long recovery.
 
 Restore the data snapshot into a separate temporary directory:
 

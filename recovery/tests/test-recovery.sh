@@ -24,6 +24,7 @@ COMMAND_OUTPUT="$TEST_ROOT/command.log"
 PLAN_OUTPUT="$TEST_ROOT/plan.log"
 STATUS_OUTPUT="$TEST_ROOT/status.log"
 SNAPSHOTS_OUTPUT="$TEST_ROOT/snapshots.log"
+DATA_SNAPSHOTS_OUTPUT="$TEST_ROOT/data-snapshots.log"
 RESTIC_LOG="$TEST_ROOT/restic.log"
 RECOVERY="$REPOSITORY_ROOT/recovery/bin/server-infra-recovery"
 TEST_REPOSITORY_URL="git@github.com:example/server-infra.git"
@@ -226,6 +227,52 @@ if FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   fail_test "Completed configuration phase accepted another snapshot"
 fi
 
+FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  data-snapshots \
+  --break-glass "$BREAK_GLASS_FILE" > "$DATA_SNAPSHOTS_OUTPUT"
+assert_contains "$DATA_SNAPSHOTS_OUTPUT" \
+  "deadbeef  2026-07-24 00:05:00  acceptance  server-infra-data"
+assert_contains "$RESTIC_LOG" \
+  "--no-cache snapshots --host acceptance --tag server-infra-data"
+
+FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  select-data \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --snapshot deadbeef >> "$COMMAND_OUTPUT" 2>&1
+assert_contains "$STATE_FILE" "RECOVERY_PHASE_DATA=complete"
+assert_contains "$STATE_FILE" "RECOVERY_DATA_SNAPSHOT=deadbeef"
+assert_contains "$RESTIC_LOG" \
+  "--no-cache snapshots deadbeef --host acceptance --tag server-infra-data"
+
+RESTIC_LINES_BEFORE="$(wc -l < "$RESTIC_LOG")"
+FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  select-data \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --snapshot deadbeef >> "$COMMAND_OUTPUT" 2>&1
+RESTIC_LINES_AFTER="$(wc -l < "$RESTIC_LOG")"
+[[ "$RESTIC_LINES_BEFORE" == "$RESTIC_LINES_AFTER" ]] || \
+  fail_test "Repeated data selection contacted restic again"
+
+if FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  select-data \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --snapshot 12345678 >/dev/null 2>&1; then
+  fail_test "Data selection accepted another snapshot after pinning"
+fi
+
+PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" plan > "$PLAN_OUTPUT"
+assert_contains "$PLAN_OUTPUT" \
+  "Next: restore projects in dependency order."
+
 PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   --state-root "$RESUME_STATE_ROOT" \
   init --break-glass "$BREAK_GLASS_FILE" >/dev/null 2>&1
@@ -271,6 +318,7 @@ for secret_value in \
     "$PLAN_OUTPUT" \
     "$STATUS_OUTPUT" \
     "$SNAPSHOTS_OUTPUT" \
+    "$DATA_SNAPSHOTS_OUTPUT" \
     "$RESTIC_LOG" >/dev/null; then
     fail_test "Secret value escaped from the break-glass record"
   fi
@@ -307,4 +355,4 @@ if PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   fail_test "Recovery accepted a symlinked break-glass record"
 fi
 
-printf '[recovery-test][ok] secure session and resumable configuration restore passed\n'
+printf '[recovery-test][ok] resumable config restore and pinned data snapshot passed\n'

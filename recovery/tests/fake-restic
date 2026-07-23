@@ -18,9 +18,15 @@ fi
 
 case "${1:-}" in
   snapshots)
-    printf '%s\n' \
-      "ID        Time                 Host        Tags" \
-      "abcdef12  2026-07-24 00:00:00  acceptance  server-infra-config"
+    if [[ " $* " == *" --tag server-infra-data "* ]]; then
+      printf '%s\n' \
+        "ID        Time                 Host        Tags" \
+        "deadbeef  2026-07-24 00:05:00  acceptance  server-infra-data"
+    else
+      printf '%s\n' \
+        "ID        Time                 Host        Tags" \
+        "abcdef12  2026-07-24 00:00:00  acceptance  server-infra-config"
+    fi
     ;;
   restore)
     target=""

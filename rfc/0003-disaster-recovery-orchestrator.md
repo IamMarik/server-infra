@@ -144,9 +144,17 @@ The second increment implements:
 - installation only when `/etc/server-infra` is absent;
 - rollback of configuration installed by a handled failed invocation.
 
-Data snapshot selection, project reconstruction, application validation,
-deployment, and finalization remain documented manual operations until their
-contracts are separately implemented and tested.
+The third increment implements:
+
+- `data-snapshots --break-glass`;
+- `select-data --break-glass --snapshot`;
+- validation of the selected snapshot against server host and data tag;
+- one immutable data snapshot ID shared by every project restore;
+- idempotent reselection of the same ID and refusal of a different ID.
+
+Project reconstruction, application validation, deployment, and finalization
+remain documented manual operations until their contracts are separately
+implemented and tested.
 
 ## Consequences
 

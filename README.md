@@ -188,6 +188,16 @@ sudo ./recovery/bin/server-infra-recovery restore-config \
 Project data and deployment phases remain operator-guided. See
 `recovery/README.md`.
 
+After configuration recovery, pin one data point for every project:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery data-snapshots \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery select-data \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --snapshot <data-snapshot-id>
+```
+
 ## Documentation
 
 - `ARCHITECTURE.md` explains the system model.

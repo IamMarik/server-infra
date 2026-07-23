@@ -46,6 +46,12 @@ Usage:
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] [--work-root <absolute-path>] \
     restore-config --break-glass <absolute-path> --snapshot <exact-id>
+  server-infra-recovery [--state-root <absolute-path>] \
+    [--config-root <absolute-path>] \
+    data-snapshots --break-glass <absolute-path>
+  server-infra-recovery [--state-root <absolute-path>] \
+    [--config-root <absolute-path>] \
+    select-data --break-glass <absolute-path> --snapshot <exact-id>
 
 Operations:
   init
@@ -61,9 +67,13 @@ Operations:
   restore-config
     Restore one exact configuration snapshot, validate it, and install it only
     when the active configuration root is absent.
+  data-snapshots
+    List data snapshots after configuration recovery is complete.
+  select-data
+    Verify and pin one data snapshot for every project in this recovery.
 
-The implementation does not yet restore project data, deploy infrastructure,
-or start traffic. Follow backup/RECOVERY.md for those phases.
+The implementation does not yet restore project files or databases, deploy
+infrastructure, or start traffic. Follow backup/RECOVERY.md for those phases.
 
 Defaults to:
   --state-root /var/lib/server-infra/recovery
@@ -984,6 +994,79 @@ run_restore_config() {
   recovery_warn "Project data and public traffic remain untouched"
 }
 
+validate_configuration_phase_complete() {
+  [[ "$RECOVERY_PHASE_CONFIG" == "complete" ]] || \
+    fail "Configuration recovery must complete before selecting project data"
+  [[ -d "$CONFIG_ROOT" && ! -L "$CONFIG_ROOT" ]] || \
+    fail "Completed recovery state is missing active configuration"
+  validate_config_destination
+  validate_live_configuration
+}
+
+run_data_snapshots() {
+  load_recovery_context
+  validate_configuration_phase_complete
+  require_command restic
+
+  recovery_log "Data snapshots for $RECOVERY_INSTANCE"
+  run_break_glass_restic \
+    --no-cache \
+    snapshots \
+    --host "$RECOVERY_INSTANCE" \
+    --tag server-infra-data
+}
+
+run_select_data() {
+  local snapshot_listing
+  local snapshot_line=""
+  local displayed_id
+  local snapshot_found=0
+
+  [[ "$SNAPSHOT_ID" =~ ^[0-9a-f]{8,64}$ ]] || \
+    fail "select-data requires an exact 8-64 character lowercase hex snapshot ID"
+  load_recovery_context
+  validate_configuration_phase_complete
+  require_command restic
+
+  acquire_recovery_lock
+  trap cleanup EXIT
+  validate_state_file
+
+  if [[ "$RECOVERY_PHASE_DATA" == "complete" ]]; then
+    [[ "$RECOVERY_DATA_SNAPSHOT" == "$SNAPSHOT_ID" ]] || \
+      fail "Data snapshot is already pinned to another ID"
+    recovery_ok "data snapshot already selected: $SNAPSHOT_ID"
+    return
+  fi
+  [[ "$RECOVERY_PHASE_DATA" == "pending" ]] || \
+    fail "Data snapshot selection is in an unsupported state"
+
+  snapshot_listing="$(
+    run_break_glass_restic \
+      --no-cache \
+      snapshots "$SNAPSHOT_ID" \
+      --host "$RECOVERY_INSTANCE" \
+      --tag server-infra-data
+  )"
+  while IFS= read -r snapshot_line || [[ -n "$snapshot_line" ]]; do
+    if [[ "$snapshot_line" =~ ^([0-9a-f]{8,64})[[:space:]] ]]; then
+      displayed_id="${BASH_REMATCH[1]}"
+      if [[ "$SNAPSHOT_ID" == "$displayed_id"* || \
+        "$displayed_id" == "$SNAPSHOT_ID"* ]]; then
+        snapshot_found=1
+        break
+      fi
+    fi
+  done <<< "$snapshot_listing"
+  [[ "$snapshot_found" == "1" ]] || \
+    fail "Selected data snapshot does not match this server and data tag"
+
+  RECOVERY_PHASE_DATA="complete"
+  RECOVERY_DATA_SNAPSHOT="$SNAPSHOT_ID"
+  write_state_file
+  recovery_ok "data snapshot selected for every project: $SNAPSHOT_ID"
+}
+
 print_phase() {
   local phase_number="$1"
   local phase_state="$2"
@@ -1134,7 +1217,8 @@ parse_arguments() {
         usage
         exit 0
         ;;
-      init | plan | status | config-snapshots | restore-config)
+      init | plan | status | config-snapshots | restore-config | \
+      data-snapshots | select-data)
         [[ -z "$OPERATION" ]] || fail "Specify exactly one operation"
         OPERATION="$1"
         shift
@@ -1155,6 +1239,17 @@ parse_arguments() {
       ;;
     restore-config)
       [[ -n "$SNAPSHOT_ID" ]] || fail "restore-config requires --snapshot"
+      ;;
+    data-snapshots)
+      [[ -z "$SNAPSHOT_ID" ]] || \
+        fail "--snapshot is supported only by restore-config and select-data"
+      [[ "$work_root_set" == "0" ]] || \
+        fail "--work-root is supported only by restore-config"
+      ;;
+    select-data)
+      [[ -n "$SNAPSHOT_ID" ]] || fail "select-data requires --snapshot"
+      [[ "$work_root_set" == "0" ]] || \
+        fail "--work-root is supported only by restore-config"
       ;;
     plan | status)
       [[ -z "$BREAK_GLASS_FILE" && -z "$SNAPSHOT_ID" ]] || \
@@ -1188,6 +1283,12 @@ main() {
       ;;
     restore-config)
       run_restore_config
+      ;;
+    data-snapshots)
+      run_data_snapshots
+      ;;
+    select-data)
+      run_select_data
       ;;
   esac
 }

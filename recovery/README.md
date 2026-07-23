@@ -25,8 +25,10 @@ The current implementation provides:
 - `status` to inspect pinned metadata and phase state.
 - `config-snapshots` to list matching configuration snapshots;
 - `restore-config` to pin, restore, validate, and install one snapshot.
+- `data-snapshots` to list data snapshots after configuration recovery;
+- `select-data` to validate and pin one data snapshot for all projects.
 
-It does not yet select or restore the data snapshot, clone projects, deploy
+It does not yet restore project files or databases, clone projects, deploy
 infrastructure, or start public traffic.
 
 ## Security model
@@ -80,6 +82,11 @@ installed configuration before marking the phase complete. Recovery mutations
 are serialized with a PID lock; a lock whose process no longer exists is
 reclaimed on retry.
 
+Data selection is allowed only after the installed configuration is validated.
+The selected snapshot must match both the server instance and
+`server-infra-data` tag. Once stored, another snapshot ID is rejected so all
+project restores use one consistent recovery point.
+
 ## Operations
 
 After fencing the failed VM, authorizing temporary Git access, cloning
@@ -103,6 +110,17 @@ sudo ./recovery/bin/server-infra-recovery config-snapshots \
 sudo ./recovery/bin/server-infra-recovery restore-config \
   --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --snapshot <config-snapshot-id>
+```
+
+List and pin one data snapshot:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery data-snapshots \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
+
+sudo ./recovery/bin/server-infra-recovery select-data \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --snapshot <data-snapshot-id>
 ```
 
 The restore uses `/var/cache/server-infra/recovery` for a root-only restic
@@ -154,5 +172,9 @@ Run without contacting GitHub, Backblaze, or a real restic repository:
   recovery target.
 - A failed configuration extraction remains pinned as `in-progress`; rerun
   `restore-config` with the same snapshot ID.
+- `configuration recovery must complete` prevents a data point from being
+  selected before the host configuration is trustworthy.
+- `data snapshot is already pinned` prevents different projects from using
+  different points in time.
 - An existing session is never silently replaced. Session reset will be a
   separate, explicitly destructive operation if it is introduced later.
