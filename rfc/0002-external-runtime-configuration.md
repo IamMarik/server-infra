@@ -4,7 +4,8 @@
 
 Accepted.
 
-Migration status: not started.
+Migration status: repository prerequisites partially implemented; host cutover
+not started.
 
 ## Context
 
@@ -20,6 +21,12 @@ specific servers.
 Only the proxy module is currently known to be operational. Its migration must
 not implicitly deploy monitoring or change the identity of existing Docker
 volumes.
+
+The current proxy implementation builds a custom Caddy image with the Porkbun
+DNS provider. Its Caddyfile also contains monitoring routes and concrete
+application routes. These are existing runtime behaviors that must be
+preserved during cutover, but they are not a precedent for keeping
+application-specific configuration in Git.
 
 ## Decision
 
@@ -68,6 +75,8 @@ The migration must preserve all of the following:
 4. Current proxy routes and HTTPS behavior during the initial cutover.
 5. A tested path back to the repository-local configuration.
 6. Existing runtime files until backup and restore have been verified.
+7. The custom Caddy image capability required for Porkbun DNS challenges.
+8. Existing Caddy certificate and account state in the `caddy-data` volume.
 
 Migration commands must never use `docker compose down --volumes`.
 
@@ -89,10 +98,18 @@ Before changing the repository or host:
 
 - record the deployed Git commit;
 - record container Compose labels and the effective project name;
+- record the active Caddy image ID and digest;
+- confirm `dns.providers.porkbun` is present in the active Caddy binary;
 - record attached volumes and Docker networks;
 - record the locations and permissions of current runtime files;
+- inventory all current routes, domains, redirects, authentication rules, and
+  upstream container names;
+- verify that every expected upstream is attached to the external
+  `server-infra` network;
 - validate the active Caddy configuration;
 - verify every currently expected HTTP and HTTPS route;
+- verify wildcard certificate issuance or renewal through Porkbun without
+  exposing API credentials;
 - store a protected copy of current runtime configuration outside Git.
 
 The phase is complete only when the current proxy can be restored using the
@@ -112,6 +129,21 @@ Without changing host behavior:
 Concrete environment directories and the legacy deployment path remain
 available during this phase.
 
+The current main branch has partially completed this phase:
+
+- `proxy/runtime.env.example` exists;
+- `proxy/runtime.env` and known Caddy backup filenames are ignored;
+- the custom Porkbun-enabled Caddy build is defined in Git.
+
+The example is not yet a complete proxy contract because the current
+Caddyfile also references `CADDY_EMAIL`, `STATUS_DOMAIN`, and other routing
+values. Repository-wide runtime filename protection, tracked-file validation,
+secret scanning, and history review are still required.
+
+The concrete `pathetic.gay`, `saveproof.app`, and `saveproof.org` routes in the
+repository Caddyfile are temporary migration input. They must move to host
+configuration in Phase 5.
+
 ### Phase 2: Add an Explicit External Configuration Mode
 
 Deployment and validation scripts gain an explicit `--config-root` option.
@@ -129,6 +161,15 @@ The configuration reader must:
 - support a preflight that makes no runtime changes.
 
 The legacy mode remains available only for the rollback window.
+
+The current Compose expression:
+
+```text
+${MODULE_ENV_FILE:-./runtime.env}
+```
+
+is treated as legacy compatibility. The external configuration mode must pass
+an absolute environment path and must not silently select `./runtime.env`.
 
 ### Phase 3: Prepare the Host for Proxy Only
 
@@ -154,6 +195,18 @@ permissions, and atomically renamed into place.
 
 The old runtime files remain untouched.
 
+The initial proxy runtime file must account for every variable referenced by
+the deployed Caddyfile, including:
+
+- Caddy account email;
+- monitoring route domains and log authentication values, when those routes
+  remain active;
+- Porkbun API key and API secret key;
+- any other values used by current application routes.
+
+Because Porkbun credentials are present, the complete proxy runtime file is
+treated as a secret file with mode `0600`.
+
 ### Phase 4: Switch Only the Proxy Environment Source
 
 The first production cutover changes only the location of proxy environment
@@ -165,6 +218,10 @@ Before deployment:
 - run `docker compose config --quiet`;
 - confirm the resolved Compose project name;
 - confirm the resolved named volumes match the active volumes;
+- build the custom Caddy image before the maintenance window;
+- verify the built binary contains `dns.providers.porkbun`;
+- record the candidate image ID and preserve the previous image ID for
+  rollback;
 - validate the Caddy configuration without printing secrets.
 
 Deploy with `docker compose up -d` using absolute paths and the preserved
@@ -175,13 +232,15 @@ After deployment:
 - verify container health and restart count;
 - verify ports 80, 443 TCP, and 443 UDP where applicable;
 - verify expected HTTP and HTTPS routes;
+- verify redirects and basic authentication behavior;
+- verify the wildcard TLS route and its certificate;
 - verify the same named volumes are attached;
 - review Caddy logs;
 - repeat the deployment and confirm it is idempotent.
 
 Rollback uses the recorded commit and legacy runtime files with the same
-Compose project name. The external configuration remains in place for
-diagnosis.
+Compose project name and previous Caddy image. The external configuration
+remains in place for diagnosis.
 
 ### Phase 5: Externalize Proxy Routes
 
@@ -199,8 +258,27 @@ Mount `/etc/server-infra/proxy/conf.d` read-only. Initially copy the current
 routes without changing their behavior. Removing obsolete monitoring routes is
 a separate reviewed change.
 
-Pass only explicitly allowed environment variables to the Caddy container.
-Do not inject the complete `runtime.env`.
+Move all concrete application domains, upstreams, redirects, authentication
+rules, and wildcard TLS policies out of the repository Caddyfile. This
+includes the current `pathetic` and `saveproof` routes.
+
+Pass only explicitly allowed environment variables to the Caddy container. In
+addition to `CADDY_EMAIL`, the temporary allowlist includes the variables
+referenced by active route fragments, such as:
+
+- `LOGS_AUTH_USER`;
+- `LOGS_AUTH_PASSWORD_HASH`;
+- `PORKBUN_API_KEY`;
+- `PORKBUN_API_SECRET_KEY`.
+
+Domain variables may remain temporarily while routes are copied verbatim, but
+concrete domains should ultimately live directly in host-owned Caddy
+fragments. Do not inject the complete `runtime.env`.
+
+File-backed secrets are preferred only when the Caddy DNS plugin and
+configuration contract can consume them directly. Until then, Porkbun values
+remain explicitly allowlisted container environment variables and the runtime
+file remains mode `0600`.
 
 Validate the complete mounted configuration before deployment and repeat all
 proxy checks after deployment.
@@ -232,6 +310,8 @@ The rollback window closes only after:
 - a successful proxy container restart;
 - a successful host reboot test where practical;
 - stable HTTPS and routing;
+- successful validation of the custom Porkbun-enabled Caddy binary;
+- successful wildcard TLS operation;
 - confirmation that the original volumes remain attached;
 - a successful configuration backup and restore test;
 - an observation period of at least three days.
@@ -263,6 +343,9 @@ The deployment wrapper supplies:
 - a stable project name;
 - a controlled process environment.
 
+The explicit project directory must also make the custom Caddy Dockerfile and
+build context resolve predictably.
+
 Compose CLI interpolation and container environment injection are treated as
 different mechanisms. Each service explicitly allowlists the environment
 variables it needs. File-backed Compose secrets are preferred for credentials
@@ -270,6 +353,11 @@ when supported by the image.
 
 Validation uses `docker compose config --quiet`. Fully rendered configuration
 must not be written to logs because it may contain secrets.
+
+The Caddy base image and Porkbun plugin version should be pinned to compatible
+versions before rebuilds are treated as reproducible. Until version pinning is
+implemented, each rollout must record the exact built image ID and retain the
+previous working image for rollback.
 
 ## Installation Contract
 
@@ -295,6 +383,9 @@ unit installation. It must:
   independent of host values.
 - Proxy migration takes multiple small deployments instead of one large
   cutover.
+- The reusable Porkbun-enabled Caddy build remains in Git, while Porkbun
+  credentials and wildcard domain policy belong to host runtime
+  configuration.
 - Legacy configuration temporarily coexists with the new contract to provide
   an explicit rollback path.
 - Application code, application deployment logic, domains, server names, and
