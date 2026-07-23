@@ -1,0 +1,7 @@
+# Target: /etc/server-infra/backup/freshness
+# Required permissions: root:root 0640
+# Optional dump freshness requirements use:
+# <maximum-age-seconds> <absolute-marker-path>
+#
+# Example:
+# 7200 /var/lib/server-infra/backup/staging/example/complete

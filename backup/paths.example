@@ -1,0 +1,6 @@
+# Target: /etc/server-infra/backup/paths
+# Required permissions: root:root 0640
+# One absolute data source per line. Broad roots such as /, /etc, and /var are
+# rejected. /etc/server-infra is backed up separately and must not be listed.
+
+/var/lib/server-infra/backup/staging

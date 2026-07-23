@@ -6,6 +6,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
 source "$SCRIPT_DIR/common.sh"
 
+HOST_EXEC_ROOT="/usr/local/libexec/server-infra"
+HOST_COMMAND_ROOT="/usr/local/bin"
+SYSTEMD_UNIT_ROOT="/etc/systemd/system"
+HOST_STATE_ROOT="/var/lib/server-infra"
+HOST_CACHE_ROOT="/var/cache/server-infra"
+EXTERNAL_HAS_COMPOSE=0
+EXTERNAL_HAS_HOST=0
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -25,7 +33,8 @@ The explicit config-root form requires exactly one operation:
   --apply  Run the same preflight, then deploy.
 
 By default, --apply requires every expected Compose project to exist already.
-Use --allow-new-project only when intentionally deploying a new module.
+Use --allow-new-project only when intentionally deploying a new Compose
+module.
 USAGE
 }
 
@@ -160,6 +169,251 @@ compose_project_exists() {
   [[ -n "$container_ids" ]]
 }
 
+module_driver() {
+  local module_name="$1"
+  local manifest_file="$REPO_ROOT/$module_name/module.env"
+
+  read_required_env_value "$manifest_file" "MODULE_DRIVER"
+}
+
+classify_external_modules() {
+  local module_name
+  local driver
+
+  EXTERNAL_HAS_COMPOSE=0
+  EXTERNAL_HAS_HOST=0
+
+  for module_name in "${EXTERNAL_MODULES[@]}"; do
+    driver="$(module_driver "$module_name")"
+    case "$driver" in
+      compose)
+        EXTERNAL_HAS_COMPOSE=1
+        ;;
+      host)
+        EXTERNAL_HAS_HOST=1
+        ;;
+      *)
+        fail "Unsupported MODULE_DRIVER for $module_name: $driver"
+        ;;
+    esac
+  done
+}
+
+prepare_external_tools() {
+  local operation="$1"
+  local module_name
+  local manifest_file
+  local host_required_commands
+  local required_commands=()
+  local command_name
+
+  if [[ "$EXTERNAL_HAS_COMPOSE" == "1" ]]; then
+    require_command docker
+    require_command env
+    docker compose version >/dev/null || fail "Docker Compose is not available"
+  fi
+
+  if [[ "$EXTERNAL_HAS_HOST" == "1" && "$operation" == "apply" ]]; then
+    [[ "$(uname -s)" == "Linux" ]] || fail "Applying host modules requires Linux"
+    [[ "$EUID" == "0" ]] || fail "Applying host modules requires root privileges"
+    require_command install
+    require_command mktemp
+    require_command mv
+    require_command rm
+    require_command systemctl
+
+    for module_name in "${EXTERNAL_MODULES[@]}"; do
+      [[ "$(module_driver "$module_name")" == "host" ]] || continue
+      manifest_file="$REPO_ROOT/$module_name/module.env"
+      host_required_commands="$(
+        read_required_env_value "$manifest_file" "HOST_REQUIRED_COMMANDS"
+      )"
+      [[ -n "$host_required_commands" ]] || continue
+
+      read -r -a required_commands <<< "$host_required_commands"
+      for command_name in "${required_commands[@]}"; do
+        require_command "$command_name"
+      done
+      required_commands=()
+    done
+  fi
+}
+
+run_host_module_preflight() {
+  local config_root="$1"
+  local module_name="$2"
+  local module_dir="$REPO_ROOT/$module_name"
+  local manifest_file="$module_dir/module.env"
+  local host_preflight_executable
+
+  host_preflight_executable="$(
+    read_required_env_value "$manifest_file" "HOST_PREFLIGHT_EXECUTABLE"
+  )"
+
+  [[ -n "$host_preflight_executable" ]] || return
+
+  "$module_dir/$host_preflight_executable" \
+    --config-root "$config_root" \
+    validate
+}
+
+install_host_file_atomic() {
+  local source_file="$1"
+  local destination_file="$2"
+  local destination_mode="$3"
+  local destination_dir="${destination_file%/*}"
+  local destination_name="${destination_file##*/}"
+  local temporary_file
+
+  [[ -f "$source_file" ]] || fail "Host artifact not found: $source_file"
+  [[ ! -L "$source_file" ]] || fail "Host artifact must not be a symlink: $source_file"
+  [[ -d "$destination_dir" ]] || \
+    fail "Host artifact destination directory not found: $destination_dir"
+  [[ ! -L "$destination_dir" ]] || \
+    fail "Host artifact destination directory must not be a symlink: $destination_dir"
+
+  temporary_file="$(mktemp "$destination_dir/.${destination_name}.tmp.XXXXXX")"
+  if ! install \
+    -o root \
+    -g root \
+    -m "$destination_mode" \
+    "$source_file" \
+    "$temporary_file"; then
+    rm -f -- "$temporary_file"
+    fail "Unable to prepare host artifact: $destination_file"
+  fi
+
+  if ! mv -f -- "$temporary_file" "$destination_file"; then
+    rm -f -- "$temporary_file"
+    fail "Unable to install host artifact: $destination_file"
+  fi
+
+  ok "installed host artifact: $destination_file"
+}
+
+install_host_module_artifacts() {
+  local module_name="$1"
+  local module_dir="$REPO_ROOT/$module_name"
+  local manifest_file="$module_dir/module.env"
+  local host_executables
+  local host_public_executables
+  local host_state_dirs
+  local host_cache_dirs
+  local systemd_units
+  local executable_paths=()
+  local public_executable_paths=()
+  local managed_dirs=()
+  local unit_paths=()
+  local relative_path
+  local module_exec_root="$HOST_EXEC_ROOT/$module_name"
+  local managed_dir_spec
+  local managed_root
+  local managed_dir_list
+
+  host_executables="$(
+    read_required_env_value "$manifest_file" "HOST_EXECUTABLES"
+  )"
+  host_public_executables="$(
+    read_required_env_value "$manifest_file" "HOST_PUBLIC_EXECUTABLES"
+  )"
+  host_state_dirs="$(read_required_env_value "$manifest_file" "HOST_STATE_DIRS")"
+  host_cache_dirs="$(read_required_env_value "$manifest_file" "HOST_CACHE_DIRS")"
+  systemd_units="$(read_required_env_value "$manifest_file" "SYSTEMD_UNITS")"
+
+  [[ ! -L "$HOST_STATE_ROOT" ]] || \
+    fail "Host state root must not be a symlink: $HOST_STATE_ROOT"
+  [[ ! -L "$HOST_CACHE_ROOT" ]] || \
+    fail "Host cache root must not be a symlink: $HOST_CACHE_ROOT"
+  install -d -o root -g root -m 0750 "$HOST_STATE_ROOT"
+  install -d -o root -g root -m 0750 "$HOST_CACHE_ROOT"
+
+  for managed_dir_spec in \
+    "$HOST_STATE_ROOT/$module_name:$host_state_dirs" \
+    "$HOST_CACHE_ROOT/$module_name:$host_cache_dirs"; do
+    managed_root="${managed_dir_spec%%:*}"
+    managed_dir_list="${managed_dir_spec#*:}"
+    [[ ! -L "$managed_root" ]] || \
+      fail "Host managed directory root must not be a symlink: $managed_root"
+    install -d -o root -g root -m 0750 "$managed_root"
+    [[ -n "$managed_dir_list" ]] || continue
+
+    read -r -a managed_dirs <<< "$managed_dir_list"
+    for relative_path in "${managed_dirs[@]}"; do
+      [[ ! -L "$managed_root/$relative_path" ]] || \
+        fail "Host managed directory must not be a symlink: $managed_root/$relative_path"
+      install -d -o root -g root -m 0750 "$managed_root/$relative_path"
+      ok "host managed directory: $managed_root/$relative_path"
+    done
+    managed_dirs=()
+  done
+
+  if [[ -n "$host_executables" ]]; then
+    [[ ! -L "$HOST_EXEC_ROOT" ]] || \
+      fail "Host executable root must not be a symlink: $HOST_EXEC_ROOT"
+    install -d -o root -g root -m 0755 "$HOST_EXEC_ROOT"
+    [[ ! -L "$module_exec_root" ]] || \
+      fail "Module executable root must not be a symlink: $module_exec_root"
+    install -d -o root -g root -m 0755 "$module_exec_root"
+
+    read -r -a executable_paths <<< "$host_executables"
+    for relative_path in "${executable_paths[@]}"; do
+      install_host_file_atomic \
+        "$module_dir/$relative_path" \
+        "$module_exec_root/${relative_path##*/}" \
+        0755
+    done
+  fi
+
+  if [[ -n "$host_public_executables" ]]; then
+    [[ ! -L "$HOST_COMMAND_ROOT" ]] || \
+      fail "Host command root must not be a symlink: $HOST_COMMAND_ROOT"
+    install -d -o root -g root -m 0755 "$HOST_COMMAND_ROOT"
+    read -r -a public_executable_paths <<< "$host_public_executables"
+    for relative_path in "${public_executable_paths[@]}"; do
+      install_host_file_atomic \
+        "$module_dir/$relative_path" \
+        "$HOST_COMMAND_ROOT/${relative_path##*/}" \
+        0755
+    done
+  fi
+
+  [[ -d "$SYSTEMD_UNIT_ROOT" ]] || \
+    fail "Systemd unit directory not found: $SYSTEMD_UNIT_ROOT"
+  [[ ! -L "$SYSTEMD_UNIT_ROOT" ]] || \
+    fail "Systemd unit directory must not be a symlink: $SYSTEMD_UNIT_ROOT"
+
+  read -r -a unit_paths <<< "$systemd_units"
+  for relative_path in "${unit_paths[@]}"; do
+    install_host_file_atomic \
+      "$module_dir/$relative_path" \
+      "$SYSTEMD_UNIT_ROOT/${relative_path##*/}" \
+      0644
+  done
+}
+
+enable_host_module() {
+  local module_name="$1"
+  local manifest_file="$REPO_ROOT/$module_name/module.env"
+  local systemd_enable_units
+  local enable_units=()
+  local unit_name
+
+  systemd_enable_units="$(
+    read_required_env_value "$manifest_file" "SYSTEMD_ENABLE_UNITS"
+  )"
+
+  if [[ -z "$systemd_enable_units" ]]; then
+    ok "host module installed without enabled units: $module_name"
+    return
+  fi
+
+  read -r -a enable_units <<< "$systemd_enable_units"
+  for unit_name in "${enable_units[@]}"; do
+    systemctl enable --now "$unit_name"
+    ok "enabled host unit: $unit_name"
+  done
+}
+
 load_external_context() {
   local config_root="$1"
   local server_file="$config_root/server.env"
@@ -171,6 +425,7 @@ load_external_context() {
   EXTERNAL_INSTANCE="$(read_env_value "$server_file" "SERVER_INFRA_INSTANCE")"
   enabled_modules="$(read_env_value "$modules_file" "ENABLED_MODULES")"
   read -r -a EXTERNAL_MODULES <<< "$enabled_modules"
+  classify_external_modules
 }
 
 deploy_external_environment() {
@@ -179,23 +434,42 @@ deploy_external_environment() {
   local allow_new_project="$3"
   local module_name
   local project_name
+  local driver
 
   load_external_context "$config_root"
+  prepare_external_tools "$operation"
 
-  log "Running Compose preflight"
+  if [[ "$allow_new_project" == "1" && "$EXTERNAL_HAS_COMPOSE" == "0" ]]; then
+    fail "--allow-new-project requires at least one Compose module"
+  fi
+
+  log "Running module preflight"
   for module_name in "${EXTERNAL_MODULES[@]}"; do
-    external_compose "$config_root" "$EXTERNAL_INSTANCE" "$module_name" \
-      config --quiet
-    project_name="server_infra_${EXTERNAL_INSTANCE}_${module_name}"
-    ok "compose configuration: $module_name (project: $project_name)"
+    driver="$(module_driver "$module_name")"
+    case "$driver" in
+      compose)
+        external_compose "$config_root" "$EXTERNAL_INSTANCE" "$module_name" \
+          config --quiet
+        project_name="server_infra_${EXTERNAL_INSTANCE}_${module_name}"
+        ok "compose configuration: $module_name (project: $project_name)"
 
-    if compose_project_exists "$project_name"; then
-      ok "existing Compose project: $project_name"
-    elif [[ "$operation" == "apply" && "$allow_new_project" == "0" ]]; then
-      fail "Compose project does not exist: $project_name"
-    else
-      warn "Compose project does not exist: $project_name"
-    fi
+        if compose_project_exists "$project_name"; then
+          ok "existing Compose project: $project_name"
+        elif [[ "$operation" == "apply" && "$allow_new_project" == "0" ]]; then
+          fail "Compose project does not exist: $project_name"
+        else
+          warn "Compose project does not exist: $project_name"
+        fi
+        ;;
+      host)
+        validate_host_module_contract "$module_name"
+        run_host_module_preflight "$config_root" "$module_name"
+        ok "host module contract: $module_name"
+        ;;
+      *)
+        fail "Unsupported MODULE_DRIVER for $module_name: $driver"
+        ;;
+    esac
   done
 
   if [[ "$operation" == "check" ]]; then
@@ -204,11 +478,36 @@ deploy_external_environment() {
   fi
 
   acquire_deployment_lock "/run/server-infra"
-  ensure_docker_network "server-infra"
+
+  if [[ "$EXTERNAL_HAS_COMPOSE" == "1" ]]; then
+    ensure_docker_network "server-infra"
+  fi
+
+  if [[ "$EXTERNAL_HAS_HOST" == "1" ]]; then
+    for module_name in "${EXTERNAL_MODULES[@]}"; do
+      [[ "$(module_driver "$module_name")" == "host" ]] || continue
+      log "Installing host module artifacts: $module_name"
+      install_host_module_artifacts "$module_name"
+    done
+    systemctl daemon-reload
+    ok "systemd configuration reloaded"
+  fi
 
   for module_name in "${EXTERNAL_MODULES[@]}"; do
-    log "Deploying module: $module_name"
-    external_compose "$config_root" "$EXTERNAL_INSTANCE" "$module_name" up -d
+    driver="$(module_driver "$module_name")"
+    case "$driver" in
+      compose)
+        log "Deploying Compose module: $module_name"
+        external_compose "$config_root" "$EXTERNAL_INSTANCE" "$module_name" up -d
+        ;;
+      host)
+        log "Activating host module: $module_name"
+        enable_host_module "$module_name"
+        ;;
+      *)
+        fail "Unsupported MODULE_DRIVER for $module_name: $driver"
+        ;;
+    esac
   done
 
   log "External configuration deployment complete"
@@ -277,10 +576,6 @@ main() {
     if [[ "$allow_new_project" == "1" && "$operation" != "apply" ]]; then
       fail "--allow-new-project requires --apply"
     fi
-
-    require_command docker
-    require_command env
-    docker compose version >/dev/null || fail "Docker Compose is not available"
 
     deploy_external_environment "$config_root" "$operation" "$allow_new_project"
     return

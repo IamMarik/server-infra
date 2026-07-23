@@ -1,4 +1,26 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
-echo "Restore placeholder. Add database-specific restore logic when database module is enabled."
+set -Eeuo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/restore.sh [--config-root <absolute-path>] \
+    --kind <config|data> \
+    --target <absolute-empty-path> \
+    [--snapshot <latest|id>]
+
+The destination must not exist or must be an empty, non-symlink directory.
+This command never restores over live configuration or data paths.
+USAGE
+}
+
+if (($# == 0)) || [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  [[ $# -gt 0 ]] && exit 0
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+exec "$SCRIPT_DIR/../backup/bin/server-infra-backup" "$@" restore

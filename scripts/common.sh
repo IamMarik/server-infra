@@ -157,6 +157,182 @@ validate_relative_config_path() {
     fail "Hidden module configuration paths are not supported: $relative_path"
 }
 
+read_required_env_value() {
+  local env_file="$1"
+  local key="$2"
+  local value
+
+  if ! value="$(read_env_value "$env_file" "$key")"; then
+    fail "Missing key $key in $env_file"
+  fi
+
+  printf '%s' "$value"
+}
+
+validate_systemd_unit_name() {
+  local unit_name="$1"
+
+  [[ "$unit_name" =~ ^[a-z0-9][a-z0-9_.-]*\.(service|timer|path|socket|target)$ ]] || \
+    fail "Invalid systemd unit name: $unit_name"
+}
+
+validate_host_module_contract() {
+  local module_name="$1"
+  local module_dir="${2:-$REPO_ROOT/$module_name}"
+  local manifest_file="$module_dir/module.env"
+  local host_executables
+  local host_public_executables
+  local host_required_commands
+  local host_preflight_executable
+  local host_state_dirs
+  local host_cache_dirs
+  local systemd_units
+  local systemd_enable_units
+  local executable_paths=()
+  local public_executable_paths=()
+  local required_commands=()
+  local managed_dirs=()
+  local unit_paths=()
+  local enable_units=()
+  local relative_path
+  local command_name
+  local unit_name
+  local managed_dir_list
+  local declared_executables=$'\n'
+  local declared_units=$'\n'
+  local seen_destinations=$'\n'
+
+  [[ -d "$module_dir" ]] || fail "Module directory not found: $module_name"
+  [[ -f "$manifest_file" ]] || fail "Module manifest not found: $manifest_file"
+
+  host_executables="$(read_required_env_value "$manifest_file" "HOST_EXECUTABLES")"
+  host_public_executables="$(
+    read_required_env_value "$manifest_file" "HOST_PUBLIC_EXECUTABLES"
+  )"
+  host_required_commands="$(
+    read_required_env_value "$manifest_file" "HOST_REQUIRED_COMMANDS"
+  )"
+  host_preflight_executable="$(
+    read_required_env_value "$manifest_file" "HOST_PREFLIGHT_EXECUTABLE"
+  )"
+  host_state_dirs="$(read_required_env_value "$manifest_file" "HOST_STATE_DIRS")"
+  host_cache_dirs="$(read_required_env_value "$manifest_file" "HOST_CACHE_DIRS")"
+  systemd_units="$(read_required_env_value "$manifest_file" "SYSTEMD_UNITS")"
+  systemd_enable_units="$(
+    read_required_env_value "$manifest_file" "SYSTEMD_ENABLE_UNITS"
+  )"
+
+  [[ -n "$systemd_units" ]] || \
+    fail "SYSTEMD_UNITS must not be empty for host module: $module_name"
+
+  if [[ -n "$host_executables" ]]; then
+    read -r -a executable_paths <<< "$host_executables"
+
+    for relative_path in "${executable_paths[@]}"; do
+      validate_relative_config_path "$relative_path"
+      [[ "$relative_path" == "bin/${relative_path##*/}" ]] || \
+        fail "Host executable must be directly under bin/: $relative_path"
+      [[ -f "$module_dir/$relative_path" ]] || \
+        fail "Host executable not found: $module_dir/$relative_path"
+      [[ ! -L "$module_dir/$relative_path" ]] || \
+        fail "Host executable must not be a symlink: $module_dir/$relative_path"
+      [[ -x "$module_dir/$relative_path" ]] || \
+        fail "Host executable is not executable: $module_dir/$relative_path"
+
+      if [[ "$seen_destinations" == *$'\n'"${relative_path##*/}"$'\n'* ]]; then
+        fail "Duplicate host executable destination: ${relative_path##*/}"
+      fi
+      seen_destinations+="${relative_path##*/}"$'\n'
+      declared_executables+="$relative_path"$'\n'
+    done
+  fi
+
+  if [[ -n "$host_public_executables" ]]; then
+    read -r -a public_executable_paths <<< "$host_public_executables"
+    seen_destinations=$'\n'
+    for relative_path in "${public_executable_paths[@]}"; do
+      validate_relative_config_path "$relative_path"
+      [[ "$declared_executables" == *$'\n'"$relative_path"$'\n'* ]] || \
+        fail "Public executable must be declared in HOST_EXECUTABLES"
+      if [[ "$seen_destinations" == \
+        *$'\n'"${relative_path##*/}"$'\n'* ]]; then
+        fail "Duplicate public executable destination: ${relative_path##*/}"
+      fi
+      seen_destinations+="${relative_path##*/}"$'\n'
+    done
+  fi
+
+  if [[ -n "$host_required_commands" ]]; then
+    read -r -a required_commands <<< "$host_required_commands"
+    seen_destinations=$'\n'
+    for command_name in "${required_commands[@]}"; do
+      [[ "$command_name" =~ ^[a-z0-9][a-z0-9+._-]*$ ]] || \
+        fail "Invalid required host command: $command_name"
+      if [[ "$seen_destinations" == *$'\n'"$command_name"$'\n'* ]]; then
+        fail "Duplicate required host command: $command_name"
+      fi
+      seen_destinations+="$command_name"$'\n'
+    done
+  fi
+
+  if [[ -n "$host_preflight_executable" ]]; then
+    validate_relative_config_path "$host_preflight_executable"
+    [[ "$declared_executables" == \
+      *$'\n'"$host_preflight_executable"$'\n'* ]] || \
+      fail "HOST_PREFLIGHT_EXECUTABLE must be declared in HOST_EXECUTABLES"
+  fi
+
+  for managed_dir_list in "$host_state_dirs" "$host_cache_dirs"; do
+    [[ -n "$managed_dir_list" ]] || continue
+    read -r -a managed_dirs <<< "$managed_dir_list"
+    seen_destinations=$'\n'
+    for relative_path in "${managed_dirs[@]}"; do
+      validate_relative_config_path "$relative_path"
+      [[ "$relative_path" == "${relative_path##*/}" ]] || \
+        fail "Host managed directory must not be nested: $relative_path"
+      if [[ "$seen_destinations" == *$'\n'"$relative_path"$'\n'* ]]; then
+        fail "Duplicate host managed directory: $relative_path"
+      fi
+      seen_destinations+="$relative_path"$'\n'
+    done
+    managed_dirs=()
+  done
+
+  read -r -a unit_paths <<< "$systemd_units"
+  for relative_path in "${unit_paths[@]}"; do
+    validate_relative_config_path "$relative_path"
+    [[ "$relative_path" == "systemd/${relative_path##*/}" ]] || \
+      fail "Systemd unit must be directly under systemd/: $relative_path"
+    unit_name="${relative_path##*/}"
+    validate_systemd_unit_name "$unit_name"
+    [[ -f "$module_dir/$relative_path" ]] || \
+      fail "Systemd unit not found: $module_dir/$relative_path"
+    [[ ! -L "$module_dir/$relative_path" ]] || \
+      fail "Systemd unit must not be a symlink: $module_dir/$relative_path"
+
+    if [[ "$declared_units" == *$'\n'"$unit_name"$'\n'* ]]; then
+      fail "Duplicate systemd unit destination: $unit_name"
+    fi
+    declared_units+="$unit_name"$'\n'
+  done
+
+  if [[ -n "$systemd_enable_units" ]]; then
+    read -r -a enable_units <<< "$systemd_enable_units"
+
+    seen_destinations=$'\n'
+    for unit_name in "${enable_units[@]}"; do
+      validate_systemd_unit_name "$unit_name"
+      [[ "$declared_units" == *$'\n'"$unit_name"$'\n'* ]] || \
+        fail "Enabled systemd unit is not declared in SYSTEMD_UNITS: $unit_name"
+
+      if [[ "$seen_destinations" == *$'\n'"$unit_name"$'\n'* ]]; then
+        fail "Duplicate enabled systemd unit: $unit_name"
+      fi
+      seen_destinations+="$unit_name"$'\n'
+    done
+  fi
+}
+
 validate_config_root_path() {
   local config_root="$1"
   local normalized_root="${config_root%/}"

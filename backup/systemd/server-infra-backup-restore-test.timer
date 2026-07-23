@@ -1,0 +1,11 @@
+[Unit]
+Description=Test Server Infra configuration restore monthly
+
+[Timer]
+OnCalendar=*-*-01 05:30:00
+Persistent=true
+AccuracySec=1min
+Unit=server-infra-backup-restore-test.service
+
+[Install]
+WantedBy=timers.target

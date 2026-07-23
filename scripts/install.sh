@@ -12,6 +12,7 @@ OPERATION=""
 INSTALL_EXAMPLES=0
 REQUESTED_MODULES=()
 SELECTED_MODULES=()
+SELECTED_HAS_HOST=0
 
 usage() {
   cat <<'USAGE'
@@ -78,6 +79,7 @@ check_module_contract() {
   local module_driver
   local runtime_mode
   local config_dirs
+  local config_files
   local example_files
   local path_entries=()
   local relative_path
@@ -91,6 +93,7 @@ check_module_contract() {
   module_driver="$(read_manifest_value "$manifest_file" "MODULE_DRIVER")"
   runtime_mode="$(read_manifest_value "$manifest_file" "RUNTIME_ENV_MODE")"
   config_dirs="$(read_manifest_value "$manifest_file" "REQUIRED_CONFIG_DIRS")"
+  config_files="$(read_manifest_value "$manifest_file" "REQUIRED_CONFIG_FILES")"
   example_files="$(read_manifest_value "$manifest_file" "EXAMPLE_CONFIG_FILES")"
 
   case "$module_driver" in
@@ -101,9 +104,12 @@ check_module_contract() {
       docker compose version >/dev/null || fail "Docker Compose is not available"
       ;;
     host)
-      [[ "$(uname -s)" == "Linux" ]] || \
-        fail "Host modules require Linux: $module_name"
-      require_command systemctl
+      SELECTED_HAS_HOST=1
+      validate_host_module_contract "$module_name"
+      if [[ "$OPERATION" == "apply" ]]; then
+        [[ "$(uname -s)" == "Linux" ]] || \
+          fail "Applying host modules requires Linux: $module_name"
+      fi
       ;;
     *)
       fail "Unsupported MODULE_DRIVER in $manifest_file: $module_driver"
@@ -115,6 +121,14 @@ check_module_contract() {
 
   if [[ -n "$config_dirs" ]]; then
     read -r -a path_entries <<< "$config_dirs"
+    for relative_path in "${path_entries[@]}"; do
+      validate_relative_config_path "$relative_path"
+    done
+  fi
+
+  path_entries=()
+  if [[ -n "$config_files" ]]; then
+    read -r -a path_entries <<< "$config_files"
     for relative_path in "${path_entries[@]}"; do
       validate_relative_config_path "$relative_path"
     done
@@ -155,6 +169,7 @@ show_install_plan() {
   local module_name
   local manifest_file
   local config_dirs
+  local config_files
   local path_entries=()
   local relative_path
 
@@ -165,12 +180,21 @@ show_install_plan() {
     log "Module directory: $CONFIG_ROOT/$module_name"
     manifest_file="$REPO_ROOT/$module_name/module.env"
     config_dirs="$(read_manifest_value "$manifest_file" "REQUIRED_CONFIG_DIRS")"
+    config_files="$(read_manifest_value "$manifest_file" "REQUIRED_CONFIG_FILES")"
 
     path_entries=()
     if [[ -n "$config_dirs" ]]; then
       read -r -a path_entries <<< "$config_dirs"
       for relative_path in "${path_entries[@]}"; do
         log "Module config directory: $CONFIG_ROOT/$module_name/$relative_path"
+      done
+    fi
+
+    path_entries=()
+    if [[ -n "$config_files" ]]; then
+      read -r -a path_entries <<< "$config_files"
+      for relative_path in "${path_entries[@]}"; do
+        log "Required module config: $CONFIG_ROOT/$module_name/$relative_path"
       done
     fi
   done
@@ -366,7 +390,7 @@ main() {
   show_install_plan
 
   if [[ "$OPERATION" == "check" ]]; then
-    if [[ "$(uname -s)" != "Linux" ]]; then
+    if [[ "$SELECTED_HAS_HOST" == "1" && "$(uname -s)" != "Linux" ]]; then
       warn "Host apply requires Linux; check mode made no changes"
     fi
     ok "install preflight complete; no host changes made"

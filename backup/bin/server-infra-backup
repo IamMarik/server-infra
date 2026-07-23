@@ -1,0 +1,1208 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_ROOT="/etc/server-infra"
+OPERATION=""
+BACKUP_MODULE_DIR=""
+RUNTIME_FILE=""
+PATHS_FILE=""
+EXCLUDES_FILE=""
+FRESHNESS_FILE=""
+SOURCES_ROOT=""
+CONFIG_TAG="server-infra-config"
+DATA_TAG="server-infra-data"
+CACHE_DIR="${SERVER_INFRA_BACKUP_CACHE_DIR:-/var/cache/server-infra/backup/restic}"
+RESTORE_TEST_ROOT="${SERVER_INFRA_BACKUP_RESTORE_TEST_ROOT:-/var/cache/server-infra/backup/restore-tests}"
+LOCK_ROOT="${SERVER_INFRA_BACKUP_LOCK_ROOT:-/run/server-infra}"
+JOB_LOCK=""
+OPERATION_LOCK=""
+CURRENT_OPERATION=""
+MONITOR_READY=0
+JOB_SUCCESS=0
+ACTIVE_PUSH_URL=""
+ACTIVE_MONITOR_LABEL=""
+RESTORE_TARGET=""
+RESTORE_SNAPSHOT="latest"
+RESTORE_KIND=""
+RESTORE_TEST_TARGET=""
+DATA_PATHS=()
+PATHS_FILES=()
+EXCLUDES_FILES=()
+FRESHNESS_FILES=()
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  server-infra-backup [--config-root <absolute-path>] validate
+  server-infra-backup [--config-root <absolute-path>] init
+  server-infra-backup [--config-root <absolute-path>] run
+  server-infra-backup [--config-root <absolute-path>] retention
+  server-infra-backup [--config-root <absolute-path>] check
+  server-infra-backup [--config-root <absolute-path>] restore \
+    --kind <config|data> --target <absolute-path> [--snapshot <latest|id>]
+  server-infra-backup [--config-root <absolute-path>] restore-test
+  server-infra-backup project <init|install|validate|list|remove> [options]
+
+Operations:
+  validate   Validate configuration without contacting remote services.
+  init       Explicitly initialize the configured restic repository.
+  run        Create configuration and data snapshots, then optionally retain.
+  retention  Apply the configured retention policy explicitly.
+  check      Check repository metadata integrity.
+  restore    Restore one tagged snapshot into an absent or empty directory.
+  restore-test
+             Restore and validate the latest configuration snapshot.
+  project    Manage application file and PostgreSQL backup sources.
+
+Scheduled operations never initialize a missing repository. Restore never
+writes into the live configuration or data paths.
+USAGE
+}
+
+log() {
+  printf '[server-infra][backup] %s\n' "$*"
+}
+
+ok() {
+  printf '[server-infra][backup][ok] %s\n' "$*"
+}
+
+warn() {
+  printf '[server-infra][backup][warn] %s\n' "$*" >&2
+}
+
+fail() {
+  printf '[server-infra][backup][error] %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  local command_name="$1"
+  command -v "$command_name" >/dev/null 2>&1 || \
+    fail "Required command not found: $command_name"
+}
+
+parse_env_line() {
+  local raw_line="$1"
+  local source_name="$2"
+  local line_number="$3"
+  local value_length
+  local first_character
+  local last_character
+
+  PARSED_ENV_KIND="skip"
+  PARSED_ENV_KEY=""
+  PARSED_ENV_VALUE=""
+
+  raw_line="${raw_line%$'\r'}"
+
+  if [[ "$raw_line" =~ ^[[:space:]]*$ ]] || \
+    [[ "$raw_line" =~ ^[[:space:]]*# ]]; then
+    return
+  fi
+
+  if [[ ! "$raw_line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]]; then
+    fail "Invalid KEY=VALUE entry in $source_name at line $line_number"
+  fi
+
+  PARSED_ENV_KEY="${BASH_REMATCH[1]}"
+  PARSED_ENV_VALUE="${BASH_REMATCH[2]}"
+  value_length="${#PARSED_ENV_VALUE}"
+
+  if ((value_length > 0)); then
+    first_character="${PARSED_ENV_VALUE:0:1}"
+    last_character="${PARSED_ENV_VALUE:value_length-1:1}"
+
+    if [[ "$first_character" == '"' || "$last_character" == '"' ]]; then
+      if ((value_length < 2)) || \
+        [[ "$first_character" != '"' || "$last_character" != '"' ]]; then
+        fail "Unbalanced double quote in $source_name at line $line_number"
+      fi
+      PARSED_ENV_VALUE="${PARSED_ENV_VALUE:1:value_length-2}"
+    elif [[ "$first_character" == "'" || "$last_character" == "'" ]]; then
+      if ((value_length < 2)) || \
+        [[ "$first_character" != "'" || "$last_character" != "'" ]]; then
+        fail "Unbalanced single quote in $source_name at line $line_number"
+      fi
+      PARSED_ENV_VALUE="${PARSED_ENV_VALUE:1:value_length-2}"
+    fi
+  fi
+
+  PARSED_ENV_KIND="assignment"
+}
+
+read_env_value() {
+  local env_file="$1"
+  local requested_key="$2"
+  local line=""
+  local line_number=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    parse_env_line "$line" "$env_file" "$line_number"
+
+    if [[ "$PARSED_ENV_KIND" == "assignment" && \
+      "$PARSED_ENV_KEY" == "$requested_key" ]]; then
+      printf '%s' "$PARSED_ENV_VALUE"
+      return 0
+    fi
+  done < "$env_file"
+
+  return 1
+}
+
+is_placeholder_value() {
+  local value="$1"
+
+  case "$value" in
+    example | replace-me | changeme | *.invalid | *'<'*'>'*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+read_active_value() {
+  local env_file="$1"
+  local key="$2"
+  local value
+
+  if ! value="$(read_env_value "$env_file" "$key")"; then
+    fail "Missing key $key in $env_file"
+  fi
+  [[ -n "$value" ]] || fail "Empty required key $key in $env_file"
+  is_placeholder_value "$value" && \
+    fail "Placeholder value for required key $key in $env_file"
+
+  printf '%s' "$value"
+}
+
+validate_known_runtime_keys() {
+  local allowed_keys=$'\nRESTIC_REPOSITORY\nRESTIC_PASSWORD_FILE\nAWS_ACCESS_KEY_ID\nAWS_SECRET_ACCESS_KEY\nAWS_DEFAULT_REGION\nUPTIME_KUMA_BACKUP_PUSH_URL\nUPTIME_KUMA_CHECK_PUSH_URL\nUPTIME_KUMA_RESTORE_TEST_PUSH_URL\nBACKUP_KEEP_DAILY\nBACKUP_KEEP_WEEKLY\nBACKUP_KEEP_MONTHLY\nBACKUP_RETENTION_ENABLED\nBACKUP_PRUNE_ENABLED\n'
+  local seen_keys=$'\n'
+  local line=""
+  local line_number=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    parse_env_line "$line" "$RUNTIME_FILE" "$line_number"
+    [[ "$PARSED_ENV_KIND" == "assignment" ]] || continue
+
+    [[ "$allowed_keys" == *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Unknown key $PARSED_ENV_KEY in $RUNTIME_FILE"
+    [[ "$seen_keys" != *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Duplicate key $PARSED_ENV_KEY in $RUNTIME_FILE"
+    seen_keys+="$PARSED_ENV_KEY"$'\n'
+  done < "$RUNTIME_FILE"
+}
+
+validate_absolute_path() {
+  local path_value="$1"
+  local path_label="$2"
+
+  [[ "$path_value" == /* ]] || fail "$path_label must be an absolute path"
+  [[ "$path_value" != *".."* ]] || fail "$path_label must not contain .."
+  [[ "$path_value" != *"//"* ]] || fail "$path_label must not contain //"
+  [[ "$path_value" != *$'\n'* && "$path_value" != *$'\r'* ]] || \
+    fail "$path_label contains an invalid line break"
+}
+
+validate_no_symlink_components() {
+  local path_value="$1"
+  local path_label="$2"
+  local current_path=""
+  local component
+  local components=()
+
+  IFS='/' read -r -a components <<< "${path_value#/}"
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    current_path="$current_path/$component"
+    [[ ! -L "$current_path" ]] || \
+      fail "$path_label contains a symlinked path component: $current_path"
+  done
+}
+
+validate_regular_file() {
+  local file_path="$1"
+  local file_label="$2"
+
+  [[ -f "$file_path" ]] || fail "$file_label not found: $file_path"
+  [[ -r "$file_path" ]] || fail "$file_label is not readable: $file_path"
+  [[ ! -L "$file_path" ]] || fail "$file_label must not be a symlink: $file_path"
+}
+
+validate_source_manifest() {
+  local manifest_file="$1"
+  local expected_name="$2"
+  local source_dir="${manifest_file%/*}"
+  local allowed_keys=$'\nSOURCE_VERSION\nSOURCE_NAME\nSOURCE_TYPE\nPROJECT_ROOT\nCOMPOSE_FILE\nCOMPOSE_SERVICE\nCOMPOSE_ENV_FILE\nDUMP_TIME\nDUMP_MAX_AGE_SECONDS\nSTAGING_DIR\n'
+  local seen_keys=$'\n'
+  local line=""
+  local line_number=0
+  local source_version
+  local source_name
+  local source_type
+  local project_root
+  local compose_file
+  local compose_service
+  local compose_env_file
+  local dump_time
+  local dump_hour
+  local dump_minute
+  local dump_max_age
+  local staging_dir
+  local expected_freshness
+  local source_key
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    parse_env_line "$line" "$manifest_file" "$line_number"
+    [[ "$PARSED_ENV_KIND" == "assignment" ]] || continue
+
+    [[ "$allowed_keys" == *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Unknown key $PARSED_ENV_KEY in $manifest_file"
+    [[ "$seen_keys" != *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Duplicate key $PARSED_ENV_KEY in $manifest_file"
+    seen_keys+="$PARSED_ENV_KEY"$'\n'
+  done < "$manifest_file"
+
+  source_version="$(read_active_value "$manifest_file" "SOURCE_VERSION")"
+  source_name="$(read_active_value "$manifest_file" "SOURCE_NAME")"
+  source_type="$(read_active_value "$manifest_file" "SOURCE_TYPE")"
+  project_root="$(read_active_value "$manifest_file" "PROJECT_ROOT")"
+
+  [[ "$source_version" == "1" ]] || \
+    fail "Unsupported SOURCE_VERSION in $manifest_file"
+  [[ "$source_name" == "$expected_name" ]] || \
+    fail "SOURCE_NAME must match its sources.d directory: $expected_name"
+  validate_absolute_path "$project_root" "PROJECT_ROOT in $manifest_file"
+  [[ -d "$project_root" && ! -L "$project_root" ]] || \
+    fail "Project root not found for backup source $source_name"
+
+  case "$source_type" in
+    postgres-compose)
+      compose_file="$(read_active_value "$manifest_file" "COMPOSE_FILE")"
+      compose_service="$(read_active_value "$manifest_file" "COMPOSE_SERVICE")"
+      if ! compose_env_file="$(
+        read_env_value "$manifest_file" "COMPOSE_ENV_FILE"
+      )"; then
+        fail "Missing key COMPOSE_ENV_FILE in $manifest_file"
+      fi
+      dump_time="$(read_active_value "$manifest_file" "DUMP_TIME")"
+      dump_max_age="$(
+        read_active_value "$manifest_file" "DUMP_MAX_AGE_SECONDS"
+      )"
+      staging_dir="$(read_active_value "$manifest_file" "STAGING_DIR")"
+
+      validate_absolute_path "$compose_file" "COMPOSE_FILE in $manifest_file"
+      [[ "$compose_service" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || \
+        fail "Invalid COMPOSE_SERVICE in $manifest_file"
+      if [[ -n "$compose_env_file" ]]; then
+        validate_absolute_path \
+          "$compose_env_file" \
+          "COMPOSE_ENV_FILE in $manifest_file"
+      fi
+      [[ "$dump_time" =~ ^([0-9]{2}):([0-9]{2})$ ]] || \
+        fail "DUMP_TIME must use HH:MM in $manifest_file"
+      dump_hour="${BASH_REMATCH[1]}"
+      dump_minute="${BASH_REMATCH[2]}"
+      ((10#$dump_hour <= 23 && 10#$dump_minute <= 59)) || \
+        fail "DUMP_TIME is outside the valid clock range in $manifest_file"
+      validate_positive_integer "$dump_max_age" "DUMP_MAX_AGE_SECONDS"
+      validate_absolute_path "$staging_dir" "STAGING_DIR in $manifest_file"
+      [[ "${staging_dir##*/}" == "$source_name" ]] || \
+        fail "STAGING_DIR must end with SOURCE_NAME in $manifest_file"
+      [[ -f "$compose_file" && ! -L "$compose_file" ]] || \
+        fail "Compose file not found for backup source $source_name"
+      if [[ -n "$compose_env_file" ]]; then
+        [[ -f "$compose_env_file" && ! -L "$compose_env_file" ]] || \
+          fail "Compose env file not found for backup source $source_name"
+      fi
+      command -v docker >/dev/null 2>&1 || \
+        fail "Docker is required by PostgreSQL backup source $source_name"
+
+      grep -F -x -- "$staging_dir" "$source_dir/paths" >/dev/null || \
+        fail "Source paths must include STAGING_DIR for $source_name"
+      expected_freshness="$dump_max_age $staging_dir/postgres.complete"
+      grep -F -x -- "$expected_freshness" "$source_dir/freshness" >/dev/null || \
+        fail "Source freshness must track the generated PostgreSQL dump"
+      ;;
+    files-only)
+      for source_key in \
+        COMPOSE_FILE \
+        COMPOSE_SERVICE \
+        COMPOSE_ENV_FILE \
+        DUMP_TIME \
+        DUMP_MAX_AGE_SECONDS \
+        STAGING_DIR; do
+        if read_env_value "$manifest_file" "$source_key" >/dev/null; then
+          fail "$source_key is not supported by files-only source $source_name"
+        fi
+      done
+      ;;
+    *)
+      fail "Unsupported SOURCE_TYPE in $manifest_file: $source_type"
+      ;;
+  esac
+}
+
+discover_source_configuration() {
+  local source_dirs=()
+  local source_dir
+  local source_name
+  local config_file
+  local mode
+
+  PATHS_FILES=("$PATHS_FILE")
+  EXCLUDES_FILES=("$EXCLUDES_FILE")
+  FRESHNESS_FILES=("$FRESHNESS_FILE")
+
+  [[ -e "$SOURCES_ROOT" ]] || return 0
+  [[ -d "$SOURCES_ROOT" && ! -L "$SOURCES_ROOT" ]] || \
+    fail "Backup sources root must be a regular directory: $SOURCES_ROOT"
+  mode="$(file_mode "$SOURCES_ROOT")"
+  [[ "$mode" == "750" ]] || \
+    fail "Backup sources root must have mode 0750: $SOURCES_ROOT"
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    [[ "$(stat -c '%U:%G' "$SOURCES_ROOT")" == "root:root" ]] || \
+      fail "Backup sources root must be owned by root:root"
+  fi
+
+  shopt -s nullglob
+  source_dirs=("$SOURCES_ROOT"/*)
+  shopt -u nullglob
+
+  for source_dir in "${source_dirs[@]}"; do
+    source_name="${source_dir##*/}"
+    [[ "$source_name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
+      fail "Invalid backup source directory name: $source_name"
+    [[ -d "$source_dir" && ! -L "$source_dir" ]] || \
+      fail "Backup source must be a regular directory: $source_dir"
+    mode="$(file_mode "$source_dir")"
+    [[ "$mode" == "750" ]] || \
+      fail "Backup source directory must have mode 0750: $source_dir"
+
+    for config_file in source.conf paths excludes freshness; do
+      validate_regular_file \
+        "$source_dir/$config_file" \
+        "Backup source $source_name $config_file"
+      mode="$(file_mode "$source_dir/$config_file")"
+      [[ "$mode" == "640" ]] || \
+        fail "Backup source file must have mode 0640: $source_dir/$config_file"
+      if [[ "$(uname -s)" == "Linux" ]]; then
+        [[ "$(stat -c '%U:%G' "$source_dir/$config_file")" == "root:root" ]] || \
+          fail "Backup source files must be owned by root:root"
+      fi
+    done
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      [[ "$(stat -c '%U:%G' "$source_dir")" == "root:root" ]] || \
+        fail "Backup source directories must be owned by root:root"
+    fi
+
+    validate_source_manifest "$source_dir/source.conf" "$source_name"
+    PATHS_FILES+=("$source_dir/paths")
+    EXCLUDES_FILES+=("$source_dir/excludes")
+    FRESHNESS_FILES+=("$source_dir/freshness")
+  done
+}
+
+file_mode() {
+  local file_path="$1"
+
+  case "$(uname -s)" in
+    Linux)
+      stat -c '%a' "$file_path"
+      ;;
+    Darwin)
+      stat -f '%Lp' "$file_path"
+      ;;
+    *)
+      fail "Unsupported platform for permission validation"
+      ;;
+  esac
+}
+
+file_mtime() {
+  local file_path="$1"
+
+  case "$(uname -s)" in
+    Linux)
+      stat -c '%Y' "$file_path"
+      ;;
+    Darwin)
+      stat -f '%m' "$file_path"
+      ;;
+    *)
+      fail "Unsupported platform for freshness validation"
+      ;;
+  esac
+}
+
+validate_data_paths() {
+  local require_sources="$1"
+  local paths_file
+  local line=""
+  local line_number=0
+  local path_count=0
+  local seen_paths=$'\n'
+
+  DATA_PATHS=()
+  for paths_file in "${PATHS_FILES[@]}"; do
+    line_number=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line_number=$((line_number + 1))
+      line="${line%$'\r'}"
+      [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+      validate_absolute_path "$line" \
+        "Data path in $paths_file at line $line_number"
+      case "${line%/}" in
+        "" | / | /etc | /var | /home | /root | /usr | /opt | /tmp | /run)
+          fail "Refusing broad data path in $paths_file: $line"
+          ;;
+      esac
+      [[ "${line%/}" != "${CONFIG_ROOT%/}" ]] || \
+        fail "$CONFIG_ROOT is backed up separately and must not be in $paths_file"
+
+      if [[ "$require_sources" == "1" ]]; then
+        [[ -e "$line" ]] || fail "Data source not found: $line"
+        [[ ! -L "$line" ]] || fail "Data source must not be a symlink: $line"
+        [[ -r "$line" ]] || fail "Data source is not readable: $line"
+      fi
+
+      if [[ "$seen_paths" != *$'\n'"${line%/}"$'\n'* ]]; then
+        DATA_PATHS+=("$line")
+        seen_paths+="${line%/}"$'\n'
+        path_count=$((path_count + 1))
+      fi
+    done < "$paths_file"
+  done
+
+  ((path_count > 0)) || fail "At least one backup data path is required"
+}
+
+validate_excludes() {
+  local excludes_file
+  local line=""
+  local line_number=0
+
+  for excludes_file in "${EXCLUDES_FILES[@]}"; do
+    line_number=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line_number=$((line_number + 1))
+      line="${line%$'\r'}"
+      [[ "$line" != *'$'* ]] || \
+        fail "Dollar signs are not supported in $excludes_file at line $line_number"
+    done < "$excludes_file"
+  done
+}
+
+validate_freshness() {
+  local require_fresh="$1"
+  local freshness_file
+  local line=""
+  local line_number=0
+  local maximum_age
+  local marker_path
+  local marker_mtime
+  local marker_age
+  local now
+
+  now="$(date +%s)"
+  for freshness_file in "${FRESHNESS_FILES[@]}"; do
+    line_number=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line_number=$((line_number + 1))
+      line="${line%$'\r'}"
+      [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+      if [[ ! "$line" =~ ^([0-9]+)[[:space:]]+(/.*)$ ]]; then
+        fail "Invalid freshness entry in $freshness_file at line $line_number"
+      fi
+      maximum_age="${BASH_REMATCH[1]}"
+      marker_path="${BASH_REMATCH[2]}"
+      ((maximum_age > 0)) || \
+        fail "Freshness maximum age must be positive in $freshness_file"
+      validate_absolute_path "$marker_path" \
+        "Freshness marker in $freshness_file at line $line_number"
+
+      [[ "$require_fresh" == "1" ]] || continue
+      validate_regular_file "$marker_path" "Freshness marker"
+      marker_mtime="$(file_mtime "$marker_path")"
+      [[ "$marker_mtime" =~ ^[0-9]+$ ]] || \
+        fail "Unable to determine freshness marker time: $marker_path"
+      marker_age=$((now - marker_mtime))
+      ((marker_age >= 0)) || \
+        fail "Freshness marker is dated in the future: $marker_path"
+      ((marker_age <= maximum_age)) || \
+        fail "Freshness marker is stale: $marker_path"
+    done < "$freshness_file"
+  done
+}
+
+validate_boolean() {
+  local value="$1"
+  local key="$2"
+
+  [[ "$value" == "true" || "$value" == "false" ]] || \
+    fail "$key must be true or false"
+}
+
+validate_positive_integer() {
+  local value="$1"
+  local key="$2"
+
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || \
+    fail "$key must be a positive integer"
+}
+
+validate_push_url() {
+  local url_value="$1"
+  local key="$2"
+
+  [[ "$url_value" == https://* ]] || fail "$key must use HTTPS"
+  [[ "$url_value" != *'?'* && "$url_value" != *'#'* ]] || \
+    fail "$key must not contain query parameters"
+}
+
+load_configuration() {
+  local server_file="$CONFIG_ROOT/server.env"
+  local password_mode
+
+  validate_absolute_path "$CONFIG_ROOT" "Configuration root"
+  case "${CONFIG_ROOT%/}" in
+    "" | / | /etc | /var | /run | /usr | /opt | /root | /home | /tmp)
+      fail "Refusing unsafe configuration root: $CONFIG_ROOT"
+      ;;
+  esac
+
+  BACKUP_MODULE_DIR="$CONFIG_ROOT/backup"
+  RUNTIME_FILE="$BACKUP_MODULE_DIR/runtime.env"
+  PATHS_FILE="$BACKUP_MODULE_DIR/paths"
+  EXCLUDES_FILE="$BACKUP_MODULE_DIR/excludes"
+  FRESHNESS_FILE="$BACKUP_MODULE_DIR/freshness"
+  SOURCES_ROOT="$BACKUP_MODULE_DIR/sources.d"
+
+  [[ -d "$CONFIG_ROOT" && ! -L "$CONFIG_ROOT" ]] || \
+    fail "Configuration root is not a regular directory: $CONFIG_ROOT"
+  [[ -d "$BACKUP_MODULE_DIR" && ! -L "$BACKUP_MODULE_DIR" ]] || \
+    fail "Backup configuration directory not found: $BACKUP_MODULE_DIR"
+
+  validate_regular_file "$server_file" "Server configuration"
+  validate_regular_file "$RUNTIME_FILE" "Backup runtime configuration"
+  validate_regular_file "$PATHS_FILE" "Backup paths configuration"
+  validate_regular_file "$EXCLUDES_FILE" "Backup excludes configuration"
+  validate_regular_file "$FRESHNESS_FILE" "Backup freshness configuration"
+  discover_source_configuration
+  validate_known_runtime_keys
+
+  SERVER_INFRA_INSTANCE="$(read_active_value "$server_file" "SERVER_INFRA_INSTANCE")"
+  RESTIC_REPOSITORY="$(read_active_value "$RUNTIME_FILE" "RESTIC_REPOSITORY")"
+  RESTIC_PASSWORD_FILE="$(read_active_value "$RUNTIME_FILE" "RESTIC_PASSWORD_FILE")"
+  AWS_ACCESS_KEY_ID="$(read_active_value "$RUNTIME_FILE" "AWS_ACCESS_KEY_ID")"
+  AWS_SECRET_ACCESS_KEY="$(read_active_value "$RUNTIME_FILE" "AWS_SECRET_ACCESS_KEY")"
+  AWS_DEFAULT_REGION="$(read_active_value "$RUNTIME_FILE" "AWS_DEFAULT_REGION")"
+  UPTIME_KUMA_BACKUP_PUSH_URL="$(
+    read_active_value "$RUNTIME_FILE" "UPTIME_KUMA_BACKUP_PUSH_URL"
+  )"
+  UPTIME_KUMA_CHECK_PUSH_URL="$(
+    read_active_value "$RUNTIME_FILE" "UPTIME_KUMA_CHECK_PUSH_URL"
+  )"
+  UPTIME_KUMA_RESTORE_TEST_PUSH_URL="$(
+    read_active_value "$RUNTIME_FILE" "UPTIME_KUMA_RESTORE_TEST_PUSH_URL"
+  )"
+  BACKUP_KEEP_DAILY="$(read_active_value "$RUNTIME_FILE" "BACKUP_KEEP_DAILY")"
+  BACKUP_KEEP_WEEKLY="$(read_active_value "$RUNTIME_FILE" "BACKUP_KEEP_WEEKLY")"
+  BACKUP_KEEP_MONTHLY="$(read_active_value "$RUNTIME_FILE" "BACKUP_KEEP_MONTHLY")"
+  BACKUP_RETENTION_ENABLED="$(
+    read_active_value "$RUNTIME_FILE" "BACKUP_RETENTION_ENABLED"
+  )"
+  BACKUP_PRUNE_ENABLED="$(read_active_value "$RUNTIME_FILE" "BACKUP_PRUNE_ENABLED")"
+
+  [[ "$SERVER_INFRA_INSTANCE" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
+    fail "SERVER_INFRA_INSTANCE must use lowercase kebab-case"
+  [[ "$RESTIC_REPOSITORY" == s3:https://* ]] || \
+    fail "RESTIC_REPOSITORY must use an encrypted S3-compatible URL"
+  validate_absolute_path "$RESTIC_PASSWORD_FILE" "RESTIC_PASSWORD_FILE"
+  validate_regular_file "$RESTIC_PASSWORD_FILE" "Restic password file"
+  password_mode="$(file_mode "$RESTIC_PASSWORD_FILE")"
+  [[ "$password_mode" == "600" ]] || \
+    fail "Restic password file must have mode 0600; found 0$password_mode"
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    [[ "$(stat -c '%U:%G' "$RESTIC_PASSWORD_FILE")" == "root:root" ]] || \
+      fail "Restic password file must be owned by root:root"
+  fi
+
+  [[ "$AWS_DEFAULT_REGION" =~ ^[a-z0-9][a-z0-9-]*$ ]] || \
+    fail "AWS_DEFAULT_REGION has an invalid format"
+  validate_push_url \
+    "$UPTIME_KUMA_BACKUP_PUSH_URL" \
+    "UPTIME_KUMA_BACKUP_PUSH_URL"
+  validate_push_url \
+    "$UPTIME_KUMA_CHECK_PUSH_URL" \
+    "UPTIME_KUMA_CHECK_PUSH_URL"
+  validate_push_url \
+    "$UPTIME_KUMA_RESTORE_TEST_PUSH_URL" \
+    "UPTIME_KUMA_RESTORE_TEST_PUSH_URL"
+  validate_positive_integer "$BACKUP_KEEP_DAILY" "BACKUP_KEEP_DAILY"
+  validate_positive_integer "$BACKUP_KEEP_WEEKLY" "BACKUP_KEEP_WEEKLY"
+  validate_positive_integer "$BACKUP_KEEP_MONTHLY" "BACKUP_KEEP_MONTHLY"
+  validate_boolean "$BACKUP_RETENTION_ENABLED" "BACKUP_RETENTION_ENABLED"
+  validate_boolean "$BACKUP_PRUNE_ENABLED" "BACKUP_PRUNE_ENABLED"
+  if [[ "$BACKUP_PRUNE_ENABLED" == "true" && \
+    "$BACKUP_RETENTION_ENABLED" != "true" ]]; then
+    fail "BACKUP_PRUNE_ENABLED requires BACKUP_RETENTION_ENABLED=true"
+  fi
+
+  validate_data_paths 0
+  validate_excludes
+  validate_freshness 0
+
+  export RESTIC_REPOSITORY
+  export RESTIC_PASSWORD_FILE
+  export AWS_ACCESS_KEY_ID
+  export AWS_SECRET_ACCESS_KEY
+  export AWS_DEFAULT_REGION
+  export RESTIC_CACHE_DIR="$CACHE_DIR"
+  MONITOR_READY=1
+}
+
+prepare_runtime() {
+  validate_absolute_path "$LOCK_ROOT" "Runtime lock root"
+  validate_absolute_path "$CACHE_DIR" "Restic cache directory"
+  validate_absolute_path "$RESTORE_TEST_ROOT" "Restore test root"
+  validate_no_symlink_components "$RESTORE_TEST_ROOT" "Restore test root"
+  case "${LOCK_ROOT%/}" in
+    "" | / | /run | /tmp | /var | /etc | /usr | /opt | /home | /root)
+      fail "Refusing unsafe runtime lock root: $LOCK_ROOT"
+      ;;
+  esac
+  case "${CACHE_DIR%/}" in
+    "" | / | /var | /var/cache | /tmp | /etc | /usr | /opt | /home | /root)
+      fail "Refusing unsafe restic cache directory: $CACHE_DIR"
+      ;;
+  esac
+  case "${RESTORE_TEST_ROOT%/}" in
+    "" | / | /var | /var/cache | /tmp | /etc | /usr | /opt | /home | /root)
+      fail "Refusing unsafe restore test root: $RESTORE_TEST_ROOT"
+      ;;
+  esac
+
+  [[ -d "$LOCK_ROOT" && ! -L "$LOCK_ROOT" ]] || \
+    fail "Runtime lock root not found: $LOCK_ROOT"
+  [[ ! -L "$CACHE_DIR" ]] || fail "Restic cache directory must not be a symlink"
+  [[ ! -L "$RESTORE_TEST_ROOT" ]] || \
+    fail "Restore test root must not be a symlink"
+  mkdir -p "$CACHE_DIR"
+  mkdir -p "$RESTORE_TEST_ROOT"
+  chmod 0750 "$CACHE_DIR"
+  chmod 0750 "$RESTORE_TEST_ROOT"
+}
+
+acquire_job_lock() {
+  JOB_LOCK="$LOCK_ROOT/backup.lock"
+  if ! mkdir "$JOB_LOCK" 2>/dev/null; then
+    fail "Another backup operation is running"
+  fi
+}
+
+acquire_operation_lock() {
+  OPERATION_LOCK="$LOCK_ROOT/operation.lock"
+  if ! mkdir "$OPERATION_LOCK" 2>/dev/null; then
+    fail "Another server-infra install or deployment is running"
+  fi
+}
+
+release_locks() {
+  if [[ -n "$OPERATION_LOCK" && -d "$OPERATION_LOCK" ]]; then
+    rmdir "$OPERATION_LOCK" 2>/dev/null || \
+      warn "Unable to release operation lock"
+  fi
+  OPERATION_LOCK=""
+
+  if [[ -n "$JOB_LOCK" && -d "$JOB_LOCK" ]]; then
+    rmdir "$JOB_LOCK" 2>/dev/null || warn "Unable to release backup lock"
+  fi
+  JOB_LOCK=""
+}
+
+push_status() {
+  local status="$1"
+  local message="$2"
+
+  [[ -n "$ACTIVE_PUSH_URL" ]] || fail "No active push monitor configured"
+  curl \
+    --fail \
+    --silent \
+    --show-error \
+    --max-time 15 \
+    --output /dev/null \
+    --get \
+    --data-urlencode "status=$status" \
+    --data-urlencode "msg=$message" \
+    "$ACTIVE_PUSH_URL"
+}
+
+cleanup_restore_test_target() {
+  [[ -n "$RESTORE_TEST_TARGET" ]] || return 0
+
+  case "$RESTORE_TEST_TARGET" in
+    "$RESTORE_TEST_ROOT"/restore-test-*)
+      ;;
+    *)
+      warn "Refusing to remove unexpected restore test path: $RESTORE_TEST_TARGET"
+      return 1
+      ;;
+  esac
+  [[ ! -L "$RESTORE_TEST_TARGET" ]] || {
+    warn "Refusing to remove symlinked restore test path"
+    return 1
+  }
+  if [[ -d "$RESTORE_TEST_TARGET" ]]; then
+    rm -rf -- "$RESTORE_TEST_TARGET"
+  fi
+  RESTORE_TEST_TARGET=""
+}
+
+on_exit() {
+  local exit_status=$?
+
+  trap - EXIT
+  cleanup_restore_test_target || true
+  release_locks
+
+  if [[ "$MONITOR_READY" == "1" && -n "$ACTIVE_PUSH_URL" && \
+    "$JOB_SUCCESS" != "1" ]]; then
+    push_status down "$ACTIVE_MONITOR_LABEL failed on $SERVER_INFRA_INSTANCE" || \
+      warn "Unable to report scheduled job failure to Uptime Kuma"
+  fi
+
+  exit "$exit_status"
+}
+
+run_restic() {
+  restic "$@"
+}
+
+apply_retention() {
+  local tag_name
+  local retention_args=()
+
+  [[ "$BACKUP_RETENTION_ENABLED" == "true" ]] || \
+    fail "Retention is disabled by BACKUP_RETENTION_ENABLED"
+
+  for tag_name in "$CONFIG_TAG" "$DATA_TAG"; do
+    retention_args=(
+      forget
+      --host "$SERVER_INFRA_INSTANCE"
+      --tag "$tag_name"
+      --group-by host,tags
+      --keep-daily "$BACKUP_KEEP_DAILY"
+      --keep-weekly "$BACKUP_KEEP_WEEKLY"
+      --keep-monthly "$BACKUP_KEEP_MONTHLY"
+    )
+    if [[ "$BACKUP_PRUNE_ENABLED" == "true" ]]; then
+      retention_args+=(--prune)
+    fi
+    run_restic "${retention_args[@]}"
+  done
+}
+
+run_init() {
+  CURRENT_OPERATION="init"
+  load_configuration
+  require_command restic
+  prepare_runtime
+  acquire_job_lock
+
+  log "Initializing the configured restic repository"
+  run_restic init
+  ok "restic repository initialized"
+}
+
+run_backup() {
+  local excludes_args=()
+  local excludes_file
+
+  CURRENT_OPERATION="run"
+  load_configuration
+  ACTIVE_PUSH_URL="$UPTIME_KUMA_BACKUP_PUSH_URL"
+  ACTIVE_MONITOR_LABEL="Backup"
+  require_command restic
+  require_command curl
+  prepare_runtime
+  acquire_job_lock
+
+  run_restic snapshots >/dev/null
+  validate_data_paths 1
+  validate_freshness 1
+
+  acquire_operation_lock
+  log "Creating mandatory configuration snapshot"
+  run_restic backup \
+    --host "$SERVER_INFRA_INSTANCE" \
+    --tag "$CONFIG_TAG" \
+    "$CONFIG_ROOT"
+  rmdir "$OPERATION_LOCK"
+  OPERATION_LOCK=""
+
+  log "Creating configured data snapshot"
+  for excludes_file in "${EXCLUDES_FILES[@]}"; do
+    excludes_args+=(--exclude-file "$excludes_file")
+  done
+  run_restic backup \
+    --host "$SERVER_INFRA_INSTANCE" \
+    --tag "$DATA_TAG" \
+    "${excludes_args[@]}" \
+    "${DATA_PATHS[@]}"
+
+  if [[ "$BACKUP_RETENTION_ENABLED" == "true" ]]; then
+    log "Applying configured retention policy"
+    apply_retention
+  else
+    warn "Automatic retention is disabled"
+  fi
+
+  push_status up "Backup completed on $SERVER_INFRA_INSTANCE"
+  JOB_SUCCESS=1
+  ok "backup job completed"
+}
+
+run_retention() {
+  CURRENT_OPERATION="retention"
+  load_configuration
+  require_command restic
+  prepare_runtime
+  acquire_job_lock
+
+  apply_retention
+  ok "retention policy applied"
+}
+
+run_check() {
+  CURRENT_OPERATION="check"
+  load_configuration
+  ACTIVE_PUSH_URL="$UPTIME_KUMA_CHECK_PUSH_URL"
+  ACTIVE_MONITOR_LABEL="Repository check"
+  require_command restic
+  require_command curl
+  prepare_runtime
+  acquire_job_lock
+
+  log "Checking restic repository metadata"
+  run_restic check
+  push_status up "Repository check completed on $SERVER_INFRA_INSTANCE"
+  JOB_SUCCESS=1
+  ok "repository metadata check completed"
+}
+
+paths_overlap() {
+  local first="${1%/}"
+  local second="${2%/}"
+
+  [[ "$first" == "$second" || "$first" == "$second"/* || \
+    "$second" == "$first"/* ]]
+}
+
+validate_restore_target() {
+  local target="$1"
+  local data_path
+  local entries=()
+
+  validate_absolute_path "$target" "Restore target"
+  validate_no_symlink_components "$target" "Restore target"
+  case "${target%/}" in
+    "" | / | /etc | /var | /var/cache | /home | /root | /usr | /opt | /tmp | /run)
+      fail "Refusing unsafe restore target: $target"
+      ;;
+  esac
+  ! paths_overlap "$target" "$CONFIG_ROOT" || \
+    fail "Restore target must not overlap the live configuration root"
+  ! paths_overlap "$target" "$CACHE_DIR" || \
+    fail "Restore target must not overlap the restic cache directory"
+  ! paths_overlap "$target" "$LOCK_ROOT" || \
+    fail "Restore target must not overlap the runtime lock directory"
+  for data_path in "${DATA_PATHS[@]}"; do
+    ! paths_overlap "$target" "$data_path" || \
+      fail "Restore target must not overlap a configured data path: $data_path"
+  done
+  if [[ "$CURRENT_OPERATION" == "restore-test" ]]; then
+    [[ "$target" == "$RESTORE_TEST_ROOT"/restore-test-* ]] || \
+      fail "Restore test target is outside its managed root"
+  else
+    ! paths_overlap "$target" "$RESTORE_TEST_ROOT" || \
+      fail "Restore target must not overlap the restore test root"
+  fi
+  [[ ! -L "$target" ]] || fail "Restore target must not be a symlink"
+
+  if [[ -e "$target" ]]; then
+    [[ -d "$target" ]] || fail "Restore target must be a directory"
+    shopt -s nullglob dotglob
+    entries=("$target"/*)
+    shopt -u nullglob dotglob
+    ((${#entries[@]} == 0)) || fail "Restore target must be empty: $target"
+  else
+    mkdir -m 0700 -p -- "$target"
+  fi
+}
+
+restore_snapshot() {
+  local target="$1"
+  local snapshot="$2"
+  local kind="$3"
+  local tag_name
+
+  case "$kind" in
+    config)
+      tag_name="$CONFIG_TAG"
+      ;;
+    data)
+      tag_name="$DATA_TAG"
+      ;;
+    *)
+      fail "Restore kind must be config or data"
+      ;;
+  esac
+  [[ "$snapshot" == "latest" || "$snapshot" =~ ^[0-9a-f]{8,64}$ ]] || \
+    fail "Snapshot must be latest or an 8-64 character lowercase hex ID"
+
+  validate_restore_target "$target"
+  log "Restoring $kind snapshot $snapshot into $target"
+  run_restic restore "$snapshot" \
+    --host "$SERVER_INFRA_INSTANCE" \
+    --tag "$tag_name" \
+    --target "$target"
+}
+
+run_restore() {
+  CURRENT_OPERATION="restore"
+  load_configuration
+  require_command restic
+  prepare_runtime
+  acquire_job_lock
+
+  restore_snapshot "$RESTORE_TARGET" "$RESTORE_SNAPSHOT" "$RESTORE_KIND"
+  ok "snapshot restored into $RESTORE_TARGET"
+}
+
+validate_restored_mode() {
+  local path="$1"
+  local expected_mode="$2"
+  local label="$3"
+  local actual_mode
+
+  [[ -e "$path" && ! -L "$path" ]] || \
+    fail "Restored $label is missing or is a symlink: $path"
+  actual_mode="$(file_mode "$path")"
+  [[ "$actual_mode" == "$expected_mode" ]] || \
+    fail "Restored $label must have mode 0$expected_mode; found 0$actual_mode"
+}
+
+validate_restored_configuration() {
+  local restored_root="$RESTORE_TEST_TARGET$CONFIG_ROOT"
+  local required_nonempty_file
+
+  [[ -d "$restored_root" ]] || \
+    fail "Restored configuration root not found: $restored_root"
+  [[ -d "$restored_root/backup" ]] || \
+    fail "Restored backup configuration directory not found"
+  validate_restored_mode "$restored_root" 750 "configuration root"
+  validate_restored_mode "$restored_root/server.env" 640 "server.env"
+  validate_restored_mode "$restored_root/modules.env" 640 "modules.env"
+  validate_restored_mode "$restored_root/backup" 750 "backup directory"
+  validate_restored_mode "$restored_root/backup/runtime.env" 600 "runtime.env"
+  validate_restored_mode \
+    "$restored_root/backup/restic-password" \
+    600 \
+    "restic-password"
+  validate_restored_mode "$restored_root/backup/paths" 640 "paths"
+  validate_restored_mode "$restored_root/backup/excludes" 640 "excludes"
+  validate_restored_mode "$restored_root/backup/freshness" 640 "freshness"
+
+  for required_nonempty_file in \
+    "$restored_root/server.env" \
+    "$restored_root/modules.env" \
+    "$restored_root/backup/runtime.env" \
+    "$restored_root/backup/restic-password" \
+    "$restored_root/backup/paths"; do
+    [[ -s "$required_nonempty_file" ]] || \
+      fail "Restored required file is empty: $required_nonempty_file"
+  done
+}
+
+run_restore_test() {
+  local timestamp
+
+  CURRENT_OPERATION="restore-test"
+  load_configuration
+  ACTIVE_PUSH_URL="$UPTIME_KUMA_RESTORE_TEST_PUSH_URL"
+  ACTIVE_MONITOR_LABEL="Restore test"
+  require_command restic
+  require_command curl
+  prepare_runtime
+  acquire_job_lock
+
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  RESTORE_TEST_TARGET="$RESTORE_TEST_ROOT/restore-test-$SERVER_INFRA_INSTANCE-$timestamp-$$"
+  restore_snapshot "$RESTORE_TEST_TARGET" latest config
+  validate_restored_configuration
+  push_status up "Restore test completed on $SERVER_INFRA_INSTANCE"
+  JOB_SUCCESS=1
+  ok "configuration restore test completed"
+}
+
+parse_arguments() {
+  local config_root_set=0
+  local restore_target_set=0
+  local restore_snapshot_set=0
+  local restore_kind_set=0
+
+  while (($# > 0)); do
+    case "$1" in
+      --config-root)
+        (($# >= 2)) || fail "Missing value for --config-root"
+        [[ "$config_root_set" == "0" ]] || \
+          fail "--config-root may be specified only once"
+        CONFIG_ROOT="$2"
+        config_root_set=1
+        shift 2
+        ;;
+      --config-root=*)
+        [[ "$config_root_set" == "0" ]] || \
+          fail "--config-root may be specified only once"
+        CONFIG_ROOT="${1#*=}"
+        [[ -n "$CONFIG_ROOT" ]] || fail "Missing value for --config-root"
+        config_root_set=1
+        shift
+        ;;
+      --target)
+        (($# >= 2)) || fail "Missing value for --target"
+        [[ "$restore_target_set" == "0" ]] || \
+          fail "--target may be specified only once"
+        RESTORE_TARGET="$2"
+        restore_target_set=1
+        shift 2
+        ;;
+      --target=*)
+        [[ "$restore_target_set" == "0" ]] || \
+          fail "--target may be specified only once"
+        RESTORE_TARGET="${1#*=}"
+        [[ -n "$RESTORE_TARGET" ]] || fail "Missing value for --target"
+        restore_target_set=1
+        shift
+        ;;
+      --snapshot)
+        (($# >= 2)) || fail "Missing value for --snapshot"
+        [[ "$restore_snapshot_set" == "0" ]] || \
+          fail "--snapshot may be specified only once"
+        RESTORE_SNAPSHOT="$2"
+        restore_snapshot_set=1
+        shift 2
+        ;;
+      --snapshot=*)
+        [[ "$restore_snapshot_set" == "0" ]] || \
+          fail "--snapshot may be specified only once"
+        RESTORE_SNAPSHOT="${1#*=}"
+        [[ -n "$RESTORE_SNAPSHOT" ]] || fail "Missing value for --snapshot"
+        restore_snapshot_set=1
+        shift
+        ;;
+      --kind)
+        (($# >= 2)) || fail "Missing value for --kind"
+        [[ "$restore_kind_set" == "0" ]] || \
+          fail "--kind may be specified only once"
+        RESTORE_KIND="$2"
+        restore_kind_set=1
+        shift 2
+        ;;
+      --kind=*)
+        [[ "$restore_kind_set" == "0" ]] || \
+          fail "--kind may be specified only once"
+        RESTORE_KIND="${1#*=}"
+        [[ -n "$RESTORE_KIND" ]] || fail "Missing value for --kind"
+        restore_kind_set=1
+        shift
+        ;;
+      --help | -h)
+        usage
+        exit 0
+        ;;
+      -*)
+        fail "Unknown argument: $1"
+        ;;
+      *)
+        [[ -z "$OPERATION" ]] || fail "Specify exactly one operation"
+        OPERATION="$1"
+        shift
+        ;;
+    esac
+  done
+}
+
+main() {
+  if [[ "${1:-}" == "project" ]]; then
+    local project_helper="${SERVER_INFRA_BACKUP_PROJECT_EXECUTABLE:-}"
+
+    shift
+    [[ -n "$project_helper" ]] || \
+      project_helper="$SCRIPT_DIR/server-infra-backup-project"
+    if [[ ! -x "$project_helper" && \
+      -x "/usr/local/libexec/server-infra/backup/server-infra-backup-project" ]]; then
+      project_helper="/usr/local/libexec/server-infra/backup/server-infra-backup-project"
+    fi
+    [[ -x "$project_helper" ]] || \
+      fail "Backup project helper is not installed"
+    exec "$project_helper" "$@"
+  fi
+
+  parse_arguments "$@"
+  [[ -n "$OPERATION" ]] || { usage; exit 1; }
+
+  trap on_exit EXIT
+
+  if [[ "$OPERATION" != "restore" && \
+    (-n "$RESTORE_TARGET" || "$RESTORE_SNAPSHOT" != "latest" || \
+    -n "$RESTORE_KIND") ]]; then
+    fail "Restore options are supported only by the restore operation"
+  fi
+
+  case "$OPERATION" in
+    validate)
+      CURRENT_OPERATION="validate"
+      load_configuration
+      ok "backup configuration: $CONFIG_ROOT"
+      ;;
+    init)
+      run_init
+      ;;
+    run)
+      run_backup
+      ;;
+    retention)
+      run_retention
+      ;;
+    check)
+      run_check
+      ;;
+    restore)
+      [[ -n "$RESTORE_TARGET" ]] || fail "restore requires --target"
+      [[ -n "$RESTORE_KIND" ]] || fail "restore requires --kind"
+      run_restore
+      ;;
+    restore-test)
+      run_restore_test
+      ;;
+    *)
+      fail "Unknown operation: $OPERATION"
+      ;;
+  esac
+}
+
+main "$@"

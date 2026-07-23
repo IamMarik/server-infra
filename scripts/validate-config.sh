@@ -106,6 +106,7 @@ validate_module_runtime() {
   local required_env
   local runtime_mode
   local config_dirs
+  local config_files
   local required_keys=()
   local config_paths=()
   local required_key
@@ -122,6 +123,7 @@ validate_module_runtime() {
   required_env="$(read_declared_value "$manifest_file" "REQUIRED_ENV")"
   runtime_mode="$(read_declared_value "$manifest_file" "RUNTIME_ENV_MODE")"
   config_dirs="$(read_declared_value "$manifest_file" "REQUIRED_CONFIG_DIRS")"
+  config_files="$(read_declared_value "$manifest_file" "REQUIRED_CONFIG_FILES")"
 
   [[ -n "$description" ]] || fail "MODULE_DESCRIPTION is empty for $module_name"
   [[ "$module_version" =~ ^[0-9]+$ ]] || \
@@ -135,6 +137,7 @@ validate_module_runtime() {
         fail "Compose file not found for module: $module_name"
       ;;
     host)
+      validate_host_module_contract "$module_name"
       ;;
     *)
       fail "Unsupported MODULE_DRIVER for $module_name: $module_driver"
@@ -152,29 +155,35 @@ validate_module_runtime() {
     done
   fi
 
-  if [[ -n "$required_env" ]]; then
-    read -r -a required_keys <<< "$required_env"
+  config_paths=()
+  if [[ -n "$config_files" ]]; then
+    read -r -a config_paths <<< "$config_files"
+    for config_path in "${config_paths[@]}"; do
+      validate_relative_config_path "$config_path"
+      validate_managed_path "$CONFIG_ROOT/$module_name/$config_path" file 0640
+    done
   fi
 
-  if ((${#required_keys[@]} > 0)); then
+  if [[ -n "$required_env" ]]; then
+    read -r -a required_keys <<< "$required_env"
     validate_managed_path "$runtime_file" file "$runtime_mode"
     validate_env_file "$runtime_file"
+
+    for required_key in "${required_keys[@]}"; do
+      [[ "$required_key" =~ ^[A-Z][A-Z0-9_]*$ ]] || \
+        fail "Invalid required key name in $manifest_file"
+
+      if [[ "$seen_required_keys" == *$'\n'"$required_key"$'\n'* ]]; then
+        fail "Duplicate required key in $manifest_file: $required_key"
+      fi
+      seen_required_keys+="$required_key"$'\n'
+
+      read_active_value "$runtime_file" "$required_key" >/dev/null
+    done
   elif [[ -f "$runtime_file" ]]; then
     validate_managed_path "$runtime_file" file "$runtime_mode"
     validate_env_file "$runtime_file"
   fi
-
-  for required_key in "${required_keys[@]}"; do
-    [[ "$required_key" =~ ^[A-Z][A-Z0-9_]*$ ]] || \
-      fail "Invalid required key name in $manifest_file"
-
-    if [[ "$seen_required_keys" == *$'\n'"$required_key"$'\n'* ]]; then
-      fail "Duplicate required key in $manifest_file: $required_key"
-    fi
-    seen_required_keys+="$required_key"$'\n'
-
-    read_active_value "$runtime_file" "$required_key" >/dev/null
-  done
 
   ok "module configuration: $module_name"
 }

@@ -1,0 +1,382 @@
+# Backup
+
+## Purpose
+
+Provide encrypted, incremental, off-site host backups without application
+knowledge or a Docker dependency.
+
+The module creates a mandatory configuration snapshot and a separately tagged
+data snapshot in a server-owned restic repository.
+
+## Components
+
+- restic using the Backblaze B2 S3-compatible API;
+- native systemd services with daily, weekly, and monthly timers;
+- a standalone runner installed under
+  `/usr/local/libexec/server-infra/backup/`;
+- separate Uptime Kuma push reporting for backup, repository check, and
+  restore-test jobs.
+
+The host must provide `restic`, `curl`, and system CA certificates. Deployment
+checks runtime commands before changing host artifacts.
+
+## Configuration
+
+Active configuration belongs under:
+
+```text
+/etc/server-infra/backup/
+├── runtime.env
+├── paths
+├── excludes
+├── freshness
+├── sources.d/
+│   └── <project>/
+│       ├── source.conf
+│       ├── paths
+│       ├── excludes
+│       └── freshness
+└── restic-password
+```
+
+`runtime.env` is mode `0600` because it contains provider credentials and a
+push-monitor URL. Use `runtime.env.example` as the key contract.
+
+`paths` contains one absolute data source per line. The runner rejects broad
+roots and backs up `/etc/server-infra` separately without data excludes.
+
+`excludes` contains restic exclude patterns. Dollar signs are rejected because
+restic expands environment variables in exclude files.
+
+`freshness` contains optional database-dump completion markers:
+
+```text
+<maximum-age-seconds> <absolute-marker-path>
+```
+
+The owning application or database module must write a completed dump
+atomically and update its marker only after success.
+
+`sources.d` is optional. Each child directory is one independently managed
+project source. The runner merges its `paths`, `excludes`, and `freshness`
+with the three base files. Existing hosts without `sources.d` remain valid.
+Duplicate paths are backed up only once.
+
+All exclude files apply to the complete data snapshot, so project-specific
+patterns should be anchored to that project's paths when they are not generic.
+
+The restic password file must be root-owned with mode `0600`. Store a second,
+recoverable copy of the password outside the server failure domain.
+
+## Deployment
+
+Prepare the configuration layout and examples:
+
+```bash
+sudo ./scripts/install.sh --module backup --apply --install-examples
+```
+
+Preview backup tool installation:
+
+```bash
+./scripts/install-restic.sh --check
+```
+
+On a Debian-compatible Linux host, install missing tools from the distribution
+repositories:
+
+```bash
+sudo ./scripts/install-restic.sh --apply
+```
+
+The installer is idempotent: it does not reinstall or upgrade tools that are
+already available. If the distribution package is too old for a future module
+requirement, use an official restic binary as a separately reviewed
+installation change.
+
+Create active files from the examples, replace every placeholder, then
+validate without changing the host:
+
+```bash
+./scripts/deploy.sh --config-root /etc/server-infra --check
+```
+
+Add `backup` to `/etc/server-infra/modules.env` only when configuration is
+ready. Apply installs the runner and systemd units, then enables the timer:
+
+```bash
+sudo ./scripts/deploy.sh --config-root /etc/server-infra --apply
+```
+
+The default schedules use the server timezone:
+
+- backup: daily at `03:30`;
+- repository metadata check: Sunday at `04:30`;
+- configuration restore test: the first day of each month at `05:30`.
+
+## Project Backup Wizard
+
+The project wizard registers either:
+
+- application files only; or
+- application files plus one PostgreSQL database running in Docker Compose.
+
+The checked-in project manifest is non-secret:
+
+```text
+<application>/.server-infra/backup/
+├── source.conf
+├── paths
+├── excludes
+├── freshness
+├── restore-check.sh
+└── README.md
+```
+
+For a files-only project, run from the application checkout:
+
+```bash
+server-infra-backup project init --files-only
+```
+
+The repository compatibility wrapper provides the same operation:
+
+```bash
+/path/to/server-infra/scripts/backup-project.sh init --files-only
+```
+
+Files-only mode asks for at least one absolute file or directory path. It does
+not ask for Compose settings, create a staging directory, or install a project
+dump timer.
+
+For files plus PostgreSQL, run the interactive wizard without
+`--files-only`. The manifest records absolute host paths:
+
+```bash
+server-infra-backup project init
+```
+
+The wizard asks for:
+
+- a stable lowercase project name;
+- optional absolute file or directory paths to include in addition to the
+  generated database dump;
+- the Compose file and PostgreSQL service;
+- an optional Compose env-file path;
+- daily dump time and maximum permitted dump age.
+
+The selected Compose env file is automatically added to `paths`; it does not
+need to be entered a second time as an application path. If `.env` exists in
+the application root, the wizard offers it as the default.
+
+It creates `.server-infra/backup` inside the application repository. Review
+and commit those files. They contain paths and service metadata but no
+database password. `README.md` documents the project-local workflow.
+`restore-check.sh <restore-root>` verifies that every configured path exists
+under a separate restic restore target; PostgreSQL sources also require a
+non-empty restored dump. Customize it with application-specific integrity or
+database import checks. The backup scheduler never executes it automatically.
+Re-running `init` on an existing manifest creates either support file when it
+is missing, but does not overwrite a customized copy.
+
+The non-interactive files-only form is:
+
+```bash
+server-infra-backup project init \
+  --files-only \
+  --non-interactive \
+  --project-root /opt/my-app \
+  --name my-app \
+  --include /etc/my-app \
+  --include /srv/my-app/uploads
+```
+
+The equivalent non-interactive PostgreSQL command is:
+
+```bash
+server-infra-backup project init \
+  --non-interactive \
+  --project-root /opt/my-app \
+  --name my-app \
+  --include /srv/my-app/uploads \
+  --compose-file /opt/my-app/docker-compose.yml \
+  --compose-service postgres \
+  --compose-env-file /opt/my-app/.env \
+  --dump-time 02:45 \
+  --max-age-seconds 14400
+```
+
+Validate the project manifest:
+
+```bash
+cd /opt/my-app
+server-infra-backup project validate
+```
+
+Preview server installation:
+
+```bash
+sudo server-infra-backup project install --check
+```
+
+Install the active source and enable its dump timer:
+
+```bash
+sudo server-infra-backup project install
+```
+
+`validate` and `install` use `$PWD/.server-infra/backup` by default. Pass
+`--manifest /absolute/path` only when running from another directory or CI.
+
+Installation copies the reviewed manifest to
+`/etc/server-infra/backup/sources.d/my-app`, creates the root-owned staging
+directory for PostgreSQL sources, and installs their project-specific service
+and timer. A files-only source installs only the active configuration and has
+no producer timer. Use `--no-enable` for PostgreSQL when the timer must be
+enabled only after a manual dump test.
+
+List installed sources:
+
+```bash
+sudo server-infra-backup project list
+```
+
+Preview removal:
+
+```bash
+sudo server-infra-backup project remove --name my-app --check
+```
+
+Remove the active source and its dump timer:
+
+```bash
+sudo server-infra-backup project remove --name my-app
+```
+
+Removal archives the active source configuration under
+`/etc/server-infra/backup/removed-sources`, removes only the generated systemd
+service and timer, and reloads systemd. It does not delete the staging dump or
+the application repository's `.server-infra/backup` manifest. Reinstall the
+manifest to register the source again.
+
+Run the producer manually:
+
+```bash
+sudo systemctl start server-infra-backup-project-my-app.service
+journalctl -u server-infra-backup-project-my-app.service
+```
+
+The producer passes the optional env-file to `docker compose --env-file`; it
+never executes the env-file with `source`. `pg_dump` and `pg_restore --list`
+run inside the selected container. They use `POSTGRES_USER` when set, otherwise
+`postgres`; `POSTGRES_DB` defaults to the selected database user. The dump is
+written and checked under a temporary filename, then atomically renamed. The
+freshness marker is published last.
+
+The generated dump timer should run before the main `03:30` backup. If a dump
+starts but does not finish, its marker remains absent and the main backup
+fails instead of silently copying an old database dump.
+
+## Operations
+
+Initialize a new repository explicitly:
+
+```bash
+sudo ./scripts/backup.sh --config-root /etc/server-infra init
+```
+
+The scheduled job never initializes a repository.
+
+Run a backup manually:
+
+```bash
+sudo ./scripts/backup.sh --config-root /etc/server-infra run
+```
+
+Apply retention explicitly after provider-policy validation:
+
+```bash
+sudo ./scripts/backup.sh --config-root /etc/server-infra retention
+```
+
+Run the same metadata-only repository check used by the weekly timer:
+
+```bash
+sudo ./scripts/backup.sh --config-root /etc/server-infra check
+```
+
+Restore the latest configuration snapshot into a new or empty directory:
+
+```bash
+sudo ./scripts/restore.sh \
+  --config-root /etc/server-infra \
+  --kind config \
+  --target /var/tmp/server-infra-restore
+```
+
+Use `--kind data` for the tagged data snapshot. Use
+`--snapshot <snapshot-id>` to select an exact snapshot instead of `latest`.
+The command rejects symlinks, broad system paths, the live configuration
+root, and non-empty destinations. A failed manual restore leaves its target in
+place for inspection.
+
+Run the monthly configuration restore test manually:
+
+```bash
+sudo ./scripts/backup.sh --config-root /etc/server-infra restore-test
+```
+
+The test restores the latest configuration snapshot selected by server
+instance and tag, validates the expected layout and permissions, and removes
+only the temporary directory it created under
+`/var/cache/server-infra/backup/restore-tests`.
+
+`BACKUP_RETENTION_ENABLED` and `BACKUP_PRUNE_ENABLED` default to `false`.
+Automatic prune must remain disabled until Object Lock or versioning behavior
+has been validated for the server.
+
+Inspect the timer and service:
+
+```bash
+systemctl status \
+  server-infra-backup.timer \
+  server-infra-backup-check.timer \
+  server-infra-backup-restore-test.timer
+journalctl -u server-infra-backup.service
+journalctl -u server-infra-backup-check.service
+journalctl -u server-infra-backup-restore-test.service
+```
+
+Create three independent Uptime Kuma push monitors. A successful daily backup
+must not mask a failed weekly check or monthly restore test.
+
+Run the module lifecycle and safety test without contacting a real repository
+or monitor:
+
+```bash
+./backup/tests/test-runner.sh
+./backup/tests/test-project-wizard.sh
+```
+
+The generic restore test proves that encrypted configuration files can be
+retrieved with their expected structure and permissions. It does not prove
+that an application-owned logical database dump can be imported; every
+application that stages such a dump must own and document that import test.
+
+## Troubleshooting
+
+- A missing repository causes `run` to fail; use the explicit `init` operation
+  only after verifying the repository URL.
+- A stale or missing required marker stops the data snapshot and reports the
+  job as failed.
+- `project` commands require the backup module to have been deployed first so
+  that `server-infra-backup` and its internal helper are installed.
+- PostgreSQL project sources require Docker Compose and `pg_dump`/`pg_restore`
+  inside the selected service.
+- A deployment or another backup operation prevents a concurrent backup.
+- Push URLs must be HTTPS base URLs without query parameters.
+- `check` validates repository metadata only. A full `--read-data` scan is an
+  intentionally separate operator decision because it downloads all pack
+  data.
+- A restore test failure reports to its own monitor and still removes only the
+  temporary test directory created for that invocation.

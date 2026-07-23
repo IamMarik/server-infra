@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the Server Infra restic repository weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00
+Persistent=true
+AccuracySec=1min
+Unit=server-infra-backup-check.service
+
+[Install]
+WantedBy=timers.target

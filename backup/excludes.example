@@ -1,0 +1,8 @@
+# Target: /etc/server-infra/backup/excludes
+# Required permissions: root:root 0640
+# Restic exclude patterns, one per line. Environment expansion is disabled by
+# the module contract, so dollar signs are rejected.
+
+*.tmp
+*.partial
+cache/

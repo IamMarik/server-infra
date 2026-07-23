@@ -26,7 +26,8 @@ server-infra/
 ├── scripts/
 ├── environments/
 ├── proxy/
-└── monitoring/
+├── monitoring/
+└── backup/
 ```
 
 ## Core model
@@ -47,7 +48,9 @@ during migration:
 ./scripts/deploy.sh prod-app
 ```
 
-Current scripts are foundation stubs. They validate repository conventions and prepare the deployment flow; service deployment is implemented incrementally.
+Current scripts validate repository conventions and deploy Compose or native
+host modules through an explicit driver contract. Individual infrastructure
+capabilities are implemented incrementally.
 
 The `environments/` flow is retained temporarily for rollback while runtime
 configuration migrates to `/etc/server-infra`. Do not add new runtime values
@@ -71,8 +74,9 @@ host:
 ./scripts/validate-config.sh --config-root /etc/server-infra
 ```
 
-Run the complete deployment preflight, including Docker Compose resolution,
-without changing runtime state:
+Run the complete deployment preflight, including driver-specific module
+validation and Docker Compose resolution when applicable, without changing
+runtime state:
 
 ```bash
 ./scripts/deploy.sh --config-root /etc/server-infra --check
@@ -86,10 +90,10 @@ external configuration requires an additional explicit operation:
 ./scripts/deploy.sh --config-root /etc/server-infra --apply
 ```
 
-For migration, apply requires the expected Compose project to exist so a typo
-in `SERVER_INFRA_INSTANCE` cannot silently create new empty named volumes.
-`--allow-new-project` is reserved for intentional first deployment of a new
-module.
+For migration, apply requires every expected Compose project to exist so a
+typo in `SERVER_INFRA_INSTANCE` cannot silently create new empty named
+volumes. `--allow-new-project` applies only to an intentional first deployment
+of a Compose module.
 
 Preview host layout preparation for the proxy:
 
@@ -104,11 +108,40 @@ files. It never creates active runtime files or secrets:
 sudo ./scripts/install.sh --module proxy --apply --install-examples
 ```
 
+Preview or install the host tools required by the backup module:
+
+```bash
+./scripts/install-restic.sh --check
+sudo ./scripts/install-restic.sh --apply
+```
+
+Initialize a PostgreSQL Compose backup source from an application repository:
+
+```bash
+server-infra-backup project init
+```
+
+For files without a database producer:
+
+```bash
+server-infra-backup project init --files-only
+```
+
+The wizard creates a non-secret `.server-infra/backup` manifest in the
+application repository, including a project README and manual restore-check
+script. See `backup/README.md` for validation, server installation, listing,
+removal, dump testing, and restore instructions. The public command is
+installed by applying the `backup` host module. From the application root,
+`project validate` and `project install` find this directory automatically.
+For PostgreSQL sources, the Compose env file selected by the wizard is
+automatically included in the backup paths.
+
 ## Documentation
 
 - `ARCHITECTURE.md` explains the system model.
 - `STYLE.md` defines repository style rules.
 - `AGENTS.md` gives AI-agent instructions.
 - Each module has its own `README.md`.
+- `rfc/0001-backup-stack.md` defines the host-level backup module and rollout.
 - `rfc/0002-external-runtime-configuration.md` defines the safe runtime
   configuration migration.

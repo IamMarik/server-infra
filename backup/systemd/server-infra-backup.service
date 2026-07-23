@@ -1,0 +1,17 @@
+[Unit]
+Description=Server Infra encrypted off-site backup
+Documentation=https://restic.net/
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/server-infra/backup/runtime.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/server-infra/backup/server-infra-backup --config-root /etc/server-infra run
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+PrivateTmp=true
+NoNewPrivileges=true
+TimeoutStartSec=infinity

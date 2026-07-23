@@ -26,6 +26,23 @@ All shell scripts must:
 - Use named volumes for persistent service data.
 - Do not commit secrets.
 
+## Host Modules
+
+- Declare host executables with `HOST_EXECUTABLES`.
+- Expose only operator-facing host commands with `HOST_PUBLIC_EXECUTABLES`;
+  keep implementation helpers under `libexec`.
+- Keep declared executables directly under the module's `bin/` directory.
+- Declare apply-time dependencies with `HOST_REQUIRED_COMMANDS`.
+- Keep module preflight read-only and declare it with
+  `HOST_PREFLIGHT_EXECUTABLE`.
+- Declare persistent and cache directories with `HOST_STATE_DIRS` and
+  `HOST_CACHE_DIRS`.
+- Declare all systemd units with `SYSTEMD_UNITS`.
+- Declare the subset enabled by deployment with `SYSTEMD_ENABLE_UNITS`.
+- Keep declared units directly under the module's `systemd/` directory.
+- Do not execute native services directly from the Git checkout.
+- Do not add module-specific branches to the host driver.
+
 ## Configuration
 
 - Active host configuration belongs under `/etc/server-infra`.
@@ -45,6 +62,7 @@ All shell scripts must:
   supported.
 - Do not commit domains, server names, application routes, passwords, private
   keys, API tokens, or provider credentials.
+- Declare required non-secret module files with `REQUIRED_CONFIG_FILES`.
 
 ## Documentation
 

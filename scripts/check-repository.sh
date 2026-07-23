@@ -27,6 +27,7 @@ is_forbidden_tracked_path() {
     modules.env | */modules.env | modules.env.* | */modules.env.* | \
     config.env | */config.env | config.env.* | */config.env.* | \
     runtime.env | */runtime.env | runtime.env.* | */runtime.env.* | \
+    backup/paths | backup/excludes | backup/freshness | \
     restic-password | */restic-password | \
     restic-password.* | */restic-password.* | \
     *.secret | */*.secret | \
@@ -51,6 +52,10 @@ check_required_examples() {
     "modules.env.example"
     "proxy/runtime.env.example"
     "proxy/conf.d/service.caddy.example"
+    "backup/runtime.env.example"
+    "backup/paths.example"
+    "backup/excludes.example"
+    "backup/freshness.example"
   )
   local example_path
   local missing=0

@@ -7,6 +7,9 @@
 **/config.env.*
 **/runtime.env
 **/runtime.env.*
+/backup/paths
+/backup/excludes
+/backup/freshness
 
 # Secrets and private keys
 **/restic-password

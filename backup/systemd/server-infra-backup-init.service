@@ -1,0 +1,14 @@
+[Unit]
+Description=Initialize the Server Infra restic repository
+Documentation=https://restic.net/
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/server-infra/backup/runtime.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/server-infra/backup/server-infra-backup --config-root /etc/server-infra init
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+TimeoutStartSec=infinity

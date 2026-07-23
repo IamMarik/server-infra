@@ -1,0 +1,1268 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+OPERATION="${1:-}"
+[[ $# -eq 0 ]] || shift
+
+CONFIG_ROOT="/etc/server-infra"
+PROJECT_ROOT=""
+SOURCE_NAME=""
+SOURCE_TYPE="postgres-compose"
+MANIFEST_DIR=""
+COMPOSE_FILE=""
+COMPOSE_SERVICE="postgres"
+COMPOSE_ENV_FILE=""
+DUMP_TIME="02:45"
+DUMP_MAX_AGE_SECONDS="14400"
+STAGING_ROOT="/var/lib/server-infra/backup/staging"
+STAGING_DIR=""
+SYSTEMD_UNIT_ROOT="/etc/systemd/system"
+LOCK_ROOT="${SERVER_INFRA_BACKUP_LOCK_ROOT:-/run/server-infra}"
+HELPER_EXECUTABLE="${SERVER_INFRA_BACKUP_PROJECT_EXECUTABLE:-/usr/local/libexec/server-infra/backup/server-infra-backup-project}"
+CHECK_ONLY=0
+ENABLE_TIMER=1
+NON_INTERACTIVE=0
+FILES_ONLY=0
+OPERATION_LOCK=""
+INSTALL_JOB_LOCK=""
+DUMP_LOCK=""
+DUMP_TMP=""
+MARKER_TMP=""
+INCLUDE_PATHS=()
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  server-infra-backup project init [options]
+  server-infra-backup project validate [--manifest <directory>]
+  server-infra-backup project install [--manifest <directory>] [--check]
+  server-infra-backup project list [--config-root <absolute-path>]
+  server-infra-backup project remove --name <name> [--check]
+
+Internal:
+  server-infra-backup-project dump --source-config <source.conf>
+
+Init options:
+  --project-root <path>       Existing application root. Defaults to $PWD.
+  --name <kebab-case>         Stable backup source name.
+  --include <absolute-path>   Repeat for each file or directory to back up.
+  --compose-file <path>       Docker Compose file.
+  --compose-service <name>    PostgreSQL service. Default: postgres.
+  --compose-env-file <path>   Optional Compose interpolation env file.
+  --dump-time <HH:MM>         Daily dump time. Default: 02:45.
+  --max-age-seconds <number>  Freshness limit. Default: 14400.
+  --files-only                Back up files without PostgreSQL or a dump timer.
+  --manifest <directory>      Output directory. Default:
+                              <project-root>/.server-infra/backup.
+  --non-interactive           Fail instead of prompting for missing values.
+
+Install options:
+  --manifest <directory>      Default: $PWD/.server-infra/backup.
+  --config-root <path>        Default: /etc/server-infra.
+  --check                     Validate and print the plan without changes.
+  --no-enable                 Install without enabling the generated timer.
+
+Remove options:
+  --name <kebab-case>         Installed source name to remove.
+  --config-root <path>        Default: /etc/server-infra.
+  --check                     Print the removal plan without changes.
+
+The PostgreSQL helper never sources the Compose env file and stores no
+database password. It executes pg_dump and pg_restore inside the configured
+Compose service.
+USAGE
+}
+
+log() {
+  printf '[server-infra][backup-project] %s\n' "$*"
+}
+
+ok() {
+  printf '[server-infra][backup-project][ok] %s\n' "$*"
+}
+
+warn() {
+  printf '[server-infra][backup-project][warn] %s\n' "$*" >&2
+}
+
+fail() {
+  printf '[server-infra][backup-project][error] %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  local command_name="$1"
+  command -v "$command_name" >/dev/null 2>&1 || \
+    fail "Required command not found: $command_name"
+}
+
+validate_absolute_path() {
+  local path_value="$1"
+  local path_label="$2"
+
+  [[ "$path_value" == /* ]] || fail "$path_label must be an absolute path"
+  [[ "$path_value" != *".."* && "$path_value" != *"//"* ]] || \
+    fail "$path_label contains an unsafe path component"
+  [[ "$path_value" != *[[:space:]]* ]] || \
+    fail "$path_label must not contain whitespace"
+  case "${path_value%/}" in
+    "" | / | /etc | /var | /run | /usr | /opt | /root | /home | /tmp)
+      fail "Refusing broad path for $path_label: $path_value"
+      ;;
+  esac
+}
+
+validate_source_name() {
+  [[ "$1" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
+    fail "Source name must use lowercase kebab-case"
+  ((${#1} <= 48)) || fail "Source name must not exceed 48 characters"
+}
+
+validate_service_name() {
+  [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || \
+    fail "Compose service has an invalid format"
+}
+
+validate_dump_time() {
+  local value="$1"
+  local hour
+  local minute
+
+  [[ "$value" =~ ^([0-9]{2}):([0-9]{2})$ ]] || \
+    fail "Dump time must use HH:MM"
+  hour="${BASH_REMATCH[1]}"
+  minute="${BASH_REMATCH[2]}"
+  ((10#$hour <= 23 && 10#$minute <= 59)) || \
+    fail "Dump time is outside the valid clock range"
+}
+
+validate_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]] || fail "$2 must be a positive integer"
+}
+
+parse_env_line() {
+  local raw_line="$1"
+  local source_name="$2"
+  local line_number="$3"
+  local value_length
+  local first_character
+  local last_character
+
+  PARSED_ENV_KIND="skip"
+  PARSED_ENV_KEY=""
+  PARSED_ENV_VALUE=""
+  raw_line="${raw_line%$'\r'}"
+
+  if [[ "$raw_line" =~ ^[[:space:]]*$ ]] || \
+    [[ "$raw_line" =~ ^[[:space:]]*# ]]; then
+    return
+  fi
+  [[ "$raw_line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || \
+    fail "Invalid KEY=VALUE entry in $source_name at line $line_number"
+  PARSED_ENV_KEY="${BASH_REMATCH[1]}"
+  PARSED_ENV_VALUE="${BASH_REMATCH[2]}"
+  value_length="${#PARSED_ENV_VALUE}"
+
+  if ((value_length > 0)); then
+    first_character="${PARSED_ENV_VALUE:0:1}"
+    last_character="${PARSED_ENV_VALUE:value_length-1:1}"
+    if [[ "$first_character" == '"' || "$last_character" == '"' ]]; then
+      ((value_length >= 2)) && \
+        [[ "$first_character" == '"' && "$last_character" == '"' ]] || \
+        fail "Unbalanced quote in $source_name at line $line_number"
+      PARSED_ENV_VALUE="${PARSED_ENV_VALUE:1:value_length-2}"
+    elif [[ "$first_character" == "'" || "$last_character" == "'" ]]; then
+      ((value_length >= 2)) && \
+        [[ "$first_character" == "'" && "$last_character" == "'" ]] || \
+        fail "Unbalanced quote in $source_name at line $line_number"
+      PARSED_ENV_VALUE="${PARSED_ENV_VALUE:1:value_length-2}"
+    fi
+  fi
+  PARSED_ENV_KIND="assignment"
+}
+
+read_env_value() {
+  local env_file="$1"
+  local requested_key="$2"
+  local line=""
+  local line_number=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    parse_env_line "$line" "$env_file" "$line_number"
+    if [[ "$PARSED_ENV_KIND" == "assignment" && \
+      "$PARSED_ENV_KEY" == "$requested_key" ]]; then
+      printf '%s' "$PARSED_ENV_VALUE"
+      return 0
+    fi
+  done < "$env_file"
+  return 1
+}
+
+read_required_value() {
+  local value
+
+  value="$(read_env_value "$1" "$2")" || fail "Missing key $2 in $1"
+  [[ -n "$value" ]] || fail "Empty required key $2 in $1"
+  printf '%s' "$value"
+}
+
+read_optional_value() {
+  read_env_value "$1" "$2" || true
+}
+
+validate_source_env_keys() {
+  local env_file="$1"
+  local allowed_keys=$'\nSOURCE_VERSION\nSOURCE_NAME\nSOURCE_TYPE\nPROJECT_ROOT\nCOMPOSE_FILE\nCOMPOSE_SERVICE\nCOMPOSE_ENV_FILE\nDUMP_TIME\nDUMP_MAX_AGE_SECONDS\nSTAGING_DIR\n'
+  local seen_keys=$'\n'
+  local line=""
+  local line_number=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    parse_env_line "$line" "$env_file" "$line_number"
+    [[ "$PARSED_ENV_KIND" == "assignment" ]] || continue
+    [[ "$allowed_keys" == *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Unknown key $PARSED_ENV_KEY in $env_file"
+    [[ "$seen_keys" != *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Duplicate key $PARSED_ENV_KEY in $env_file"
+    seen_keys+="$PARSED_ENV_KEY"$'\n'
+  done < "$env_file"
+}
+
+require_source_key_absent() {
+  if read_env_value "$1" "$2" >/dev/null; then
+    fail "$2 is not supported for SOURCE_TYPE=files-only in $1"
+  fi
+}
+
+validate_list_file() {
+  local file_path="$1"
+  local list_type="$2"
+  local line=""
+  local line_number=0
+  local entry_count=0
+
+  [[ -f "$file_path" && ! -L "$file_path" ]] || \
+    fail "Missing regular $list_type file: $file_path"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+    case "$list_type" in
+      paths)
+        validate_absolute_path "$line" "Path in $file_path at line $line_number"
+        entry_count=$((entry_count + 1))
+        ;;
+      excludes)
+        [[ "$line" != *'$'* ]] || \
+          fail "Dollar signs are not supported in $file_path"
+        ;;
+      freshness)
+        [[ "$line" =~ ^([1-9][0-9]*)[[:space:]]+(/.*)$ ]] || \
+          fail "Invalid freshness entry in $file_path at line $line_number"
+        validate_absolute_path \
+          "${BASH_REMATCH[2]}" \
+          "Freshness marker in $file_path at line $line_number"
+        entry_count=$((entry_count + 1))
+        ;;
+      *)
+        fail "Unknown list type: $list_type"
+        ;;
+    esac
+  done < "$file_path"
+
+  if [[ "$list_type" == "paths" ]]; then
+    ((entry_count > 0)) || fail "$file_path must contain at least one entry"
+  fi
+}
+
+load_manifest() {
+  local source_env="$MANIFEST_DIR/source.conf"
+
+  [[ -d "$MANIFEST_DIR" && ! -L "$MANIFEST_DIR" ]] || \
+    fail "Manifest directory not found: $MANIFEST_DIR"
+  [[ -f "$source_env" && ! -L "$source_env" ]] || \
+    fail "Source manifest not found: $source_env"
+  validate_source_env_keys "$source_env"
+
+  SOURCE_VERSION="$(read_required_value "$source_env" "SOURCE_VERSION")"
+  SOURCE_NAME="$(read_required_value "$source_env" "SOURCE_NAME")"
+  SOURCE_TYPE="$(read_required_value "$source_env" "SOURCE_TYPE")"
+  PROJECT_ROOT="$(read_required_value "$source_env" "PROJECT_ROOT")"
+
+  [[ "$SOURCE_VERSION" == "1" ]] || fail "Unsupported SOURCE_VERSION"
+  validate_source_name "$SOURCE_NAME"
+  validate_absolute_path "$PROJECT_ROOT" "PROJECT_ROOT"
+
+  validate_list_file "$MANIFEST_DIR/paths" paths
+  validate_list_file "$MANIFEST_DIR/excludes" excludes
+  validate_list_file "$MANIFEST_DIR/freshness" freshness
+
+  case "$SOURCE_TYPE" in
+    postgres-compose)
+      COMPOSE_FILE="$(read_required_value "$source_env" "COMPOSE_FILE")"
+      COMPOSE_SERVICE="$(read_required_value "$source_env" "COMPOSE_SERVICE")"
+      COMPOSE_ENV_FILE="$(read_optional_value "$source_env" "COMPOSE_ENV_FILE")"
+      DUMP_TIME="$(read_required_value "$source_env" "DUMP_TIME")"
+      DUMP_MAX_AGE_SECONDS="$(
+        read_required_value "$source_env" "DUMP_MAX_AGE_SECONDS"
+      )"
+      STAGING_DIR="$(read_required_value "$source_env" "STAGING_DIR")"
+      STAGING_ROOT="${STAGING_DIR%/*}"
+
+      validate_absolute_path "$COMPOSE_FILE" "COMPOSE_FILE"
+      validate_service_name "$COMPOSE_SERVICE"
+      if [[ -n "$COMPOSE_ENV_FILE" ]]; then
+        validate_absolute_path "$COMPOSE_ENV_FILE" "COMPOSE_ENV_FILE"
+      fi
+      validate_dump_time "$DUMP_TIME"
+      validate_positive_integer \
+        "$DUMP_MAX_AGE_SECONDS" \
+        "DUMP_MAX_AGE_SECONDS"
+      validate_absolute_path "$STAGING_DIR" "STAGING_DIR"
+      [[ "${STAGING_DIR##*/}" == "$SOURCE_NAME" ]] || \
+        fail "STAGING_DIR must end with SOURCE_NAME"
+      grep -F -x -- "$STAGING_DIR" "$MANIFEST_DIR/paths" >/dev/null || \
+        fail "paths must include STAGING_DIR"
+      grep -F -x -- \
+        "$DUMP_MAX_AGE_SECONDS $STAGING_DIR/postgres.complete" \
+        "$MANIFEST_DIR/freshness" >/dev/null || \
+        fail "freshness must track the generated PostgreSQL dump"
+      ;;
+    files-only)
+      require_source_key_absent "$source_env" "COMPOSE_FILE"
+      require_source_key_absent "$source_env" "COMPOSE_SERVICE"
+      require_source_key_absent "$source_env" "COMPOSE_ENV_FILE"
+      require_source_key_absent "$source_env" "DUMP_TIME"
+      require_source_key_absent "$source_env" "DUMP_MAX_AGE_SECONDS"
+      require_source_key_absent "$source_env" "STAGING_DIR"
+      COMPOSE_FILE=""
+      COMPOSE_SERVICE=""
+      COMPOSE_ENV_FILE=""
+      DUMP_TIME=""
+      DUMP_MAX_AGE_SECONDS=""
+      STAGING_DIR=""
+      ;;
+    *)
+      fail "Unsupported SOURCE_TYPE=$SOURCE_TYPE"
+      ;;
+  esac
+}
+
+validate_runtime_inputs() {
+  [[ -d "$PROJECT_ROOT" && ! -L "$PROJECT_ROOT" ]] || \
+    fail "Project root not found: $PROJECT_ROOT"
+  if [[ "$SOURCE_TYPE" == "postgres-compose" ]]; then
+    [[ -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" ]] || \
+      fail "Compose file not found: $COMPOSE_FILE"
+    if [[ -n "$COMPOSE_ENV_FILE" ]]; then
+      [[ -f "$COMPOSE_ENV_FILE" && ! -L "$COMPOSE_ENV_FILE" ]] || \
+        fail "Compose env file not found: $COMPOSE_ENV_FILE"
+    fi
+  fi
+}
+
+prompt_value() {
+  local variable_name="$1"
+  local label="$2"
+  local default_value="$3"
+  local entered=""
+
+  if [[ -n "$default_value" ]]; then
+    printf '%s [%s]: ' "$label" "$default_value" >&2
+  else
+    printf '%s: ' "$label" >&2
+  fi
+  IFS= read -r entered
+  [[ -n "$entered" ]] || entered="$default_value"
+  printf -v "$variable_name" '%s' "$entered"
+}
+
+collect_init_values() {
+  local include_line=""
+  local default_name
+
+  if [[ -z "$PROJECT_ROOT" ]]; then
+    PROJECT_ROOT="$PWD"
+  fi
+  [[ -d "$PROJECT_ROOT" ]] || fail "Project root not found: $PROJECT_ROOT"
+  PROJECT_ROOT="$(cd "$PROJECT_ROOT" && pwd -P)"
+  default_name="${PROJECT_ROOT##*/}"
+
+  if [[ "$NON_INTERACTIVE" == "1" ]]; then
+    [[ -n "$SOURCE_NAME" ]] || fail "--name is required in non-interactive mode"
+  else
+    [[ -n "$SOURCE_NAME" ]] || \
+      prompt_value SOURCE_NAME "Project backup name" "$default_name"
+    if ((${#INCLUDE_PATHS[@]} == 0)); then
+      if [[ "$FILES_ONLY" == "1" ]]; then
+        prompt_value \
+          include_line \
+          "Absolute paths to back up (space-separated)" \
+          ""
+      else
+        prompt_value \
+          include_line \
+          "Additional absolute paths to back up (space-separated, optional)" \
+          ""
+      fi
+      if [[ -n "$include_line" ]]; then
+        read -r -a INCLUDE_PATHS <<< "$include_line"
+      fi
+    fi
+  fi
+
+  [[ -n "$MANIFEST_DIR" ]] || MANIFEST_DIR="$PROJECT_ROOT/.server-infra/backup"
+
+  if [[ "$FILES_ONLY" == "1" ]]; then
+    SOURCE_TYPE="files-only"
+    ((${#INCLUDE_PATHS[@]} > 0)) || [[ -d "$MANIFEST_DIR" ]] || \
+      fail "files-only mode requires at least one --include path"
+  else
+    SOURCE_TYPE="postgres-compose"
+    [[ -n "$COMPOSE_FILE" ]] || COMPOSE_FILE="$PROJECT_ROOT/docker-compose.yml"
+    if [[ -z "$COMPOSE_ENV_FILE" && -f "$PROJECT_ROOT/.env" ]]; then
+      COMPOSE_ENV_FILE="$PROJECT_ROOT/.env"
+    fi
+    if [[ "$NON_INTERACTIVE" != "1" ]]; then
+      prompt_value COMPOSE_FILE "Docker Compose file" "$COMPOSE_FILE"
+      prompt_value \
+        COMPOSE_SERVICE \
+        "PostgreSQL Compose service" \
+        "$COMPOSE_SERVICE"
+      prompt_value \
+        COMPOSE_ENV_FILE \
+        "Optional Docker Compose env file" \
+        "$COMPOSE_ENV_FILE"
+      prompt_value DUMP_TIME "Daily dump time (HH:MM)" "$DUMP_TIME"
+      prompt_value \
+        DUMP_MAX_AGE_SECONDS \
+        "Maximum dump age in seconds" \
+        "$DUMP_MAX_AGE_SECONDS"
+    fi
+  fi
+  validate_source_name "$SOURCE_NAME"
+  validate_absolute_path "$PROJECT_ROOT" "Project root"
+  if [[ "$SOURCE_TYPE" == "postgres-compose" ]]; then
+    STAGING_DIR="$STAGING_ROOT/$SOURCE_NAME"
+    validate_absolute_path "$COMPOSE_FILE" "Compose file"
+    validate_service_name "$COMPOSE_SERVICE"
+    if [[ -n "$COMPOSE_ENV_FILE" ]]; then
+      validate_absolute_path "$COMPOSE_ENV_FILE" "Compose env file"
+      INCLUDE_PATHS+=("$COMPOSE_ENV_FILE")
+    fi
+    validate_dump_time "$DUMP_TIME"
+    validate_positive_integer "$DUMP_MAX_AGE_SECONDS" "Maximum dump age"
+    validate_absolute_path "$STAGING_DIR" "Staging directory"
+  fi
+}
+
+write_manifest_file() {
+  local destination="$1"
+  local mode="$2"
+  shift 2
+  local temporary_file
+
+  temporary_file="$(mktemp "$MANIFEST_DIR/.${destination##*/}.tmp.XXXXXX")"
+  printf '%s\n' "$@" > "$temporary_file"
+  chmod "$mode" "$temporary_file"
+  mv -f -- "$temporary_file" "$destination"
+}
+
+write_restore_check() {
+  write_manifest_file "$MANIFEST_DIR/restore-check.sh" 0755 \
+    '#!/usr/bin/env bash' \
+    '' \
+    'set -Eeuo pipefail' \
+    '' \
+    'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' \
+    'PROJECT_DUMP_PATH=""' \
+    '' \
+    'fail() {' \
+    '  printf "[restore-check][error] %s\n" "$*" >&2' \
+    '  exit 1' \
+    '}' \
+    '' \
+    'RESTORE_ROOT="${1:-}"' \
+    '[[ -n "$RESTORE_ROOT" ]] || fail "Usage: restore-check.sh <restore-root>"' \
+    '[[ "$RESTORE_ROOT" == /* ]] || fail "Restore root must be absolute"' \
+    '[[ -d "$RESTORE_ROOT" && ! -L "$RESTORE_ROOT" ]] || \' \
+    '  fail "Restore root must be an existing regular directory"' \
+    '' \
+    'while IFS= read -r source_line || [[ -n "$source_line" ]]; do' \
+    '  source_line="${source_line%$'\''\r'\''}"' \
+    '  case "$source_line" in' \
+    '    STAGING_DIR=*)' \
+    '      PROJECT_DUMP_PATH="${source_line#STAGING_DIR=}/postgres.dump"' \
+    '      ;;' \
+    '  esac' \
+    'done < "$SCRIPT_DIR/source.conf"' \
+    '' \
+    'checked=0' \
+    'while IFS= read -r source_path || [[ -n "$source_path" ]]; do' \
+    '  source_path="${source_path%$'\''\r'\''}"' \
+    '  [[ "$source_path" =~ ^[[:space:]]*$ || \' \
+    '    "$source_path" =~ ^[[:space:]]*# ]] && continue' \
+    '  restored_path="${RESTORE_ROOT%/}$source_path"' \
+    '  [[ -e "$restored_path" || -L "$restored_path" ]] || \' \
+    '    fail "Restored path is missing: $restored_path"' \
+    '  checked=$((checked + 1))' \
+    'done < "$SCRIPT_DIR/paths"' \
+    '' \
+    'if [[ -n "$PROJECT_DUMP_PATH" ]]; then' \
+    '  restored_dump="${RESTORE_ROOT%/}$PROJECT_DUMP_PATH"' \
+    '  [[ -s "$restored_dump" ]] || \' \
+    '    fail "Restored PostgreSQL dump is missing or empty: $restored_dump"' \
+    'fi' \
+    '' \
+    '((checked > 0)) || fail "No project paths are configured"' \
+    'printf "[restore-check][ok] %s configured paths are present\n" "$checked"'
+}
+
+write_project_readme() {
+  local mode_description
+
+  if [[ "$SOURCE_TYPE" == "files-only" ]]; then
+    mode_description="Files only; no database producer or project timer."
+  else
+    mode_description="Files plus a PostgreSQL custom-format dump from Docker Compose."
+  fi
+
+  write_manifest_file "$MANIFEST_DIR/README.md" 0644 \
+    "# Backup source: $SOURCE_NAME" \
+    '' \
+    "$mode_description" \
+    '' \
+    'This directory is non-secret and should be reviewed and committed with' \
+    'the application repository.' \
+    '' \
+    '## Files' \
+    '' \
+    '- `source.conf` describes the source type and server paths.' \
+    '- `paths` lists absolute paths included in the data snapshot.' \
+    '- `excludes` contains restic exclusion patterns.' \
+    '- `freshness` contains required completion markers, when applicable.' \
+    '- `restore-check.sh` checks that configured paths exist after restore.' \
+    '' \
+    '## Workflow' \
+    '' \
+    '```bash' \
+    'server-infra-backup project validate' \
+    'sudo server-infra-backup project install --check' \
+    'sudo server-infra-backup project install' \
+    'sudo server-infra-backup project list' \
+    '```' \
+    '' \
+    'After restoring the data snapshot into a separate directory:' \
+    '' \
+    '```bash' \
+    '.server-infra/backup/restore-check.sh /absolute/restore/root' \
+    '```' \
+    '' \
+    'This check verifies presence and a non-empty staged PostgreSQL dump when' \
+    'configured. Add application-specific integrity or import checks here; the' \
+    'server backup scheduler does not execute this script automatically.'
+}
+
+ensure_project_support_files() {
+  local support_file
+
+  for support_file in restore-check.sh README.md; do
+    [[ ! -L "$MANIFEST_DIR/$support_file" ]] || \
+      fail "Project support file must not be a symlink: $MANIFEST_DIR/$support_file"
+  done
+  if [[ ! -e "$MANIFEST_DIR/restore-check.sh" ]]; then
+    write_restore_check
+    ok "project restore check created: $MANIFEST_DIR/restore-check.sh"
+  fi
+  if [[ ! -e "$MANIFEST_DIR/README.md" ]]; then
+    write_project_readme
+    ok "project backup README created: $MANIFEST_DIR/README.md"
+  fi
+}
+
+validate_project_support_files() {
+  [[ -f "$MANIFEST_DIR/restore-check.sh" && \
+    ! -L "$MANIFEST_DIR/restore-check.sh" && \
+    -x "$MANIFEST_DIR/restore-check.sh" ]] || \
+    fail "Missing executable restore check: $MANIFEST_DIR/restore-check.sh"
+  [[ -f "$MANIFEST_DIR/README.md" && \
+    ! -L "$MANIFEST_DIR/README.md" && \
+    -r "$MANIFEST_DIR/README.md" ]] || \
+    fail "Missing project backup README: $MANIFEST_DIR/README.md"
+}
+
+finish_existing_manifest() {
+  local requested_files_only="$1"
+
+  load_manifest
+  if [[ "$requested_files_only" == "1" && "$SOURCE_TYPE" != "files-only" ]]; then
+    fail "Existing manifest is not a files-only source"
+  fi
+  validate_runtime_inputs
+  ensure_project_support_files
+  validate_project_support_files
+  ok "project backup manifest already exists: $MANIFEST_DIR"
+}
+
+run_init() {
+  local candidate_project_root
+  local include_path
+  local path_lines=()
+  local requested_files_only="$FILES_ONLY"
+  local seen_paths=$'\n'
+
+  if [[ -n "$MANIFEST_DIR" && -d "$MANIFEST_DIR" && ! -L "$MANIFEST_DIR" ]]; then
+    finish_existing_manifest "$requested_files_only"
+    return
+  fi
+  if [[ -z "$MANIFEST_DIR" ]]; then
+    candidate_project_root="${PROJECT_ROOT:-$PWD}"
+    if [[ -d "$candidate_project_root" ]]; then
+      candidate_project_root="$(cd "$candidate_project_root" && pwd -P)"
+      MANIFEST_DIR="$candidate_project_root/.server-infra/backup"
+      if [[ -d "$MANIFEST_DIR" && ! -L "$MANIFEST_DIR" ]]; then
+        finish_existing_manifest "$requested_files_only"
+        return
+      fi
+    fi
+  fi
+
+  collect_init_values
+  if [[ -d "$MANIFEST_DIR" && ! -L "$MANIFEST_DIR" ]]; then
+    finish_existing_manifest "$requested_files_only"
+    return
+  fi
+  [[ ! -e "$MANIFEST_DIR" ]] || \
+    fail "Manifest destination already exists: $MANIFEST_DIR"
+  mkdir -p "$MANIFEST_DIR"
+  chmod 0755 "$MANIFEST_DIR"
+
+  path_lines=("${INCLUDE_PATHS[@]}")
+  if [[ "$SOURCE_TYPE" == "postgres-compose" ]]; then
+    path_lines+=("$STAGING_DIR")
+  fi
+  INCLUDE_PATHS=("${path_lines[@]}")
+  path_lines=()
+  for include_path in "${INCLUDE_PATHS[@]}"; do
+    validate_absolute_path "$include_path" "Included backup path"
+    if [[ "$seen_paths" != *$'\n'"${include_path%/}"$'\n'* ]]; then
+      path_lines+=("$include_path")
+      seen_paths+="${include_path%/}"$'\n'
+    fi
+  done
+
+  if [[ "$SOURCE_TYPE" == "files-only" ]]; then
+    write_manifest_file "$MANIFEST_DIR/source.conf" 0644 \
+      "SOURCE_VERSION=1" \
+      "SOURCE_NAME=$SOURCE_NAME" \
+      "SOURCE_TYPE=files-only" \
+      "PROJECT_ROOT=$PROJECT_ROOT"
+  else
+    write_manifest_file "$MANIFEST_DIR/source.conf" 0644 \
+      "SOURCE_VERSION=1" \
+      "SOURCE_NAME=$SOURCE_NAME" \
+      "SOURCE_TYPE=postgres-compose" \
+      "PROJECT_ROOT=$PROJECT_ROOT" \
+      "COMPOSE_FILE=$COMPOSE_FILE" \
+      "COMPOSE_SERVICE=$COMPOSE_SERVICE" \
+      "COMPOSE_ENV_FILE=$COMPOSE_ENV_FILE" \
+      "DUMP_TIME=$DUMP_TIME" \
+      "DUMP_MAX_AGE_SECONDS=$DUMP_MAX_AGE_SECONDS" \
+      "STAGING_DIR=$STAGING_DIR"
+  fi
+  write_manifest_file "$MANIFEST_DIR/paths" 0644 "${path_lines[@]}"
+  if [[ "$SOURCE_TYPE" == "files-only" ]]; then
+    write_manifest_file "$MANIFEST_DIR/excludes" 0644 \
+      "# Add restic exclude patterns here."
+    write_manifest_file "$MANIFEST_DIR/freshness" 0644 \
+      "# No generated freshness markers for files-only sources."
+  else
+    write_manifest_file "$MANIFEST_DIR/excludes" 0644 \
+      "*.partial.*" \
+      ".dump.lock"
+    write_manifest_file "$MANIFEST_DIR/freshness" 0644 \
+      "$DUMP_MAX_AGE_SECONDS $STAGING_DIR/postgres.complete"
+  fi
+
+  load_manifest
+  validate_runtime_inputs
+  ensure_project_support_files
+  validate_project_support_files
+  ok "project backup manifest created: $MANIFEST_DIR"
+  log "Review and commit the manifest, then install it on the server"
+}
+
+release_operation_lock() {
+  if [[ -n "$OPERATION_LOCK" && -d "$OPERATION_LOCK" ]]; then
+    rmdir "$OPERATION_LOCK" 2>/dev/null || \
+      warn "Unable to release operation lock"
+  fi
+  OPERATION_LOCK=""
+
+  if [[ -n "$INSTALL_JOB_LOCK" && -d "$INSTALL_JOB_LOCK" ]]; then
+    rmdir "$INSTALL_JOB_LOCK" 2>/dev/null || \
+      warn "Unable to release backup job lock"
+  fi
+  INSTALL_JOB_LOCK=""
+}
+
+acquire_operation_lock() {
+  [[ -d "$LOCK_ROOT" && ! -L "$LOCK_ROOT" ]] || \
+    fail "Runtime lock root not found: $LOCK_ROOT"
+  INSTALL_JOB_LOCK="$LOCK_ROOT/backup.lock"
+  mkdir "$INSTALL_JOB_LOCK" 2>/dev/null || \
+    fail "A backup or restore operation is running"
+  OPERATION_LOCK="$LOCK_ROOT/operation.lock"
+  if ! mkdir "$OPERATION_LOCK" 2>/dev/null; then
+    rmdir "$INSTALL_JOB_LOCK" 2>/dev/null || true
+    INSTALL_JOB_LOCK=""
+    fail "Another server-infra install or deployment is running"
+  fi
+  trap release_operation_lock EXIT
+}
+
+install_file_atomic() {
+  local source_file="$1"
+  local destination_file="$2"
+  local mode="$3"
+  local destination_dir="${destination_file%/*}"
+  local temporary_file
+
+  temporary_file="$(mktemp "$destination_dir/.${destination_file##*/}.tmp.XXXXXX")"
+  if ! install -o root -g root -m "$mode" "$source_file" "$temporary_file"; then
+    rm -f -- "$temporary_file"
+    fail "Unable to prepare $destination_file"
+  fi
+  if ! mv -f -- "$temporary_file" "$destination_file"; then
+    rm -f -- "$temporary_file"
+    fail "Unable to install $destination_file"
+  fi
+}
+
+write_unit_atomic() {
+  local destination_file="$1"
+  shift
+  local destination_dir="${destination_file%/*}"
+  local temporary_file
+
+  temporary_file="$(mktemp "$destination_dir/.${destination_file##*/}.tmp.XXXXXX")"
+  printf '%s\n' "$@" > "$temporary_file"
+  chmod 0644 "$temporary_file"
+  chown root:root "$temporary_file"
+  mv -f -- "$temporary_file" "$destination_file"
+}
+
+run_install() {
+  local active_sources_root
+  local active_source_dir
+  local active_source_env
+  local service_name
+  local timer_name
+  local installed_source_type=""
+
+  load_manifest
+  validate_runtime_inputs
+  validate_project_support_files
+  validate_absolute_path "$CONFIG_ROOT" "Configuration root"
+  active_sources_root="$CONFIG_ROOT/backup/sources.d"
+  active_source_dir="$active_sources_root/$SOURCE_NAME"
+  active_source_env="$active_source_dir/source.conf"
+  service_name="server-infra-backup-project-$SOURCE_NAME.service"
+  timer_name="server-infra-backup-project-$SOURCE_NAME.timer"
+
+  if [[ -e "$active_source_dir" || -L "$active_source_dir" ]]; then
+    [[ -d "$active_source_dir" && ! -L "$active_source_dir" ]] || \
+      fail "Invalid installed source: $active_source_dir"
+    [[ -f "$active_source_env" && ! -L "$active_source_env" ]] || \
+      fail "Installed source manifest not found: $active_source_env"
+    installed_source_type="$(
+      read_required_value "$active_source_env" "SOURCE_TYPE"
+    )"
+    [[ "$installed_source_type" == "$SOURCE_TYPE" ]] || \
+      fail "Installed source type differs; remove the source before changing type"
+  fi
+
+  log "Source: $SOURCE_NAME"
+  log "Source type: $SOURCE_TYPE"
+  log "Active configuration: $active_source_dir"
+  if [[ "$SOURCE_TYPE" == "postgres-compose" ]]; then
+    require_command docker
+    log "Staging directory: $STAGING_DIR"
+    log "Timer: $timer_name at $DUMP_TIME"
+  else
+    log "No database producer or project timer will be installed"
+  fi
+  if [[ "$CHECK_ONLY" == "1" ]]; then
+    ok "project install plan is valid; no changes made"
+    return
+  fi
+
+  [[ "$(uname -s)" == "Linux" ]] || fail "Project install requires Linux"
+  [[ "$EUID" == "0" ]] || fail "Project install requires root privileges"
+  require_command install
+  require_command mktemp
+  require_command mv
+  require_command systemctl
+  [[ -d "$CONFIG_ROOT/backup" && ! -L "$CONFIG_ROOT/backup" ]] || \
+    fail "Backup module configuration not found: $CONFIG_ROOT/backup"
+  [[ -d "$SYSTEMD_UNIT_ROOT" && ! -L "$SYSTEMD_UNIT_ROOT" ]] || \
+    fail "Systemd unit root not found: $SYSTEMD_UNIT_ROOT"
+  if [[ "$SOURCE_TYPE" == "postgres-compose" ]]; then
+    [[ -x "$HELPER_EXECUTABLE" ]] || \
+      fail "Installed backup project helper not found: $HELPER_EXECUTABLE"
+  fi
+
+  acquire_operation_lock
+  install -d -o root -g root -m 0750 "$active_sources_root"
+  install -d -o root -g root -m 0750 "$active_source_dir"
+  if [[ "$SOURCE_TYPE" == "postgres-compose" ]]; then
+    install -d -o root -g root -m 0750 "$STAGING_ROOT"
+    install -d -o root -g root -m 0750 "$STAGING_DIR"
+  fi
+
+  install_file_atomic "$MANIFEST_DIR/source.conf" "$active_source_env" 0640
+  install_file_atomic "$MANIFEST_DIR/paths" "$active_source_dir/paths" 0640
+  install_file_atomic "$MANIFEST_DIR/excludes" "$active_source_dir/excludes" 0640
+  install_file_atomic "$MANIFEST_DIR/freshness" "$active_source_dir/freshness" 0640
+
+  if [[ "$SOURCE_TYPE" == "files-only" ]]; then
+    systemctl disable --now "$timer_name" >/dev/null 2>&1 || true
+    systemctl stop "$service_name" >/dev/null 2>&1 || true
+    rm -f -- \
+      "$SYSTEMD_UNIT_ROOT/$timer_name" \
+      "$SYSTEMD_UNIT_ROOT/$service_name"
+    systemctl daemon-reload
+    ok "files-only project backup source installed: $SOURCE_NAME"
+    return
+  fi
+
+  write_unit_atomic "$SYSTEMD_UNIT_ROOT/$service_name" \
+    "[Unit]" \
+    "Description=Create PostgreSQL dump for backup source $SOURCE_NAME" \
+    "Requires=docker.service" \
+    "After=docker.service" \
+    "ConditionPathExists=$active_source_env" \
+    "" \
+    "[Service]" \
+    "Type=oneshot" \
+    "ExecStart=$HELPER_EXECUTABLE dump --source-config $active_source_env" \
+    "UMask=0077" \
+    "Nice=10" \
+    "IOSchedulingClass=best-effort" \
+    "IOSchedulingPriority=7" \
+    "PrivateTmp=true" \
+    "NoNewPrivileges=true" \
+    "TimeoutStartSec=infinity"
+
+  write_unit_atomic "$SYSTEMD_UNIT_ROOT/$timer_name" \
+    "[Unit]" \
+    "Description=Create PostgreSQL dump for backup source $SOURCE_NAME daily" \
+    "" \
+    "[Timer]" \
+    "OnCalendar=*-*-* $DUMP_TIME:00" \
+    "Persistent=true" \
+    "AccuracySec=1min" \
+    "Unit=$service_name" \
+    "" \
+    "[Install]" \
+    "WantedBy=timers.target"
+
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze verify \
+      "$SYSTEMD_UNIT_ROOT/$service_name" \
+      "$SYSTEMD_UNIT_ROOT/$timer_name"
+  fi
+  systemctl daemon-reload
+  if [[ "$ENABLE_TIMER" == "1" ]]; then
+    systemctl enable --now "$timer_name"
+  else
+    warn "Timer installed but not enabled: $timer_name"
+  fi
+  ok "project backup source installed: $SOURCE_NAME"
+}
+
+cleanup_dump() {
+  [[ -z "$DUMP_TMP" ]] || rm -f -- "$DUMP_TMP"
+  [[ -z "$MARKER_TMP" ]] || rm -f -- "$MARKER_TMP"
+  if [[ -n "$DUMP_LOCK" && -d "$DUMP_LOCK" ]]; then
+    rmdir "$DUMP_LOCK" 2>/dev/null || true
+  fi
+}
+
+run_dump() {
+  local source_config="$1"
+  local dump_file
+  local marker_file
+  local compose_args=()
+
+  MANIFEST_DIR="${source_config%/*}"
+  [[ "${source_config##*/}" == "source.conf" ]] || \
+    fail "--source-config must name source.conf"
+  load_manifest
+  [[ "$SOURCE_TYPE" == "postgres-compose" ]] || \
+    fail "dump requires SOURCE_TYPE=postgres-compose"
+  validate_runtime_inputs
+  require_command docker
+  require_command mktemp
+
+  [[ -d "$LOCK_ROOT" && ! -L "$LOCK_ROOT" ]] || \
+    fail "Runtime lock root not found: $LOCK_ROOT"
+  DUMP_LOCK="$LOCK_ROOT/backup-project-$SOURCE_NAME.lock"
+  mkdir "$DUMP_LOCK" 2>/dev/null || fail "A project dump is already running"
+
+  mkdir -p "$STAGING_DIR"
+  chmod 0750 "$STAGING_DIR"
+  dump_file="$STAGING_DIR/postgres.dump"
+  marker_file="$STAGING_DIR/postgres.complete"
+  DUMP_TMP="$(mktemp "$STAGING_DIR/postgres.dump.partial.XXXXXX")"
+  MARKER_TMP="$(mktemp "$STAGING_DIR/postgres.complete.partial.XXXXXX")"
+  trap cleanup_dump EXIT
+
+  rm -f -- "$marker_file"
+  compose_args=(
+    compose
+    --project-directory "$PROJECT_ROOT"
+  )
+  if [[ -n "$COMPOSE_ENV_FILE" ]]; then
+    compose_args+=(--env-file "$COMPOSE_ENV_FILE")
+  fi
+  compose_args+=(-f "$COMPOSE_FILE" exec -T "$COMPOSE_SERVICE")
+
+  log "Creating PostgreSQL dump for $SOURCE_NAME"
+  docker "${compose_args[@]}" sh -eu -c '
+    database_user="${POSTGRES_USER:-postgres}"
+    database_name="${POSTGRES_DB:-$database_user}"
+    exec pg_dump \
+      --format=custom \
+      --no-owner \
+      --no-acl \
+      --username="$database_user" \
+      --dbname="$database_name"
+  ' > "$DUMP_TMP"
+  [[ -s "$DUMP_TMP" ]] || fail "PostgreSQL dump is empty"
+
+  docker "${compose_args[@]}" pg_restore --list < "$DUMP_TMP" >/dev/null
+  chmod 0600 "$DUMP_TMP"
+  mv -f -- "$DUMP_TMP" "$dump_file"
+  DUMP_TMP=""
+
+  printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MARKER_TMP"
+  chmod 0600 "$MARKER_TMP"
+  mv -f -- "$MARKER_TMP" "$marker_file"
+  MARKER_TMP=""
+  ok "PostgreSQL dump ready: $dump_file"
+}
+
+run_list() {
+  local sources_root="$CONFIG_ROOT/backup/sources.d"
+  local source_dirs=()
+  local source_dir
+  local source_env
+  local source_type
+  local schedule
+  local listed=0
+
+  validate_absolute_path "$CONFIG_ROOT" "Configuration root"
+  [[ -e "$sources_root" ]] || {
+    log "No project backup sources installed"
+    return
+  }
+  [[ -d "$sources_root" && ! -L "$sources_root" ]] || \
+    fail "Invalid backup sources root: $sources_root"
+  shopt -s nullglob
+  source_dirs=("$sources_root"/*)
+  shopt -u nullglob
+  for source_dir in "${source_dirs[@]}"; do
+    source_env="$source_dir/source.conf"
+    [[ -f "$source_env" && ! -L "$source_env" ]] || \
+      fail "Invalid installed source: $source_dir"
+    source_type="$(read_required_value "$source_env" "SOURCE_TYPE")"
+    schedule="$(read_optional_value "$source_env" "DUMP_TIME")"
+    [[ -n "$schedule" ]] || schedule="-"
+    printf '%s\t%s\t%s\n' \
+      "$(read_required_value "$source_env" "SOURCE_NAME")" \
+      "$source_type" \
+      "$schedule"
+    listed=$((listed + 1))
+  done
+  ((listed > 0)) || log "No project backup sources installed"
+}
+
+run_remove() {
+  local sources_root
+  local active_source_dir
+  local active_source_env
+  local removed_sources_root
+  local archived_source_dir
+  local service_name
+  local timer_name
+  local source_name_in_config=""
+  local staging_dir=""
+  local timestamp
+
+  [[ -n "$SOURCE_NAME" ]] || fail "remove requires --name"
+  validate_source_name "$SOURCE_NAME"
+  validate_absolute_path "$CONFIG_ROOT" "Configuration root"
+
+  sources_root="$CONFIG_ROOT/backup/sources.d"
+  active_source_dir="$sources_root/$SOURCE_NAME"
+  active_source_env="$active_source_dir/source.conf"
+  removed_sources_root="$CONFIG_ROOT/backup/removed-sources"
+  service_name="server-infra-backup-project-$SOURCE_NAME.service"
+  timer_name="server-infra-backup-project-$SOURCE_NAME.timer"
+
+  if [[ -e "$sources_root" || -L "$sources_root" ]]; then
+    [[ -d "$sources_root" && ! -L "$sources_root" ]] || \
+      fail "Invalid backup sources root: $sources_root"
+  fi
+  if [[ -e "$removed_sources_root" || -L "$removed_sources_root" ]]; then
+    [[ -d "$removed_sources_root" && ! -L "$removed_sources_root" ]] || \
+      fail "Invalid removed sources root: $removed_sources_root"
+  fi
+  if [[ -e "$active_source_dir" || -L "$active_source_dir" ]]; then
+    [[ -d "$active_source_dir" && ! -L "$active_source_dir" ]] || \
+      fail "Invalid installed source: $active_source_dir"
+    [[ -f "$active_source_env" && ! -L "$active_source_env" ]] || \
+      fail "Installed source manifest not found: $active_source_env"
+    source_name_in_config="$(
+      read_required_value "$active_source_env" "SOURCE_NAME"
+    )"
+    [[ "$source_name_in_config" == "$SOURCE_NAME" ]] || \
+      fail "Installed source name does not match directory: $active_source_dir"
+    staging_dir="$(read_optional_value "$active_source_env" "STAGING_DIR")"
+    if [[ -n "$staging_dir" ]]; then
+      validate_absolute_path "$staging_dir" "Installed source staging directory"
+    fi
+  fi
+
+  log "Source: $SOURCE_NAME"
+  log "Active configuration: $active_source_dir"
+  log "Timer to remove: $timer_name"
+  log "Service to remove: $service_name"
+  log "Staging data will be kept"
+  if [[ "$CHECK_ONLY" == "1" ]]; then
+    if [[ -d "$active_source_dir" ]]; then
+      log "Active configuration will be archived under $removed_sources_root"
+    else
+      log "No active source configuration is installed"
+    fi
+    ok "project removal plan is valid; no changes made"
+    return
+  fi
+
+  [[ "$(uname -s)" == "Linux" ]] || fail "Project removal requires Linux"
+  [[ "$EUID" == "0" ]] || fail "Project removal requires root privileges"
+  require_command date
+  require_command install
+  require_command mv
+  require_command rm
+  require_command systemctl
+  [[ -d "$CONFIG_ROOT/backup" && ! -L "$CONFIG_ROOT/backup" ]] || \
+    fail "Backup module configuration not found: $CONFIG_ROOT/backup"
+  [[ -d "$SYSTEMD_UNIT_ROOT" && ! -L "$SYSTEMD_UNIT_ROOT" ]] || \
+    fail "Systemd unit root not found: $SYSTEMD_UNIT_ROOT"
+
+  acquire_operation_lock
+
+  if [[ -e "$SYSTEMD_UNIT_ROOT/$timer_name" || \
+    -e "$SYSTEMD_UNIT_ROOT/$service_name" ]]; then
+    systemctl disable --now "$timer_name" >/dev/null 2>&1 || \
+      warn "Timer was not enabled or could not be stopped: $timer_name"
+    systemctl stop "$service_name" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -d "$active_source_dir" ]]; then
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    archived_source_dir="$removed_sources_root/$SOURCE_NAME-$timestamp-$$"
+    [[ ! -e "$archived_source_dir" ]] || \
+      fail "Removal archive already exists: $archived_source_dir"
+    install -d -o root -g root -m 0750 "$removed_sources_root"
+    mv -- "$active_source_dir" "$archived_source_dir"
+    ok "active source configuration archived: $archived_source_dir"
+  else
+    warn "Project backup source is not installed: $SOURCE_NAME"
+  fi
+
+  rm -f -- \
+    "$SYSTEMD_UNIT_ROOT/$timer_name" \
+    "$SYSTEMD_UNIT_ROOT/$service_name"
+  systemctl daemon-reload
+  systemctl reset-failed "$service_name" >/dev/null 2>&1 || true
+  ok "project backup source removed: $SOURCE_NAME"
+  if [[ -n "$staging_dir" ]]; then
+    log "Kept staging directory: $staging_dir"
+  else
+    log "Existing staging data was not changed"
+  fi
+}
+
+parse_arguments() {
+  local source_config=""
+
+  while (($# > 0)); do
+    case "$1" in
+      --project-root)
+        (($# >= 2)) || fail "Missing value for --project-root"
+        PROJECT_ROOT="$2"
+        shift 2
+        ;;
+      --name)
+        (($# >= 2)) || fail "Missing value for --name"
+        SOURCE_NAME="$2"
+        shift 2
+        ;;
+      --include)
+        (($# >= 2)) || fail "Missing value for --include"
+        INCLUDE_PATHS+=("$2")
+        shift 2
+        ;;
+      --compose-file)
+        (($# >= 2)) || fail "Missing value for --compose-file"
+        COMPOSE_FILE="$2"
+        shift 2
+        ;;
+      --compose-service)
+        (($# >= 2)) || fail "Missing value for --compose-service"
+        COMPOSE_SERVICE="$2"
+        shift 2
+        ;;
+      --compose-env-file)
+        (($# >= 2)) || fail "Missing value for --compose-env-file"
+        COMPOSE_ENV_FILE="$2"
+        shift 2
+        ;;
+      --dump-time)
+        (($# >= 2)) || fail "Missing value for --dump-time"
+        DUMP_TIME="$2"
+        shift 2
+        ;;
+      --max-age-seconds)
+        (($# >= 2)) || fail "Missing value for --max-age-seconds"
+        DUMP_MAX_AGE_SECONDS="$2"
+        shift 2
+        ;;
+      --files-only)
+        FILES_ONLY=1
+        shift
+        ;;
+      --staging-root)
+        (($# >= 2)) || fail "Missing value for --staging-root"
+        STAGING_ROOT="$2"
+        shift 2
+        ;;
+      --manifest)
+        (($# >= 2)) || fail "Missing value for --manifest"
+        MANIFEST_DIR="$2"
+        shift 2
+        ;;
+      --source-config)
+        (($# >= 2)) || fail "Missing value for --source-config"
+        source_config="$2"
+        shift 2
+        ;;
+      --config-root)
+        (($# >= 2)) || fail "Missing value for --config-root"
+        CONFIG_ROOT="$2"
+        shift 2
+        ;;
+      --systemd-unit-root)
+        (($# >= 2)) || fail "Missing value for --systemd-unit-root"
+        SYSTEMD_UNIT_ROOT="$2"
+        shift 2
+        ;;
+      --lock-root)
+        (($# >= 2)) || fail "Missing value for --lock-root"
+        LOCK_ROOT="$2"
+        shift 2
+        ;;
+      --helper-executable)
+        (($# >= 2)) || fail "Missing value for --helper-executable"
+        HELPER_EXECUTABLE="$2"
+        shift 2
+        ;;
+      --check)
+        CHECK_ONLY=1
+        shift
+        ;;
+      --no-enable)
+        ENABLE_TIMER=0
+        shift
+        ;;
+      --non-interactive)
+        NON_INTERACTIVE=1
+        shift
+        ;;
+      --help | -h)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "Unknown argument: $1"
+        ;;
+    esac
+  done
+
+  if [[ "$OPERATION" == "dump" ]]; then
+    [[ -n "$source_config" ]] || fail "dump requires --source-config"
+    DUMP_SOURCE_CONFIG="$source_config"
+  elif [[ -n "$source_config" ]]; then
+    fail "--source-config is supported only by dump"
+  fi
+  if [[ "$FILES_ONLY" == "1" && "$OPERATION" != "init" ]]; then
+    fail "--files-only is supported only by init"
+  fi
+}
+
+use_default_manifest() {
+  [[ -n "$MANIFEST_DIR" ]] || \
+    MANIFEST_DIR="$(pwd -P)/.server-infra/backup"
+}
+
+main() {
+  case "$OPERATION" in
+    --help | -h)
+      usage
+      ;;
+    init)
+      parse_arguments "$@"
+      run_init
+      ;;
+    validate)
+      parse_arguments "$@"
+      use_default_manifest
+      load_manifest
+      validate_runtime_inputs
+      validate_project_support_files
+      ok "project backup manifest: $SOURCE_NAME"
+      ;;
+    install)
+      parse_arguments "$@"
+      use_default_manifest
+      run_install
+      ;;
+    list)
+      parse_arguments "$@"
+      run_list
+      ;;
+    remove)
+      parse_arguments "$@"
+      run_remove
+      ;;
+    dump)
+      parse_arguments "$@"
+      run_dump "$DUMP_SOURCE_CONFIG"
+      ;;
+    "")
+      usage
+      exit 1
+      ;;
+    *)
+      fail "Unknown operation: $OPERATION"
+      ;;
+  esac
+}
+
+main "$@"

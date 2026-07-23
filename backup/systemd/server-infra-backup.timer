@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Server Infra backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+AccuracySec=1min
+Unit=server-infra-backup.service
+
+[Install]
+WantedBy=timers.target

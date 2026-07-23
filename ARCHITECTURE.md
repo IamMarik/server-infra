@@ -15,6 +15,7 @@ This repository owns:
 
 - reverse proxy infrastructure;
 - server monitoring and operational tools;
+- reusable server backup and restore tooling;
 - server bootstrap and health scripts;
 - reusable infrastructure module definitions;
 - environment-level infrastructure configuration.
@@ -39,8 +40,23 @@ Target:
 /etc/server-infra/
 ├── server.env
 ├── modules.env
-├── proxy/runtime.env
-└── monitoring/runtime.env
+├── proxy/
+│   └── runtime.env
+├── monitoring/
+│   └── runtime.env
+└── backup/
+    ├── runtime.env
+    ├── paths
+    ├── excludes
+    ├── freshness
+    ├── sources.d/
+    │   └── <project>/
+    │       ├── source.conf
+    │       ├── paths
+    │       ├── excludes
+    │       └── freshness
+    ├── removed-sources/
+    └── restic-password
 ```
 
 The host decides which modules are enabled and provides concrete runtime
@@ -57,8 +73,67 @@ Examples:
 
 - `proxy` - public HTTP/HTTPS routing;
 - `monitoring` - uptime checks and container log viewing.
+- `backup` - encrypted off-site snapshots and restore operations.
 
 A module must not know which application is running on the server.
+
+The backup module may consume externally declared project sources without
+hardcoding application names. A project source is installed under
+`/etc/server-infra/backup/sources.d/<project>` and contributes data paths,
+exclude rules, and freshness markers to the server's data snapshot.
+
+The optional PostgreSQL Compose producer is a constrained generic adapter. It
+does not accept arbitrary shell commands, source env files, or store database
+passwords. Concrete project paths and service names remain host/application
+configuration.
+
+A project source may instead use `SOURCE_TYPE=files-only`. That source adds
+reviewed paths and exclusions without a database producer, staging directory,
+or project-specific systemd timer.
+
+Modules declare a driver:
+
+- `compose` for Docker Compose services;
+- `host` for native host capabilities such as systemd jobs.
+
+The deployment engine dispatches by driver, not by module name. A new module
+must not require a module-specific deployment branch.
+
+Host module manifests declare:
+
+```text
+HOST_EXECUTABLES="bin/<name> ..."
+HOST_PUBLIC_EXECUTABLES="bin/<name> ..."
+HOST_REQUIRED_COMMANDS="<command> ..."
+HOST_PREFLIGHT_EXECUTABLE="bin/<name>"
+HOST_STATE_DIRS="<name> ..."
+HOST_CACHE_DIRS="<name> ..."
+SYSTEMD_UNITS="systemd/<name>.<type> ..."
+SYSTEMD_ENABLE_UNITS="<name>.<type> ..."
+```
+
+`HOST_EXECUTABLES` may be empty. Declared executables are installed under
+`/usr/local/libexec/server-infra/<module>/`.
+
+`HOST_PUBLIC_EXECUTABLES` may be empty and must be a subset of
+`HOST_EXECUTABLES`. Declared public commands are also installed under
+`/usr/local/bin/`; internal helpers remain available only through `libexec`.
+
+`HOST_REQUIRED_COMMANDS` lists host dependencies checked before apply.
+`HOST_PREFLIGHT_EXECUTABLE` may be empty or name one declared executable. A
+preflight receives the active configuration root and must validate without
+changing host or external state.
+
+`HOST_STATE_DIRS` and `HOST_CACHE_DIRS` declare non-nested directories below
+`/var/lib/server-infra/<module>/` and `/var/cache/server-infra/<module>/`.
+
+`SYSTEMD_UNITS` must contain at least one unit. Units are installed under
+`/etc/systemd/system/`. `SYSTEMD_ENABLE_UNITS` may be empty, but every enabled
+unit must also be present in `SYSTEMD_UNITS`.
+
+Host artifact declarations are repository-relative, contain no nested paths
+beneath `bin/` or `systemd/`, and must not reference symlinks. Template units
+are not supported by the initial host driver.
 
 ### Script
 
@@ -73,14 +148,24 @@ Host configuration
   ↓
 Enabled modules
   ↓
-Module docker-compose.yml + host runtime config
+Module manifest + host runtime config
   ↓
-Docker Compose
-  ↓
-Running infrastructure services
+Module driver
+  ├── compose → Docker Compose services
+  └── host    → Native host services and timers
 ```
 
-The deployment engine should deploy modules generically. It should not contain module-specific branches unless there is a repository-level architectural decision to do so.
+The deployment engine should deploy modules generically. Driver-specific
+behavior is allowed; module-specific behavior requires a repository-level
+architectural decision.
+
+Host-module executables must be installed to a stable host path. Native
+services must not execute code directly from a mutable Git checkout.
+
+External deployment performs a complete preflight before changing host
+artifacts. Applying a host module requires Linux, root, and systemd. Check mode
+validates the repository and host configuration contracts without requiring a
+running systemd instance.
 
 ## Configuration model
 
@@ -116,3 +201,6 @@ be added there.
 7. Prefer explicit configuration over implicit behavior.
 8. Prefer simple shell and Docker Compose before heavier tools.
 9. Ask before changing repository structure.
+
+The approved `backup/` top-level module and its host-driver requirements are
+defined in `rfc/0001-backup-stack.md`.
