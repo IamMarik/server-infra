@@ -189,6 +189,27 @@ assert_contains \
   "$RESTIC_LOG" \
   "restore latest --host test-server --tag server-infra-config --target $MANUAL_TARGET"
 
+FILTERED_TARGET="$TEST_ROOT/filtered-restore"
+"$RUNNER" \
+  --config-root "$CONFIG_ROOT" \
+  restore \
+  --kind data \
+  --snapshot abcdef12 \
+  --include "$TEST_ROOT/data/postgres.dump" \
+  --target "$FILTERED_TARGET"
+assert_contains \
+  "$RESTIC_LOG" \
+  "restore abcdef12 --host test-server --tag server-infra-data --target $FILTERED_TARGET --include $TEST_ROOT/data/postgres.dump"
+
+if "$RUNNER" \
+  --config-root "$CONFIG_ROOT" \
+  restore \
+  --kind data \
+  --include "$TEST_ROOT/outside/postgres.dump" \
+  --target "$TEST_ROOT/outside-restore"; then
+  fail_test "Restore unexpectedly accepted an include outside configured data"
+fi
+
 NONEMPTY_TARGET="$TEST_ROOT/nonempty"
 mkdir "$NONEMPTY_TARGET"
 : > "$NONEMPTY_TARGET/existing"

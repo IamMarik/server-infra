@@ -168,10 +168,11 @@ The configuration reader must:
 The legacy mode remains available only for the rollback window.
 
 The repository provides `scripts/validate-config.sh` for read-only
-configuration validation. `scripts/deploy.sh --config-root ... --check` adds
-Compose resolution without runtime changes. External deployment is enabled
-only by an explicit `--config-root ... --apply`; the positional environment
-mode remains the rollback path.
+configuration validation. After cutover, `scripts/deploy.sh --check` adds
+Compose resolution without runtime changes and `scripts/deploy.sh --apply`
+enables external deployment. Both default to `/etc/server-infra`;
+`--config-root` remains available for tests and non-standard host layouts.
+The positional environment mode remains the rollback path.
 
 External apply also requires the expected Compose project to exist. An
 explicit `--allow-new-project` is required for an intentional first deployment

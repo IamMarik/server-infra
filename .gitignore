@@ -21,6 +21,9 @@
 **/id_ed25519
 **/credentials
 **/credentials.json
+**/break-glass.txt
+**/break-glass.txt.*
+/recovery/session.env
 
 # Safe configuration contracts remain trackable
 !**/*.example

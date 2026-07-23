@@ -1,0 +1,30 @@
+SERVER INFRA BREAK-GLASS RECORD
+
+Sensitive: yes
+Storage: password manager secure document and, optionally, encrypted offline media
+Server copy: do not keep a permanent copy on the backed-up server
+
+BREAK_GLASS_VERSION: 1
+GENERATED_AT: YYYY-MM-DDTHH:MM:SSZ
+SERVER_INFRA_INSTANCE: replace-me
+SERVER_INFRA_REPOSITORY_URL: https://github.example.invalid/owner/server-infra.git
+SERVER_INFRA_REPOSITORY_REF: replace-me
+
+RESTIC_REPOSITORY: s3:https://s3.example.invalid/bucket/repository-prefix
+RESTIC_PASSWORD: replace-me
+AWS_ACCESS_KEY_ID: replace-me
+AWS_SECRET_ACCESS_KEY: replace-me
+AWS_DEFAULT_REGION: example-region
+
+GIT ACCESS
+
+Git credentials and SSH private keys do not belong in this record.
+Recovery uses a newly authorized SSH key or the operator's Git provider account.
+
+LAST VERIFIED
+
+Date: YYYY-MM-DD
+Operator: replace-me
+Config restore snapshot: replace-me
+Data restore snapshot: replace-me
+Notes: replace-me

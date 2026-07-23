@@ -14,6 +14,10 @@ BIN_ROOT="$TEST_ROOT/bin"
 DOCKER_LOG="$TEST_ROOT/docker.log"
 RESTIC_LOG="$TEST_ROOT/restic.log"
 CURL_LOG="$TEST_ROOT/curl.log"
+SYSTEMCTL_LOG="$TEST_ROOT/systemctl.log"
+JOURNALCTL_LOG="$TEST_ROOT/journalctl.log"
+BACKUP_RESTORE_LOG="$TEST_ROOT/backup-restore.log"
+PROJECT_RESTORE_ROOT="$TEST_ROOT/project-restores"
 CONFIG_ROOT="$TEST_ROOT/etc/server-infra"
 FILES_PROJECT_ROOT="$TEST_ROOT/files-app"
 FILES_MANIFEST_DIR="$FILES_PROJECT_ROOT/.server-infra/backup"
@@ -44,6 +48,14 @@ mkdir -p \
   "$BIN_ROOT"
 : > "$PROJECT_ROOT/docker-compose.yml"
 : > "$PROJECT_ROOT/runtime.env"
+git -C "$PROJECT_ROOT" init --quiet
+git -C "$PROJECT_ROOT" config user.name "Backup Test"
+git -C "$PROJECT_ROOT" config user.email "backup-test@example.test"
+git -C "$PROJECT_ROOT" add docker-compose.yml runtime.env
+git -C "$PROJECT_ROOT" commit --quiet -m "test project"
+git -C "$PROJECT_ROOT" remote add origin \
+  "git@github.com:example/my-app.git"
+PROJECT_DEPLOY_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
 
 cat > "$BIN_ROOT/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -52,10 +64,29 @@ set -Eeuo pipefail
 printf '%s ' "$@" >> "$FAKE_DOCKER_LOG"
 printf '\n' >> "$FAKE_DOCKER_LOG"
 
+all_arguments="$*"
+if [[ "$all_arguments" == *"SERVER_INFRA_DB_USER="* ]]; then
+  printf 'SERVER_INFRA_DB_USER=test-user\n'
+  printf 'SERVER_INFRA_DB_NAME=test_db\n'
+  exit 0
+fi
+if [[ "$all_arguments" == *"SELECT 1 FROM pg_database"* ]]; then
+  if [[ "${FAKE_TARGET_DB_EXISTS:-0}" == "1" ]]; then
+    printf '1\n'
+  fi
+  exit 0
+fi
+if [[ "$all_arguments" == *"mktemp"* ]]; then
+  printf '/tmp/server-infra-restore-my-app.A1b2C3\n'
+  exit 0
+fi
 for argument in "$@"; do
   if [[ "$argument" == "pg_restore" ]]; then
-    cat >/dev/null
     [[ "${FAKE_DOCKER_FAIL_RESTORE:-0}" != "1" ]] || exit 44
+    if [[ "${FAKE_DOCKER_FAIL_IMPORT:-0}" == "1" && \
+      "$all_arguments" == *"--dbname"* ]]; then
+      exit 45
+    fi
     exit 0
   fi
 done
@@ -76,13 +107,60 @@ set -Eeuo pipefail
 printf '%s ' "$@" >> "$FAKE_CURL_LOG"
 printf '\n' >> "$FAKE_CURL_LOG"
 EOF
-chmod 0755 "$BIN_ROOT/docker" "$BIN_ROOT/restic" "$BIN_ROOT/curl"
+
+cat > "$BIN_ROOT/systemctl" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s ' "$@" >> "$FAKE_SYSTEMCTL_LOG"
+printf '\n' >> "$FAKE_SYSTEMCTL_LOG"
+EOF
+
+cat > "$BIN_ROOT/journalctl" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s ' "$@" >> "$FAKE_JOURNALCTL_LOG"
+printf '\n' >> "$FAKE_JOURNALCTL_LOG"
+EOF
+
+cat > "$BIN_ROOT/server-infra-backup-runner" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf '%s ' "$@" >> "$FAKE_BACKUP_RESTORE_LOG"
+printf '\n' >> "$FAKE_BACKUP_RESTORE_LOG"
+
+target=""
+while (($# > 0)); do
+  if [[ "$1" == "--target" ]]; then
+    target="$2"
+    break
+  fi
+  shift
+done
+[[ -n "$target" ]]
+mkdir -p "$target$FAKE_PROJECT_STAGING_DIR"
+printf 'fake-restored-postgresql-custom-archive\n' \
+  > "$target$FAKE_PROJECT_STAGING_DIR/postgres.dump"
+EOF
+chmod 0755 \
+  "$BIN_ROOT/docker" \
+  "$BIN_ROOT/restic" \
+  "$BIN_ROOT/curl" \
+  "$BIN_ROOT/systemctl" \
+  "$BIN_ROOT/journalctl" \
+  "$BIN_ROOT/server-infra-backup-runner"
 
 export PATH="$BIN_ROOT:$PATH"
 export FAKE_DOCKER_LOG="$DOCKER_LOG"
 export FAKE_RESTIC_LOG="$RESTIC_LOG"
 export FAKE_CURL_LOG="$CURL_LOG"
+export FAKE_SYSTEMCTL_LOG="$SYSTEMCTL_LOG"
+export FAKE_JOURNALCTL_LOG="$JOURNALCTL_LOG"
+export FAKE_BACKUP_RESTORE_LOG="$BACKUP_RESTORE_LOG"
+export FAKE_PROJECT_STAGING_DIR="$STAGING_ROOT/my-app"
 export SERVER_INFRA_BACKUP_LOCK_ROOT="$LOCK_ROOT"
+export SERVER_INFRA_BACKUP_EXECUTABLE="$BIN_ROOT/server-infra-backup-runner"
+export SERVER_INFRA_BACKUP_PROJECT_RESTORE_ROOT="$PROJECT_RESTORE_ROOT"
 
 CLI="$REPOSITORY_ROOT/backup/bin/server-infra-backup"
 INTERNAL_HELPER="$REPOSITORY_ROOT/backup/bin/server-infra-backup-project"
@@ -115,6 +193,14 @@ fi
   fail_test "files-only restore-check.sh is not executable"
 [[ -f "$FILES_MANIFEST_DIR/README.md" ]] || \
   fail_test "files-only README.md was not created"
+if grep -F "server-infra-backup project dump" \
+  "$FILES_MANIFEST_DIR/README.md" >/dev/null; then
+  fail_test "files-only README unexpectedly documents a dump producer"
+fi
+if grep -F "server-infra-backup project restore-db" \
+  "$FILES_MANIFEST_DIR/README.md" >/dev/null; then
+  fail_test "files-only README unexpectedly documents database restore"
+fi
 
 mkdir -p \
   "$FILES_RESTORE_ROOT$FILES_PROJECT_ROOT/config" \
@@ -150,12 +236,43 @@ rm -f -- \
   fail_test "Existing manifest did not receive restore-check.sh"
 [[ -f "$MANIFEST_DIR/README.md" ]] || \
   fail_test "Existing manifest did not receive README.md"
+git -C "$PROJECT_ROOT" add .server-infra/backup
+git -C "$PROJECT_ROOT" commit --quiet -m "add backup manifest"
+PROJECT_DEPLOY_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
 (
   cd "$PROJECT_ROOT"
   "$CLI" project install \
     --config-root "$CONFIG_ROOT" \
     --check
-)
+) > "$TEST_ROOT/project-install-plan.log"
+assert_contains \
+  "$TEST_ROOT/project-install-plan.log" \
+  "Recovery repository: git@github.com:example/my-app.git"
+assert_contains \
+  "$TEST_ROOT/project-install-plan.log" \
+  "Recovery commit: $PROJECT_DEPLOY_COMMIT"
+git -C "$PROJECT_ROOT" remote set-url origin \
+  "https://embedded-token@github.com/example/my-app.git"
+if (
+  cd "$PROJECT_ROOT"
+  "$CLI" project install \
+    --config-root "$CONFIG_ROOT" \
+    --check
+); then
+  fail_test "Project install accepted an HTTPS origin containing credentials"
+fi
+git -C "$PROJECT_ROOT" remote set-url origin \
+  "git@github.com:example/my-app.git"
+printf 'tracked change\n' > "$PROJECT_ROOT/docker-compose.yml"
+if (
+  cd "$PROJECT_ROOT"
+  "$CLI" project install \
+    --config-root "$CONFIG_ROOT" \
+    --check
+); then
+  fail_test "Project install accepted tracked Git changes"
+fi
+git -C "$PROJECT_ROOT" restore docker-compose.yml
 
 INTERACTIVE_ROOT="$TEST_ROOT/interactive-app"
 INTERACTIVE_MANIFEST="$INTERACTIVE_ROOT/.server-infra/backup"
@@ -179,6 +296,12 @@ assert_contains "$MANIFEST_DIR/paths" "$STAGING_ROOT/my-app"
 assert_contains \
   "$MANIFEST_DIR/freshness" \
   "14400 $STAGING_ROOT/my-app/postgres.complete"
+assert_contains \
+  "$MANIFEST_DIR/README.md" \
+  "sudo server-infra-backup project dump"
+assert_contains \
+  "$MANIFEST_DIR/README.md" \
+  "sudo server-infra-backup project restore-db"
 
 "$INTERNAL_HELPER" dump --source-config "$MANIFEST_DIR/source.conf"
 [[ -s "$STAGING_ROOT/my-app/postgres.dump" ]] || \
@@ -250,6 +373,11 @@ cp "$MANIFEST_DIR/source.conf" "$CONFIG_ROOT/backup/sources.d/my-app/source.conf
 cp "$MANIFEST_DIR/paths" "$CONFIG_ROOT/backup/sources.d/my-app/paths"
 cp "$MANIFEST_DIR/excludes" "$CONFIG_ROOT/backup/sources.d/my-app/excludes"
 cp "$MANIFEST_DIR/freshness" "$CONFIG_ROOT/backup/sources.d/my-app/freshness"
+cat > "$CONFIG_ROOT/backup/sources.d/my-app/recovery.conf" <<EOF
+RECOVERY_VERSION=1
+REPOSITORY_URL=git@github.com:example/my-app.git
+DEPLOY_COMMIT=$PROJECT_DEPLOY_COMMIT
+EOF
 cp "$FILES_MANIFEST_DIR/source.conf" \
   "$CONFIG_ROOT/backup/sources.d/files-app/source.conf"
 cp "$FILES_MANIFEST_DIR/paths" \
@@ -278,20 +406,100 @@ chmod 0640 \
   "$CONFIG_ROOT/backup/sources.d/my-app/source.conf" \
   "$CONFIG_ROOT/backup/sources.d/my-app/paths" \
   "$CONFIG_ROOT/backup/sources.d/my-app/excludes" \
-  "$CONFIG_ROOT/backup/sources.d/my-app/freshness"
+  "$CONFIG_ROOT/backup/sources.d/my-app/freshness" \
+  "$CONFIG_ROOT/backup/sources.d/my-app/recovery.conf"
 chmod 0600 \
   "$CONFIG_ROOT/backup/runtime.env" \
   "$CONFIG_ROOT/backup/restic-password"
 
+(
+  cd "$PROJECT_ROOT"
+  "$CLI" project dump --config-root "$CONFIG_ROOT"
+  "$CLI" project status --config-root "$CONFIG_ROOT"
+  "$CLI" project logs --config-root "$CONFIG_ROOT"
+  "$CLI" project restore-db \
+    --config-root "$CONFIG_ROOT" \
+    --target-db test_restore \
+    --snapshot abcdef12 \
+    --jobs 3
+)
+"$CLI" project status \
+  --name my-app \
+  --config-root "$CONFIG_ROOT"
+if "$CLI" project dump \
+  --name files-app \
+  --config-root "$CONFIG_ROOT"; then
+  fail_test "Files-only source unexpectedly accepted a dump operation"
+fi
+if "$CLI" project restore-db \
+  --name my-app \
+  --config-root "$CONFIG_ROOT" \
+  --target-db test_db; then
+  fail_test "Restore unexpectedly accepted the configured source database"
+fi
+if FAKE_TARGET_DB_EXISTS=1 \
+  "$CLI" project restore-db \
+    --name my-app \
+    --config-root "$CONFIG_ROOT" \
+    --target-db existing_restore; then
+  fail_test "Restore unexpectedly accepted an existing target database"
+fi
+if FAKE_DOCKER_FAIL_IMPORT=1 \
+  "$CLI" project restore-db \
+    --name my-app \
+    --config-root "$CONFIG_ROOT" \
+    --target-db failed_restore; then
+  fail_test "Restore unexpectedly accepted a failed pg_restore"
+fi
+assert_contains \
+  "$SYSTEMCTL_LOG" \
+  "start server-infra-backup-project-my-app.service"
+assert_contains \
+  "$SYSTEMCTL_LOG" \
+  "status --no-pager --full server-infra-backup-project-my-app.service server-infra-backup-project-my-app.timer"
+assert_contains \
+  "$JOURNALCTL_LOG" \
+  "--unit server-infra-backup-project-my-app.service --lines 100"
+assert_contains \
+  "$BACKUP_RESTORE_LOG" \
+  "restore --kind data --snapshot abcdef12 --include $STAGING_ROOT/my-app/postgres.dump"
+assert_contains \
+  "$DOCKER_LOG" \
+  "/tmp/server-infra-restore-my-app."
+assert_contains \
+  "$DOCKER_LOG" \
+  "createdb --username test-user --maintenance-db postgres --template template0 test_restore"
+assert_contains \
+  "$DOCKER_LOG" \
+  "pg_restore --exit-on-error --no-owner --no-acl --jobs 3 --username test-user --dbname test_restore"
+assert_contains \
+  "$DOCKER_LOG" \
+  "dropdb --username test-user --maintenance-db postgres --if-exists failed_restore"
+if find "$PROJECT_RESTORE_ROOT" -mindepth 1 -print -quit | grep -q .; then
+  fail_test "Database restore left temporary host data behind"
+fi
+
 LIST_OUTPUT="$TEST_ROOT/project-list.log"
+RECOVERY_LIST_OUTPUT="$TEST_ROOT/project-recovery-list.log"
 REMOVE_OUTPUT="$TEST_ROOT/project-remove.log"
 "$CLI" project list --config-root "$CONFIG_ROOT" > "$LIST_OUTPUT"
+"$CLI" project recovery-list \
+  --config-root "$CONFIG_ROOT" > "$RECOVERY_LIST_OUTPUT"
 "$CLI" project remove \
   --name my-app \
   --config-root "$CONFIG_ROOT" \
   --check > "$REMOVE_OUTPUT"
 assert_contains "$LIST_OUTPUT" $'my-app\tpostgres-compose\t02:45'
 assert_contains "$LIST_OUTPUT" $'files-app\tfiles-only\t-'
+assert_contains \
+  "$RECOVERY_LIST_OUTPUT" \
+  $'NAME\tTYPE\tPROJECT_ROOT\tREPOSITORY_URL\tDEPLOY_COMMIT'
+assert_contains \
+  "$RECOVERY_LIST_OUTPUT" \
+  $'files-app\tfiles-only\t'"$FILES_PROJECT_ROOT"$'\tMISSING\tMISSING'
+assert_contains \
+  "$RECOVERY_LIST_OUTPUT" \
+  $'my-app\tpostgres-compose\t'"$PROJECT_ROOT"$'\tgit@github.com:example/my-app.git\t'"$PROJECT_DEPLOY_COMMIT"
 assert_contains "$REMOVE_OUTPUT" "Staging data will be kept"
 [[ -d "$CONFIG_ROOT/backup/sources.d/my-app" ]] || \
   fail_test "Removal check changed the active source"

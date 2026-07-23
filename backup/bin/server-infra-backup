@@ -26,6 +26,7 @@ ACTIVE_MONITOR_LABEL=""
 RESTORE_TARGET=""
 RESTORE_SNAPSHOT="latest"
 RESTORE_KIND=""
+RESTORE_INCLUDE=""
 RESTORE_TEST_TARGET=""
 DATA_PATHS=()
 PATHS_FILES=()
@@ -41,10 +42,13 @@ Usage:
   server-infra-backup [--config-root <absolute-path>] retention
   server-infra-backup [--config-root <absolute-path>] check
   server-infra-backup [--config-root <absolute-path>] restore \
-    --kind <config|data> --target <absolute-path> [--snapshot <latest|id>]
+    --kind <config|data> --target <absolute-path> [--snapshot <latest|id>] \
+    [--include <absolute-path>]
   server-infra-backup [--config-root <absolute-path>] restore-test
   server-infra-backup setup [--config-root <absolute-path>]
-  server-infra-backup project <init|install|validate|list|remove> [options]
+  server-infra-backup project \
+    <init|install|validate|list|recovery-list|remove|dump|status|logs|restore-db> \
+    [options]
 
 Operations:
   validate   Validate configuration without contacting remote services.
@@ -53,6 +57,7 @@ Operations:
   retention  Apply the configured retention policy explicitly.
   check      Check repository metadata integrity.
   restore    Restore one tagged snapshot into an absent or empty directory.
+             Optionally restrict extraction to one configured path or child.
   restore-test
              Restore and validate the latest configuration snapshot.
   setup      Interactively create initial server and backup configuration.
@@ -990,6 +995,9 @@ restore_snapshot() {
   local snapshot="$2"
   local kind="$3"
   local tag_name
+  local include_root
+  local include_allowed=0
+  local restore_args=()
 
   case "$kind" in
     config)
@@ -1005,12 +1013,44 @@ restore_snapshot() {
   [[ "$snapshot" == "latest" || "$snapshot" =~ ^[0-9a-f]{8,64}$ ]] || \
     fail "Snapshot must be latest or an 8-64 character lowercase hex ID"
 
+  if [[ -n "$RESTORE_INCLUDE" ]]; then
+    validate_absolute_path "$RESTORE_INCLUDE" "Restore include path"
+    case "$kind" in
+      config)
+        include_root="${CONFIG_ROOT%/}"
+        if [[ "$RESTORE_INCLUDE" == "$include_root" || \
+          "$RESTORE_INCLUDE" == "$include_root"/* ]]; then
+          include_allowed=1
+        fi
+        ;;
+      data)
+        for include_root in "${DATA_PATHS[@]}"; do
+          include_root="${include_root%/}"
+          if [[ "$RESTORE_INCLUDE" == "$include_root" || \
+            "$RESTORE_INCLUDE" == "$include_root"/* ]]; then
+            include_allowed=1
+            break
+          fi
+        done
+        ;;
+    esac
+    [[ "$include_allowed" == "1" ]] || \
+      fail "Restore include path is outside the configured $kind paths"
+  fi
+
   validate_restore_target "$target"
   log "Restoring $kind snapshot $snapshot into $target"
-  run_restic restore "$snapshot" \
-    --host "$SERVER_INFRA_INSTANCE" \
-    --tag "$tag_name" \
+  restore_args=(
+    restore
+    "$snapshot"
+    --host "$SERVER_INFRA_INSTANCE"
+    --tag "$tag_name"
     --target "$target"
+  )
+  if [[ -n "$RESTORE_INCLUDE" ]]; then
+    restore_args+=(--include "$RESTORE_INCLUDE")
+  fi
+  run_restic "${restore_args[@]}"
 }
 
 run_restore() {
@@ -1094,6 +1134,7 @@ parse_arguments() {
   local restore_target_set=0
   local restore_snapshot_set=0
   local restore_kind_set=0
+  local restore_include_set=0
 
   while (($# > 0)); do
     case "$1" in
@@ -1161,6 +1202,22 @@ parse_arguments() {
         restore_kind_set=1
         shift
         ;;
+      --include)
+        (($# >= 2)) || fail "Missing value for --include"
+        [[ "$restore_include_set" == "0" ]] || \
+          fail "--include may be specified only once"
+        RESTORE_INCLUDE="$2"
+        restore_include_set=1
+        shift 2
+        ;;
+      --include=*)
+        [[ "$restore_include_set" == "0" ]] || \
+          fail "--include may be specified only once"
+        RESTORE_INCLUDE="${1#*=}"
+        [[ -n "$RESTORE_INCLUDE" ]] || fail "Missing value for --include"
+        restore_include_set=1
+        shift
+        ;;
       --help | -h)
         usage
         exit 0
@@ -1214,7 +1271,7 @@ main() {
 
   if [[ "$OPERATION" != "restore" && \
     (-n "$RESTORE_TARGET" || "$RESTORE_SNAPSHOT" != "latest" || \
-    -n "$RESTORE_KIND") ]]; then
+    -n "$RESTORE_KIND" || -n "$RESTORE_INCLUDE") ]]; then
     fail "Restore options are supported only by the restore operation"
   fi
 

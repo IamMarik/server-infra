@@ -16,6 +16,7 @@ This repository owns:
 - reverse proxy infrastructure;
 - server monitoring and operational tools;
 - reusable server backup and restore tooling;
+- complete-server recovery coordination;
 - server bootstrap and health scripts;
 - reusable infrastructure module definitions;
 - environment-level infrastructure configuration.
@@ -52,6 +53,7 @@ Target:
     ├── sources.d/
     │   └── <project>/
     │       ├── source.conf
+    │       ├── recovery.conf
     │       ├── paths
     │       ├── excludes
     │       └── freshness
@@ -86,6 +88,11 @@ The optional PostgreSQL Compose producer is a constrained generic adapter. It
 does not accept arbitrary shell commands, source env files, or store database
 passwords. Concrete project paths and service names remain host/application
 configuration.
+
+An installed project source may contain non-secret `recovery.conf` metadata
+captured from its Git checkout. It records the origin URL and exact commit
+seen by `project install`; it does not contain Git credentials or application
+deployment logic.
 
 A project source may instead use `SOURCE_TYPE=files-only`. That source adds
 reviewed paths and exclusions without a database producer, staging directory,
@@ -140,6 +147,29 @@ are not supported by the initial host driver.
 A script performs one operational action, such as deploy, health, logs, or bootstrap.
 
 Scripts must be idempotent and deterministic. Running the same script multiple times should converge to the same server state.
+
+### Recovery workflow
+
+`recovery/` is an operator workflow, not a module. It does not have a module
+manifest, deployment driver, runtime service, or independent server profile.
+It coordinates the existing infrastructure, backup, and project recovery
+contracts after complete server loss.
+
+The external break-glass record provides only the credentials and repository
+metadata needed before `/etc/server-infra` can be restored. Recovery session
+state belongs outside Git under:
+
+```text
+/var/lib/server-infra/recovery/session.env
+```
+
+The state contains no provider credentials, restic password, Git private key,
+or application secret. The restored host configuration and project
+`recovery.conf` files remain the sources of truth; the orchestrator must not
+duplicate their values in a tracked server description.
+
+The approved boundary, bootstrap procedure, and phased state model are defined
+in `rfc/0003-disaster-recovery-orchestrator.md`.
 
 ## Deployment flow
 
@@ -203,4 +233,5 @@ be added there.
 9. Ask before changing repository structure.
 
 The approved `backup/` top-level module and its host-driver requirements are
-defined in `rfc/0001-backup-stack.md`.
+defined in `rfc/0001-backup-stack.md`. The approved non-module `recovery/`
+workflow is defined in `rfc/0003-disaster-recovery-orchestrator.md`.

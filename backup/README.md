@@ -36,6 +36,7 @@ Active configuration belongs under:
 ├── sources.d/
 │   └── <project>/
 │       ├── source.conf
+│       ├── recovery.conf
 │       ├── paths
 │       ├── excludes
 │       └── freshness
@@ -72,6 +73,23 @@ patterns should be anchored to that project's paths when they are not generic.
 
 The restic password file must be root-owned with mode `0600`. Store a second,
 recoverable copy of the password outside the server failure domain.
+
+Keep the complete break-glass record outside the server as described in
+`RECOVERY.md`. `break-glass.txt.example` defines its fields but contains only
+invalid placeholders.
+
+Export a new record directly from the validated active configuration:
+
+```bash
+sudo ./scripts/export-break-glass.sh \
+  --output /media/encrypted-recovery/server-infra-break-glass.txt
+```
+
+The exporter also records the current server-infra `origin` and exact Git
+commit. It creates a mode `0600` file without printing secrets and refuses to
+overwrite an existing record. A `sudo` export belongs to the invoking operator
+rather than root. Import the file into the password manager, complete its
+`LAST VERIFIED` evidence, and remove the plaintext export.
 
 ## Deployment
 
@@ -125,8 +143,8 @@ sudo ./scripts/install.sh --module backup --apply --install-examples
 Run deployment preflight, then apply the host module:
 
 ```bash
-sudo ./scripts/deploy.sh --config-root /etc/server-infra --check
-sudo ./scripts/deploy.sh --config-root /etc/server-infra --apply
+sudo ./scripts/deploy.sh --check
+sudo ./scripts/deploy.sh --apply
 ```
 
 Apply installs the public CLI, internal helpers, and systemd units. Initialize
@@ -264,11 +282,30 @@ and timer. A files-only source installs only the active configuration and has
 no producer timer. Use `--no-enable` for PostgreSQL when the timer must be
 enabled only after a manual dump test.
 
+Installation also records the checkout's Git `origin` and exact `HEAD` in the
+root-owned `recovery.conf`. It does not contact the remote repository. Run
+`project install` after application deployment so the recovery commit remains
+current. HTTPS remotes containing credentials are rejected instead of being
+stored in the configuration snapshot. Installation also refuses tracked Git
+changes because they cannot be reconstructed from the recorded commit. The
+complete `.server-infra/backup` manifest must already be committed in that
+same checkout.
+
 List installed sources:
 
 ```bash
 sudo server-infra-backup project list
 ```
+
+List the paths, repositories, and exact commits needed after complete server
+loss:
+
+```bash
+sudo server-infra-backup project recovery-list
+```
+
+`MISSING` indicates a non-Git checkout or missing `origin`/`HEAD`. Fix and
+reinstall that source before considering the server disaster-ready.
 
 Preview removal:
 
@@ -291,9 +328,49 @@ manifest to register the source again.
 Run the producer manually:
 
 ```bash
-sudo systemctl start server-infra-backup-project-my-app.service
-journalctl -u server-infra-backup-project-my-app.service
+cd /opt/my-app
+sudo server-infra-backup project dump
+sudo server-infra-backup project status
+sudo server-infra-backup project logs
+sudo server-infra-backup project restore-db \
+  --target-db my_app_restore \
+  --jobs 4
 ```
+
+These commands resolve the source name from
+`.server-infra/backup/source.conf`. From another directory, select the
+installed source explicitly with `--name my-app`. `status` reports both the
+generated service and timer; `logs` prints the latest 100 service journal
+entries. The full systemd unit names remain available for low-level
+troubleshooting.
+
+`restore-db` selects the latest data snapshot by default. Use
+`--snapshot <id>` for a specific snapshot. It extracts only this project's
+`postgres.dump` under a root-owned temporary directory, verifies the custom
+archive, streams it into a mode `0600` regular file owned by the PostgreSQL
+Compose service user, creates a new empty database from `template0`, and runs
+`pg_restore` from that regular archive file. Other project files in the data
+snapshot are not downloaded.
+
+The PostgreSQL Compose service must be running and its standard `postgres`
+maintenance database must be available. The configured source database itself
+does not need to accept connections or still exist.
+
+The target database:
+
+- must use lowercase snake_case;
+- must differ from the configured `POSTGRES_DB`;
+- must not already exist.
+
+The command never stops the application, changes its connection string,
+renames a database, or removes the configured source database. A failed import
+removes only the new incomplete target. Successful completion removes the
+temporary host and container dump but keeps the restored database for
+application-owned validation and cutover.
+
+Parallel restore defaults to four jobs and accepts `--jobs 1` through
+`--jobs 32`. More jobs are not always faster; choose a value appropriate for
+the PostgreSQL host CPU and storage.
 
 The producer passes the optional env-file to `docker compose --env-file`; it
 never executes the env-file with `source`. `pg_dump` and `pg_restore --list`
@@ -311,7 +388,7 @@ fails instead of silently copying an old database dump.
 Initialize a new repository explicitly:
 
 ```bash
-sudo ./scripts/backup.sh --config-root /etc/server-infra init
+sudo ./scripts/backup.sh init
 ```
 
 The scheduled job never initializes a repository.
@@ -319,32 +396,33 @@ The scheduled job never initializes a repository.
 Run a backup manually:
 
 ```bash
-sudo ./scripts/backup.sh --config-root /etc/server-infra run
+sudo ./scripts/backup.sh run
 ```
 
 Apply retention explicitly after provider-policy validation:
 
 ```bash
-sudo ./scripts/backup.sh --config-root /etc/server-infra retention
+sudo ./scripts/backup.sh retention
 ```
 
 Run the same metadata-only repository check used by the weekly timer:
 
 ```bash
-sudo ./scripts/backup.sh --config-root /etc/server-infra check
+sudo ./scripts/backup.sh check
 ```
 
 Restore the latest configuration snapshot into a new or empty directory:
 
 ```bash
 sudo ./scripts/restore.sh \
-  --config-root /etc/server-infra \
   --kind config \
   --target /var/tmp/server-infra-restore
 ```
 
 Use `--kind data` for the tagged data snapshot. Use
 `--snapshot <snapshot-id>` to select an exact snapshot instead of `latest`.
+Use `--include <absolute-path>` to extract only one configured path or a child
+of it. An include outside the selected config or data paths is rejected.
 The command rejects symlinks, broad system paths, the live configuration
 root, and non-empty destinations. A failed manual restore leaves its target in
 place for inspection.
@@ -352,7 +430,7 @@ place for inspection.
 Run the monthly configuration restore test manually:
 
 ```bash
-sudo ./scripts/backup.sh --config-root /etc/server-infra restore-test
+sudo ./scripts/backup.sh restore-test
 ```
 
 The test restores the latest configuration snapshot selected by server
@@ -389,6 +467,7 @@ or monitor:
 ./backup/tests/test-runner.sh
 ./backup/tests/test-project-wizard.sh
 ./backup/tests/test-setup-wizard.sh
+./backup/tests/test-break-glass-export.sh
 ```
 
 The generic restore test proves that encrypted configuration files can be
@@ -406,6 +485,8 @@ application that stages such a dump must own and document that import test.
   that `server-infra-backup` and its internal helper are installed.
 - PostgreSQL project sources require Docker Compose and `pg_dump`/`pg_restore`
   inside the selected service.
+- `project restore-db` restores only into a new database; production cutover
+  and application-level verification remain owned by the application.
 - A deployment or another backup operation prevents a concurrent backup.
 - Push URLs must be HTTPS base URLs without query parameters.
 - `check` validates repository metadata only. A full `--read-data` scan is an
@@ -413,3 +494,5 @@ application that stages such a dump must own and document that import test.
   data.
 - A restore test failure reports to its own monitor and still removes only the
   temporary test directory created for that invocation.
+- Complete-server recovery requires the externally stored break-glass record;
+  see `RECOVERY.md`.

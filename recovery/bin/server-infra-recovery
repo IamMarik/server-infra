@@ -1,0 +1,705 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+RECOVERY_BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RECOVERY_ROOT="$(cd "$RECOVERY_BIN_DIR/.." && pwd)"
+REPOSITORY_ROOT="$(cd "$RECOVERY_ROOT/.." && pwd)"
+# shellcheck source=../../scripts/common.sh
+source "$REPOSITORY_ROOT/scripts/common.sh"
+
+STATE_VERSION=1
+STATE_ROOT="/var/lib/server-infra/recovery"
+STATE_FILE=""
+OPERATION=""
+BREAK_GLASS_FILE=""
+TEMP_FILE=""
+
+recovery_log() {
+  printf '[server-infra][recovery] %s\n' "$*"
+}
+
+recovery_ok() {
+  printf '[server-infra][recovery][ok] %s\n' "$*"
+}
+
+recovery_warn() {
+  printf '[server-infra][recovery][warn] %s\n' "$*" >&2
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  server-infra-recovery [--state-root <absolute-path>] \
+    init --break-glass <absolute-path>
+  server-infra-recovery [--state-root <absolute-path>] plan
+  server-infra-recovery [--state-root <absolute-path>] status
+
+Operations:
+  init
+    Validate a break-glass record against the current Git checkout and create
+    a resumable, non-secret recovery session.
+  plan
+    Show the ordered recovery phases and the next incomplete phase.
+  status
+    Show recovery session metadata and phase state.
+
+The initial implementation does not restore data, deploy infrastructure, or
+start traffic. Follow backup/RECOVERY.md for those manual phases.
+
+Defaults to:
+  --state-root /var/lib/server-infra/recovery
+USAGE
+}
+
+validate_absolute_path() {
+  local path_value="$1"
+  local path_label="$2"
+
+  [[ "$path_value" == /* ]] || fail "$path_label must be an absolute path"
+  [[ "$path_value" != *".."* ]] || fail "$path_label must not contain .."
+  [[ "$path_value" != *"//"* ]] || fail "$path_label must not contain //"
+  [[ "$path_value" != *$'\n'* && "$path_value" != *$'\r'* ]] || \
+    fail "$path_label contains an invalid line break"
+}
+
+validate_no_symlink_components() {
+  local path_value="$1"
+  local path_label="$2"
+  local current_path=""
+  local component
+  local components=()
+
+  IFS='/' read -r -a components <<< "${path_value#/}"
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    current_path="$current_path/$component"
+    [[ ! -L "$current_path" ]] || \
+      fail "$path_label contains a symlinked path component: $current_path"
+  done
+}
+
+file_mode() {
+  local file_path="$1"
+
+  case "$(uname -s)" in
+    Linux)
+      stat -c '%a' "$file_path"
+      ;;
+    Darwin)
+      stat -f '%Lp' "$file_path"
+      ;;
+    *)
+      fail "Unsupported platform for permission validation"
+      ;;
+  esac
+}
+
+file_owner_id() {
+  local file_path="$1"
+
+  case "$(uname -s)" in
+    Linux)
+      stat -c '%u' "$file_path"
+      ;;
+    Darwin)
+      stat -f '%u' "$file_path"
+      ;;
+    *)
+      fail "Unsupported platform for ownership validation"
+      ;;
+  esac
+}
+
+is_placeholder_value() {
+  local value="$1"
+
+  case "$value" in
+    "" | example | replace-me | changeme | not-recorded | *.invalid)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+validate_repository_url() {
+  local repository_url="$1"
+  local authority
+  local user_info
+
+  [[ -n "$repository_url" ]] || fail "Git repository URL must not be empty"
+  [[ "$repository_url" != *[[:space:]]* ]] || \
+    fail "Git repository URL must not contain whitespace"
+  [[ "$repository_url" != *"?"* && "$repository_url" != *"#"* ]] || \
+    fail "Git repository URL must not contain query parameters or fragments"
+
+  case "$repository_url" in
+    https://* | ssh://* | git@*:*)
+      ;;
+    *)
+      fail "Unsupported Git repository URL: use HTTPS or SSH"
+      ;;
+  esac
+
+  if [[ "$repository_url" == https://* ]]; then
+    authority="${repository_url#https://}"
+    authority="${authority%%/*}"
+    [[ "$authority" != *"@"* ]] || \
+      fail "Git repository URL must not contain embedded credentials"
+  elif [[ "$repository_url" == ssh://* ]]; then
+    authority="${repository_url#ssh://}"
+    authority="${authority%%/*}"
+    if [[ "$authority" == *"@"* ]]; then
+      user_info="${authority%@*}"
+      [[ "$user_info" != *":"* ]] || \
+        fail "Git repository URL must not contain embedded credentials"
+    fi
+  fi
+}
+
+validate_state_root() {
+  local normalized_root="${STATE_ROOT%/}"
+  local physical_repository_root
+
+  validate_absolute_path "$STATE_ROOT" "Recovery state root"
+  case "$normalized_root" in
+    "" | / | /var | /var/lib | /etc | /run | /tmp | /home | /root | /usr | /opt)
+      fail "Refusing unsafe recovery state root: $STATE_ROOT"
+      ;;
+  esac
+  validate_no_symlink_components "$STATE_ROOT" "Recovery state root"
+  physical_repository_root="$(cd "$REPOSITORY_ROOT" && pwd -P)"
+  case "$normalized_root/" in
+    "$physical_repository_root/"*)
+      fail "Recovery state must be outside the server-infra repository"
+      ;;
+  esac
+
+  if [[ "$(uname -s)" == "Linux" && \
+    "$normalized_root" == "/var/lib/server-infra/recovery" && \
+    "$(id -u)" != "0" ]]; then
+    fail "Default recovery state must be managed as root"
+  fi
+}
+
+validate_secret_record_file() {
+  local record_file="$1"
+  local mode
+  local owner_id
+  local current_id
+
+  validate_absolute_path "$record_file" "Break-glass path"
+  validate_no_symlink_components "$record_file" "Break-glass path"
+  [[ -f "$record_file" ]] || fail "Break-glass record not found: $record_file"
+  [[ -r "$record_file" ]] || \
+    fail "Break-glass record is not readable: $record_file"
+  [[ ! -L "$record_file" ]] || \
+    fail "Break-glass record must not be a symlink"
+
+  mode="$(file_mode "$record_file")"
+  [[ "$mode" == "600" ]] || \
+    fail "Break-glass record must have mode 0600; found 0$mode"
+
+  owner_id="$(file_owner_id "$record_file")"
+  current_id="$(id -u)"
+  if [[ "$current_id" == "0" && -n "${SUDO_UID:-}" ]]; then
+    [[ "$SUDO_UID" =~ ^[0-9]+$ ]] || fail "Invalid sudo user metadata"
+    [[ "$owner_id" == "0" || "$owner_id" == "$SUDO_UID" ]] || \
+      fail "Break-glass record must belong to root or the invoking sudo user"
+  else
+    [[ "$owner_id" == "$current_id" ]] || \
+      fail "Break-glass record must belong to the invoking user"
+  fi
+}
+
+read_break_glass() {
+  local record_file="$1"
+  local allowed_keys=$'\nBREAK_GLASS_VERSION\nGENERATED_AT\nSERVER_INFRA_INSTANCE\nSERVER_INFRA_REPOSITORY_URL\nSERVER_INFRA_REPOSITORY_REF\nRESTIC_REPOSITORY\nRESTIC_PASSWORD\nAWS_ACCESS_KEY_ID\nAWS_SECRET_ACCESS_KEY\nAWS_DEFAULT_REGION\n'
+  local seen_keys=$'\n'
+  local line=""
+  local key
+  local value
+
+  BREAK_GLASS_VERSION=""
+  BREAK_GLASS_GENERATED_AT=""
+  BREAK_GLASS_INSTANCE=""
+  BREAK_GLASS_REPOSITORY_URL=""
+  BREAK_GLASS_REPOSITORY_REF=""
+  BREAK_GLASS_RESTIC_REPOSITORY=""
+  BREAK_GLASS_RESTIC_PASSWORD=""
+  BREAK_GLASS_AWS_ACCESS_KEY_ID=""
+  BREAK_GLASS_AWS_SECRET_ACCESS_KEY=""
+  BREAK_GLASS_AWS_DEFAULT_REGION=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*):[[:space:]](.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    [[ "$allowed_keys" == *$'\n'"$key"$'\n'* ]] || continue
+    [[ "$seen_keys" != *$'\n'"$key"$'\n'* ]] || \
+      fail "Duplicate field $key in break-glass record"
+    seen_keys+="$key"$'\n'
+
+    case "$key" in
+      BREAK_GLASS_VERSION)
+        BREAK_GLASS_VERSION="$value"
+        ;;
+      GENERATED_AT)
+        BREAK_GLASS_GENERATED_AT="$value"
+        ;;
+      SERVER_INFRA_INSTANCE)
+        BREAK_GLASS_INSTANCE="$value"
+        ;;
+      SERVER_INFRA_REPOSITORY_URL)
+        BREAK_GLASS_REPOSITORY_URL="$value"
+        ;;
+      SERVER_INFRA_REPOSITORY_REF)
+        BREAK_GLASS_REPOSITORY_REF="$value"
+        ;;
+      RESTIC_REPOSITORY)
+        BREAK_GLASS_RESTIC_REPOSITORY="$value"
+        ;;
+      RESTIC_PASSWORD)
+        BREAK_GLASS_RESTIC_PASSWORD="$value"
+        ;;
+      AWS_ACCESS_KEY_ID)
+        BREAK_GLASS_AWS_ACCESS_KEY_ID="$value"
+        ;;
+      AWS_SECRET_ACCESS_KEY)
+        BREAK_GLASS_AWS_SECRET_ACCESS_KEY="$value"
+        ;;
+      AWS_DEFAULT_REGION)
+        BREAK_GLASS_AWS_DEFAULT_REGION="$value"
+        ;;
+    esac
+  done < "$record_file"
+
+  [[ "$BREAK_GLASS_VERSION" == "1" ]] || \
+    fail "Unsupported or missing BREAK_GLASS_VERSION"
+  [[ "$BREAK_GLASS_GENERATED_AT" =~ \
+    ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || \
+    fail "GENERATED_AT has an invalid format"
+  [[ "$BREAK_GLASS_INSTANCE" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
+    fail "SERVER_INFRA_INSTANCE must use lowercase kebab-case"
+  validate_repository_url "$BREAK_GLASS_REPOSITORY_URL"
+  [[ "$BREAK_GLASS_REPOSITORY_REF" =~ ^[0-9a-f]{40}$ || \
+    "$BREAK_GLASS_REPOSITORY_REF" =~ ^[0-9a-f]{64}$ ]] || \
+    fail "SERVER_INFRA_REPOSITORY_REF must be an exact Git commit"
+  [[ "$BREAK_GLASS_RESTIC_REPOSITORY" == s3:https://* ]] || \
+    fail "RESTIC_REPOSITORY must use an S3-compatible HTTPS URL"
+  [[ "$BREAK_GLASS_AWS_DEFAULT_REGION" =~ ^[a-z0-9][a-z0-9-]*$ ]] || \
+    fail "AWS_DEFAULT_REGION has an invalid format"
+
+  for value in \
+    "$BREAK_GLASS_RESTIC_REPOSITORY" \
+    "$BREAK_GLASS_RESTIC_PASSWORD" \
+    "$BREAK_GLASS_AWS_ACCESS_KEY_ID" \
+    "$BREAK_GLASS_AWS_SECRET_ACCESS_KEY" \
+    "$BREAK_GLASS_AWS_DEFAULT_REGION"; do
+    ! is_placeholder_value "$value" || \
+      fail "Break-glass record contains an empty or placeholder recovery value"
+  done
+}
+
+validate_current_repository() {
+  local current_url
+  local current_ref
+
+  require_command git
+  git -C "$REPOSITORY_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || \
+    fail "Recovery CLI must run from a Git checkout"
+
+  current_url="$(git -C "$REPOSITORY_ROOT" remote get-url origin)" || \
+    fail "Unable to read the server-infra origin URL"
+  current_ref="$(git -C "$REPOSITORY_ROOT" rev-parse HEAD)" || \
+    fail "Unable to read the server-infra Git commit"
+  [[ -z "$(git -C "$REPOSITORY_ROOT" status --porcelain --untracked-files=no)" ]] || \
+    fail "Tracked server-infra files are modified"
+
+  [[ "$current_url" == "$BREAK_GLASS_REPOSITORY_URL" ]] || \
+    fail "Current server-infra origin does not match the break-glass record"
+  [[ "$current_ref" == "$BREAK_GLASS_REPOSITORY_REF" ]] || \
+    fail "Current server-infra commit does not match the break-glass record"
+}
+
+validate_state_file() {
+  local allowed_keys=$'\nRECOVERY_STATE_VERSION\nRECOVERY_SESSION_ID\nRECOVERY_INSTANCE\nRECOVERY_STARTED_AT\nRECOVERY_BREAK_GLASS_GENERATED_AT\nRECOVERY_INFRA_REPOSITORY_URL\nRECOVERY_INFRA_REPOSITORY_REF\nRECOVERY_STATUS\nRECOVERY_PHASE_REPOSITORY\nRECOVERY_PHASE_CONFIG\nRECOVERY_CONFIG_SNAPSHOT\nRECOVERY_PHASE_DATA\nRECOVERY_DATA_SNAPSHOT\nRECOVERY_PHASE_PROJECTS\nRECOVERY_PHASE_FINALIZE\n'
+  local line=""
+  local line_number=0
+  local seen_keys=$'\n'
+  local phase
+
+  [[ -f "$STATE_FILE" ]] || fail "Recovery session is not initialized"
+  [[ ! -L "$STATE_FILE" ]] || fail "Recovery state file must not be a symlink"
+  [[ -r "$STATE_FILE" ]] || fail "Recovery state file is not readable"
+  [[ "$(file_mode "$STATE_FILE")" == "600" ]] || \
+    fail "Recovery state file must have mode 0600"
+  [[ "$(file_owner_id "$STATE_FILE")" == "$(id -u)" ]] || \
+    fail "Recovery state file must belong to the invoking user"
+  validate_env_file "$STATE_FILE"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    parse_env_line "$line" "$STATE_FILE" "$line_number"
+    [[ "$PARSED_ENV_KIND" == "assignment" ]] || continue
+    [[ "$allowed_keys" == *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Unknown key $PARSED_ENV_KEY in recovery state"
+    [[ "$seen_keys" != *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Duplicate key $PARSED_ENV_KEY in recovery state"
+    seen_keys+="$PARSED_ENV_KEY"$'\n'
+  done < "$STATE_FILE"
+
+  RECOVERY_STATE_VERSION="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_STATE_VERSION"
+  )"
+  RECOVERY_SESSION_ID="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_SESSION_ID"
+  )"
+  RECOVERY_INSTANCE="$(read_required_env_value "$STATE_FILE" "RECOVERY_INSTANCE")"
+  RECOVERY_STARTED_AT="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_STARTED_AT"
+  )"
+  RECOVERY_BREAK_GLASS_GENERATED_AT="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_BREAK_GLASS_GENERATED_AT"
+  )"
+  RECOVERY_INFRA_REPOSITORY_URL="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_INFRA_REPOSITORY_URL"
+  )"
+  RECOVERY_INFRA_REPOSITORY_REF="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_INFRA_REPOSITORY_REF"
+  )"
+  RECOVERY_STATUS="$(read_required_env_value "$STATE_FILE" "RECOVERY_STATUS")"
+  RECOVERY_PHASE_REPOSITORY="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_PHASE_REPOSITORY"
+  )"
+  RECOVERY_PHASE_CONFIG="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_PHASE_CONFIG"
+  )"
+  RECOVERY_CONFIG_SNAPSHOT="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_CONFIG_SNAPSHOT"
+  )"
+  RECOVERY_PHASE_DATA="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_PHASE_DATA"
+  )"
+  RECOVERY_DATA_SNAPSHOT="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_DATA_SNAPSHOT"
+  )"
+  RECOVERY_PHASE_PROJECTS="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_PHASE_PROJECTS"
+  )"
+  RECOVERY_PHASE_FINALIZE="$(
+    read_required_env_value "$STATE_FILE" "RECOVERY_PHASE_FINALIZE"
+  )"
+
+  [[ "$RECOVERY_STATE_VERSION" == "$STATE_VERSION" ]] || \
+    fail "Unsupported recovery state version"
+  [[ "$RECOVERY_SESSION_ID" =~ \
+    ^[a-z0-9]+(-[a-z0-9]+)*-[0-9]{8}T[0-9]{6}Z$ ]] || \
+    fail "Invalid recovery session ID"
+  [[ "$RECOVERY_INSTANCE" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
+    fail "Invalid recovery instance"
+  [[ "$RECOVERY_STARTED_AT" =~ \
+    ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || \
+    fail "Invalid recovery start time"
+  [[ "$RECOVERY_BREAK_GLASS_GENERATED_AT" =~ \
+    ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || \
+    fail "Invalid break-glass generation time in recovery state"
+  validate_repository_url "$RECOVERY_INFRA_REPOSITORY_URL"
+  [[ "$RECOVERY_INFRA_REPOSITORY_REF" =~ ^[0-9a-f]{40}$ || \
+    "$RECOVERY_INFRA_REPOSITORY_REF" =~ ^[0-9a-f]{64}$ ]] || \
+    fail "Invalid infrastructure commit in recovery state"
+  [[ "$RECOVERY_STATUS" == "in-progress" || \
+    "$RECOVERY_STATUS" == "complete" ]] || \
+    fail "Invalid overall recovery status"
+
+  for phase in \
+    "$RECOVERY_PHASE_REPOSITORY" \
+    "$RECOVERY_PHASE_CONFIG" \
+    "$RECOVERY_PHASE_DATA" \
+    "$RECOVERY_PHASE_PROJECTS" \
+    "$RECOVERY_PHASE_FINALIZE"; do
+    [[ "$phase" == "pending" || "$phase" == "complete" ]] || \
+      fail "Invalid recovery phase state"
+  done
+
+  [[ "$RECOVERY_PHASE_REPOSITORY" == "complete" ]] || \
+    fail "Repository phase must be complete in an initialized session"
+  if [[ "$RECOVERY_PHASE_CONFIG" == "complete" ]]; then
+    [[ "$RECOVERY_CONFIG_SNAPSHOT" =~ ^[0-9a-f]{8,64}$ ]] || \
+      fail "Completed configuration phase requires an exact snapshot ID"
+  else
+    [[ -z "$RECOVERY_CONFIG_SNAPSHOT" ]] || \
+      fail "Pending configuration phase must not have a snapshot ID"
+  fi
+  if [[ "$RECOVERY_PHASE_DATA" == "complete" ]]; then
+    [[ "$RECOVERY_PHASE_CONFIG" == "complete" ]] || \
+      fail "Data phase requires completed configuration"
+    [[ "$RECOVERY_DATA_SNAPSHOT" =~ ^[0-9a-f]{8,64}$ ]] || \
+      fail "Completed data phase requires an exact snapshot ID"
+  else
+    [[ -z "$RECOVERY_DATA_SNAPSHOT" ]] || \
+      fail "Pending data phase must not have a snapshot ID"
+  fi
+  if [[ "$RECOVERY_PHASE_PROJECTS" == "complete" ]]; then
+    [[ "$RECOVERY_PHASE_DATA" == "complete" ]] || \
+      fail "Projects phase requires a completed data phase"
+  fi
+  if [[ "$RECOVERY_PHASE_FINALIZE" == "complete" ]]; then
+    [[ "$RECOVERY_PHASE_PROJECTS" == "complete" ]] || \
+      fail "Finalize phase requires completed projects"
+    [[ "$RECOVERY_STATUS" == "complete" ]] || \
+      fail "Completed finalization requires complete overall status"
+  else
+    [[ "$RECOVERY_STATUS" == "in-progress" ]] || \
+      fail "In-progress finalization requires in-progress overall status"
+  fi
+}
+
+validate_state_storage() {
+  local expected_owner
+
+  [[ -d "$STATE_ROOT" && ! -L "$STATE_ROOT" ]] || \
+    fail "Recovery state root is not a regular directory"
+  [[ "$(file_mode "$STATE_ROOT")" == "700" ]] || \
+    fail "Recovery state root must have mode 0700"
+  expected_owner="$(id -u)"
+  [[ "$(file_owner_id "$STATE_ROOT")" == "$expected_owner" ]] || \
+    fail "Recovery state root must belong to the invoking user"
+}
+
+ensure_state_root() {
+  validate_state_root
+  if [[ -e "$STATE_ROOT" || -L "$STATE_ROOT" ]]; then
+    [[ -d "$STATE_ROOT" && ! -L "$STATE_ROOT" ]] || \
+      fail "Recovery state root is not a regular directory"
+    [[ "$(file_owner_id "$STATE_ROOT")" == "$(id -u)" ]] || \
+      fail "Recovery state root must belong to the invoking user"
+  else
+    mkdir -p "$STATE_ROOT"
+  fi
+  chmod 0700 "$STATE_ROOT"
+  validate_state_storage
+  STATE_FILE="$STATE_ROOT/session.env"
+}
+
+locate_state_root() {
+  validate_state_root
+  validate_state_storage
+  STATE_FILE="$STATE_ROOT/session.env"
+}
+
+cleanup() {
+  if [[ -n "$TEMP_FILE" && -f "$TEMP_FILE" ]]; then
+    rm -f -- "$TEMP_FILE"
+  fi
+}
+
+run_init() {
+  local started_at
+  local session_id
+
+  [[ -n "$BREAK_GLASS_FILE" ]] || fail "init requires --break-glass"
+  validate_secret_record_file "$BREAK_GLASS_FILE"
+  read_break_glass "$BREAK_GLASS_FILE"
+  validate_current_repository
+  ensure_state_root
+
+  if [[ -e "$STATE_FILE" || -L "$STATE_FILE" ]]; then
+    validate_state_file
+    [[ "$RECOVERY_INSTANCE" == "$BREAK_GLASS_INSTANCE" ]] || \
+      fail "Existing recovery session belongs to another server"
+    [[ "$RECOVERY_INFRA_REPOSITORY_URL" == \
+      "$BREAK_GLASS_REPOSITORY_URL" ]] || \
+      fail "Existing recovery session uses another repository"
+    [[ "$RECOVERY_INFRA_REPOSITORY_REF" == \
+      "$BREAK_GLASS_REPOSITORY_REF" ]] || \
+      fail "Existing recovery session uses another infrastructure commit"
+    [[ "$RECOVERY_BREAK_GLASS_GENERATED_AT" == \
+      "$BREAK_GLASS_GENERATED_AT" ]] || \
+      fail "Existing recovery session uses another break-glass record"
+    recovery_ok "recovery session already initialized: $RECOVERY_SESSION_ID"
+    return
+  fi
+
+  started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  session_id="$BREAK_GLASS_INSTANCE-$(date -u +%Y%m%dT%H%M%SZ)"
+  umask 077
+  TEMP_FILE="$(mktemp "$STATE_ROOT/.session.env.XXXXXX")"
+  trap cleanup EXIT
+
+  {
+    printf '%s\n' "RECOVERY_STATE_VERSION=$STATE_VERSION"
+    printf '%s\n' "RECOVERY_SESSION_ID=$session_id"
+    printf '%s\n' "RECOVERY_INSTANCE=$BREAK_GLASS_INSTANCE"
+    printf '%s\n' "RECOVERY_STARTED_AT=$started_at"
+    printf '%s\n' \
+      "RECOVERY_BREAK_GLASS_GENERATED_AT=$BREAK_GLASS_GENERATED_AT"
+    printf '%s\n' \
+      "RECOVERY_INFRA_REPOSITORY_URL=$BREAK_GLASS_REPOSITORY_URL"
+    printf '%s\n' \
+      "RECOVERY_INFRA_REPOSITORY_REF=$BREAK_GLASS_REPOSITORY_REF"
+    printf '%s\n' "RECOVERY_STATUS=in-progress"
+    printf '%s\n' "RECOVERY_PHASE_REPOSITORY=complete"
+    printf '%s\n' "RECOVERY_PHASE_CONFIG=pending"
+    printf '%s\n' "RECOVERY_CONFIG_SNAPSHOT="
+    printf '%s\n' "RECOVERY_PHASE_DATA=pending"
+    printf '%s\n' "RECOVERY_DATA_SNAPSHOT="
+    printf '%s\n' "RECOVERY_PHASE_PROJECTS=pending"
+    printf '%s\n' "RECOVERY_PHASE_FINALIZE=pending"
+  } > "$TEMP_FILE"
+
+  chmod 0600 "$TEMP_FILE"
+  if ! ln "$TEMP_FILE" "$STATE_FILE"; then
+    fail "Unable to create recovery state without overwriting existing data"
+  fi
+  rm -f -- "$TEMP_FILE"
+  TEMP_FILE=""
+
+  validate_state_file
+  recovery_ok "recovery session initialized: $RECOVERY_SESSION_ID"
+  recovery_warn "The break-glass file was not copied; keep it available for the restore phase"
+}
+
+print_phase() {
+  local phase_number="$1"
+  local phase_state="$2"
+  local phase_label="$3"
+
+  printf '%s. [%s] %s\n' "$phase_number" "$phase_state" "$phase_label"
+}
+
+run_plan() {
+  locate_state_root
+  validate_state_file
+
+  printf 'Recovery plan for %s\n\n' "$RECOVERY_INSTANCE"
+  print_phase 0 "manual" "Fence the failed server and authorize temporary Git access"
+  print_phase 1 "$RECOVERY_PHASE_REPOSITORY" \
+    "Verify server-infra repository and exact commit"
+  print_phase 2 "$RECOVERY_PHASE_CONFIG" \
+    "Restore and validate /etc/server-infra from one config snapshot"
+  print_phase 3 "$RECOVERY_PHASE_DATA" \
+    "Select and freeze one exact data snapshot"
+  print_phase 4 "$RECOVERY_PHASE_PROJECTS" \
+    "Clone exact project commits and restore files and PostgreSQL"
+  print_phase 5 "$RECOVERY_PHASE_FINALIZE" \
+    "Validate applications, deploy Caddy, open traffic, and create a new backup"
+
+  printf '\n'
+  case "pending" in
+    "$RECOVERY_PHASE_CONFIG")
+      printf '%s\n' \
+        "Next: restore host configuration using backup/RECOVERY.md."
+      ;;
+    "$RECOVERY_PHASE_DATA")
+      printf '%s\n' "Next: select and record one exact data snapshot."
+      ;;
+    "$RECOVERY_PHASE_PROJECTS")
+      printf '%s\n' "Next: restore projects in dependency order."
+      ;;
+    "$RECOVERY_PHASE_FINALIZE")
+      printf '%s\n' "Next: verify services before enabling public traffic."
+      ;;
+    *)
+      printf '%s\n' "Next: no incomplete automated phase was found."
+      ;;
+  esac
+}
+
+run_status() {
+  locate_state_root
+  validate_state_file
+
+  recovery_log "Session: $RECOVERY_SESSION_ID"
+  recovery_log "Instance: $RECOVERY_INSTANCE"
+  recovery_log "Started: $RECOVERY_STARTED_AT"
+  recovery_log "Infrastructure ref: $RECOVERY_INFRA_REPOSITORY_REF"
+  recovery_log "Overall: $RECOVERY_STATUS"
+  recovery_log "Repository: $RECOVERY_PHASE_REPOSITORY"
+  recovery_log "Configuration: $RECOVERY_PHASE_CONFIG"
+  recovery_log "Configuration snapshot: ${RECOVERY_CONFIG_SNAPSHOT:-not-selected}"
+  recovery_log "Data snapshot: ${RECOVERY_DATA_SNAPSHOT:-not-selected}"
+  recovery_log "Projects: $RECOVERY_PHASE_PROJECTS"
+  recovery_log "Finalize: $RECOVERY_PHASE_FINALIZE"
+}
+
+parse_arguments() {
+  local state_root_set=0
+  local break_glass_set=0
+
+  while (($# > 0)); do
+    case "$1" in
+      --state-root)
+        (($# >= 2)) || fail "Missing value for --state-root"
+        [[ "$state_root_set" == "0" ]] || \
+          fail "--state-root may be specified only once"
+        STATE_ROOT="$2"
+        state_root_set=1
+        shift 2
+        ;;
+      --state-root=*)
+        [[ "$state_root_set" == "0" ]] || \
+          fail "--state-root may be specified only once"
+        STATE_ROOT="${1#*=}"
+        [[ -n "$STATE_ROOT" ]] || fail "Missing value for --state-root"
+        state_root_set=1
+        shift
+        ;;
+      --break-glass)
+        (($# >= 2)) || fail "Missing value for --break-glass"
+        [[ "$break_glass_set" == "0" ]] || \
+          fail "--break-glass may be specified only once"
+        BREAK_GLASS_FILE="$2"
+        break_glass_set=1
+        shift 2
+        ;;
+      --break-glass=*)
+        [[ "$break_glass_set" == "0" ]] || \
+          fail "--break-glass may be specified only once"
+        BREAK_GLASS_FILE="${1#*=}"
+        [[ -n "$BREAK_GLASS_FILE" ]] || fail "Missing value for --break-glass"
+        break_glass_set=1
+        shift
+        ;;
+      --help | -h)
+        usage
+        exit 0
+        ;;
+      init | plan | status)
+        [[ -z "$OPERATION" ]] || fail "Specify exactly one operation"
+        OPERATION="$1"
+        shift
+        ;;
+      *)
+        fail "Unknown argument: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$OPERATION" ]] || { usage; exit 1; }
+  if [[ "$OPERATION" != "init" && -n "$BREAK_GLASS_FILE" ]]; then
+    fail "--break-glass is supported only by init"
+  fi
+}
+
+main() {
+  parse_arguments "$@"
+  validate_state_root
+
+  case "$OPERATION" in
+    init)
+      run_init
+      ;;
+    plan)
+      run_plan
+      ;;
+    status)
+      run_status
+      ;;
+  esac
+}
+
+main "$@"

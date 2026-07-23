@@ -61,7 +61,7 @@ scripts/deploy.sh prod-app
 The external deployment preflight is:
 
 ```bash
-scripts/deploy.sh --config-root /etc/server-infra --check
+scripts/deploy.sh --check
 ```
 
 ## Operations

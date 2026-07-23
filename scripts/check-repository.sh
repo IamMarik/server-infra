@@ -37,6 +37,9 @@ is_forbidden_tracked_path() {
     id_ed25519 | */id_ed25519 | \
     credentials | */credentials | \
     credentials.json | */credentials.json | \
+    break-glass.txt | */break-glass.txt | \
+    break-glass.txt.* | */break-glass.txt.* | \
+    recovery/session.env | \
     proxy/Caddyfile.backup* | proxy/Caddyfile.before-*)
       return 0
       ;;
@@ -56,6 +59,7 @@ check_required_examples() {
     "backup/paths.example"
     "backup/excludes.example"
     "backup/freshness.example"
+    "backup/break-glass.txt.example"
   )
   local example_path
   local missing=0

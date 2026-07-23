@@ -103,6 +103,7 @@ Each server owns active configuration and secrets:
     ├── paths
     ├── excludes
     ├── freshness
+    ├── sources.d/<project>/recovery.conf
     └── restic-password
 ```
 
@@ -226,9 +227,15 @@ Project-specific source configuration may be reviewed in the application
 repository, but systemd and the backup runner consume only the root-owned copy
 installed into the host configuration tree.
 
+Project installation may capture non-secret Git recovery metadata in the
+root-owned source directory. The metadata contains the repository origin and
+exact deployed commit, rejects credential-bearing HTTPS URLs, and is included
+in the mandatory configuration snapshot. It must not contain Git credentials,
+private keys, or application deployment commands.
+
 Operators manage these sources through one public command namespace:
-`server-infra-backup project init|install|validate|list|remove`. The
-PostgreSQL producer remains an internal helper under `libexec`. Removal
+`server-infra-backup project init|install|validate|list|recovery-list|remove`.
+The PostgreSQL producer remains an internal helper under `libexec`. Removal
 archives active configuration within `/etc/server-infra`, removes generated
 systemd units, and deliberately preserves staged dumps and the application
 manifest.
@@ -295,6 +302,11 @@ server-specific validation of:
 The restic repository password must also be stored outside the backed-up
 server. Losing this password makes recovery impossible.
 
+A complete break-glass record stored outside the server failure domain also
+contains the repository URL, provider recovery credentials, logical server
+identity, and server-infra Git location. The tracked example contains only
+invalid placeholders; the completed record must never be committed.
+
 ## Restore Requirements
 
 A backup job is not considered operational until all of the following succeed:
@@ -317,6 +329,14 @@ removes or rotates temporary test data safely.
 
 Database dump restore tests remain application-owned. A generic restore test
 does not prove that a logical database dump can be imported successfully.
+
+The generic PostgreSQL project helper may import a logical dump only into a
+new, non-existing database. It must refuse the configured source database and
+must not stop applications, change connection settings, promote the restored
+database, or remove the previous database. Application validation and cutover
+remain application-owned operations. The helper should restrict restic
+extraction to the selected project's dump instead of downloading unrelated
+paths from the data snapshot.
 
 ## Implementation Plan
 

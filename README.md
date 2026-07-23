@@ -27,7 +27,8 @@ server-infra/
 ├── environments/
 ├── proxy/
 ├── monitoring/
-└── backup/
+├── backup/
+└── recovery/
 ```
 
 ## Core model
@@ -36,6 +37,8 @@ server-infra/
   modules.
 - **Module** provides one infrastructure capability.
 - **Scripts** apply host configuration and operate modules.
+- **Recovery workflow** coordinates rebuild and restore after complete server
+  loss without becoming an application deployment system.
 - **Applications are outside this repository.**
 
 ## Quick start
@@ -71,7 +74,7 @@ Validate an external host configuration without executing it or changing the
 host:
 
 ```bash
-./scripts/validate-config.sh --config-root /etc/server-infra
+./scripts/validate-config.sh
 ```
 
 Run the complete deployment preflight, including driver-specific module
@@ -79,7 +82,7 @@ validation and Docker Compose resolution when applicable, without changing
 runtime state:
 
 ```bash
-./scripts/deploy.sh --config-root /etc/server-infra --check
+./scripts/deploy.sh --check
 ```
 
 External deployment remains opt-in during migration. The positional
@@ -87,8 +90,11 @@ environment command is retained as the explicit rollback path. Applying
 external configuration requires an additional explicit operation:
 
 ```bash
-./scripts/deploy.sh --config-root /etc/server-infra --apply
+./scripts/deploy.sh --apply
 ```
+
+These commands default to `/etc/server-infra`. Pass `--config-root` only for
+tests or a non-standard host layout.
 
 For migration, apply requires every expected Compose project to exist so a
 typo in `SERVER_INFRA_INSTANCE` cannot silently create new empty named
@@ -146,6 +152,32 @@ installed by applying the `backup` host module. From the application root,
 For PostgreSQL sources, the Compose env file selected by the wizard is
 automatically included in the backup paths.
 
+Manually run or inspect an installed PostgreSQL dump producer from its
+application checkout:
+
+```bash
+sudo server-infra-backup project dump
+sudo server-infra-backup project status
+sudo server-infra-backup project logs
+sudo server-infra-backup project restore-db \
+  --target-db my_app_restore
+```
+
+For complete VM loss, keep the secret break-glass record outside the server
+and follow [backup/RECOVERY.md](backup/RECOVERY.md). On the clean replacement
+host, initialize a non-secret resumable session after cloning the exact
+server-infra ref:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery init \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery plan
+sudo ./recovery/bin/server-infra-recovery status
+```
+
+The current recovery CLI validates the entry conditions and records progress;
+restore and deployment phases remain operator-guided. See `recovery/README.md`.
+
 ## Documentation
 
 - `ARCHITECTURE.md` explains the system model.
@@ -155,3 +187,7 @@ automatically included in the backup paths.
 - `rfc/0001-backup-stack.md` defines the host-level backup module and rollout.
 - `rfc/0002-external-runtime-configuration.md` defines the safe runtime
   configuration migration.
+- `rfc/0003-disaster-recovery-orchestrator.md` defines the approved recovery
+  workflow and resumable state.
+- `backup/RECOVERY.md` defines the complete-server recovery runbook and
+  break-glass record.

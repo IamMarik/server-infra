@@ -8,10 +8,12 @@ Usage:
   scripts/restore.sh [--config-root <absolute-path>] \
     --kind <config|data> \
     --target <absolute-empty-path> \
-    [--snapshot <latest|id>]
+    [--snapshot <latest|id>] \
+    [--include <absolute-path>]
 
 The destination must not exist or must be an empty, non-symlink directory.
 This command never restores over live configuration or data paths.
+An include must be one configured path or a child of one.
 USAGE
 }
 

@@ -20,6 +20,8 @@ STAGING_DIR=""
 SYSTEMD_UNIT_ROOT="/etc/systemd/system"
 LOCK_ROOT="${SERVER_INFRA_BACKUP_LOCK_ROOT:-/run/server-infra}"
 HELPER_EXECUTABLE="${SERVER_INFRA_BACKUP_PROJECT_EXECUTABLE:-/usr/local/libexec/server-infra/backup/server-infra-backup-project}"
+BACKUP_EXECUTABLE="${SERVER_INFRA_BACKUP_EXECUTABLE:-/usr/local/libexec/server-infra/backup/server-infra-backup}"
+PROJECT_RESTORE_ROOT="${SERVER_INFRA_BACKUP_PROJECT_RESTORE_ROOT:-/var/cache/server-infra/backup/project-restores}"
 CHECK_ONLY=0
 ENABLE_TIMER=1
 NON_INTERACTIVE=0
@@ -29,6 +31,21 @@ INSTALL_JOB_LOCK=""
 DUMP_LOCK=""
 DUMP_TMP=""
 MARKER_TMP=""
+DUMP_SOURCE_CONFIG=""
+PROJECT_SERVICE_NAME=""
+PROJECT_TIMER_NAME=""
+RECOVERY_REPOSITORY_URL=""
+RECOVERY_DEPLOY_COMMIT=""
+RESTORE_SNAPSHOT="latest"
+RESTORE_TARGET_DB=""
+RESTORE_JOBS=4
+RESTORE_WORK=""
+RESTORE_CONTAINER_DUMP=""
+RESTORE_DB_CREATED=0
+RESTORE_DB_SUCCESS=0
+RESTORE_DATABASE_USER=""
+RESTORE_MAINTENANCE_DB="postgres"
+RESTORE_COMPOSE_ARGS=()
 INCLUDE_PATHS=()
 
 usage() {
@@ -38,7 +55,14 @@ Usage:
   server-infra-backup project validate [--manifest <directory>]
   server-infra-backup project install [--manifest <directory>] [--check]
   server-infra-backup project list [--config-root <absolute-path>]
+  server-infra-backup project recovery-list [--config-root <absolute-path>]
   server-infra-backup project remove --name <name> [--check]
+  server-infra-backup project dump [--name <name> | --manifest <directory>]
+  server-infra-backup project status [--name <name> | --manifest <directory>]
+  server-infra-backup project logs [--name <name> | --manifest <directory>]
+  server-infra-backup project restore-db \
+    [--name <name> | --manifest <directory>] \
+    --target-db <new-database> [--snapshot <latest|id>] [--jobs <count>]
 
 Internal:
   server-infra-backup-project dump --source-config <source.conf>
@@ -63,10 +87,26 @@ Install options:
   --check                     Validate and print the plan without changes.
   --no-enable                 Install without enabling the generated timer.
 
+Install records the checkout's origin URL and current Git commit in the
+root-owned active source. URLs containing HTTPS credentials are refused.
+
 Remove options:
   --name <kebab-case>         Installed source name to remove.
   --config-root <path>        Default: /etc/server-infra.
   --check                     Print the removal plan without changes.
+
+Dump, status, logs, and restore-db options:
+  --name <kebab-case>         Installed source name. When omitted, read it from
+                              $PWD/.server-infra/backup/source.conf.
+  --manifest <directory>      Project manifest used to resolve the source name.
+  --config-root <path>        Default: /etc/server-infra.
+
+Restore-db options:
+  --target-db <name>          Required new database name. Existing databases
+                              and the configured source database are refused.
+  --snapshot <latest|id>      Data snapshot to restore. Default: latest.
+  --jobs <count>              Parallel pg_restore jobs, from 1 to 32.
+                              Default: 4.
 
 The PostgreSQL helper never sources the Compose env file and stores no
 database password. It executes pg_dump and pg_restore inside the configured
@@ -113,6 +153,22 @@ validate_absolute_path() {
   esac
 }
 
+validate_no_symlink_components() {
+  local path_value="$1"
+  local path_label="$2"
+  local current_path=""
+  local component
+  local components=()
+
+  IFS='/' read -r -a components <<< "${path_value#/}"
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    current_path="$current_path/$component"
+    [[ ! -L "$current_path" ]] || \
+      fail "$path_label contains a symlinked path component: $current_path"
+  done
+}
+
 validate_source_name() {
   [[ "$1" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
     fail "Source name must use lowercase kebab-case"
@@ -139,6 +195,61 @@ validate_dump_time() {
 
 validate_positive_integer() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]] || fail "$2 must be a positive integer"
+}
+
+validate_repository_url() {
+  local repository_url="$1"
+  local authority
+  local repository_location
+  local repository_path
+  local user_info
+
+  [[ -n "$repository_url" ]] || return
+  [[ "$repository_url" != *[[:space:]]* && \
+    "$repository_url" != *'?'* && "$repository_url" != *'#'* ]] || \
+    fail "Git repository URL contains unsupported characters"
+
+  case "$repository_url" in
+    https://*)
+      repository_location="${repository_url#https://}"
+      authority="${repository_location%%/*}"
+      repository_path="${repository_location#*/}"
+      [[ "$authority" != *'@'* ]] || \
+        fail "HTTPS Git repository URL must not contain credentials"
+      [[ "$repository_location" == */* && \
+        -n "$authority" && -n "$repository_path" ]] || \
+        fail "HTTPS Git repository URL must include a repository path"
+      ;;
+    ssh://*)
+      repository_location="${repository_url#ssh://}"
+      authority="${repository_location%%/*}"
+      repository_path="${repository_location#*/}"
+      [[ "$repository_location" == */* && \
+        -n "$authority" && -n "$repository_path" ]] || \
+        fail "SSH Git repository URL must include a repository path"
+      if [[ "$authority" == *'@'* ]]; then
+        user_info="${authority%%@*}"
+        [[ "$user_info" != *':'* ]] || \
+          fail "SSH Git repository URL must not contain a password"
+      fi
+      ;;
+    *@*:*)
+      [[ "$repository_url" =~ ^[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:.+$ ]] || \
+        fail "SSH Git repository URL has an invalid format"
+      ;;
+    *)
+      fail "Git repository URL must use HTTPS or SSH"
+      ;;
+  esac
+}
+
+validate_deploy_commit() {
+  local deploy_commit="$1"
+
+  [[ -z "$deploy_commit" || \
+    "$deploy_commit" =~ ^[0-9a-f]{40}$ || \
+    "$deploy_commit" =~ ^[0-9a-f]{64}$ ]] || \
+    fail "Git deploy commit must be a full lowercase object ID"
 }
 
 parse_env_line() {
@@ -523,11 +634,25 @@ write_restore_check() {
 
 write_project_readme() {
   local mode_description
+  local producer_commands=("")
+  local producer_notes=("")
 
   if [[ "$SOURCE_TYPE" == "files-only" ]]; then
     mode_description="Files only; no database producer or project timer."
   else
     mode_description="Files plus a PostgreSQL custom-format dump from Docker Compose."
+    producer_commands=(
+      'sudo server-infra-backup project dump'
+      'sudo server-infra-backup project status'
+      'sudo server-infra-backup project logs'
+      'sudo server-infra-backup project restore-db --target-db <new-database>'
+    )
+    producer_notes=(
+      ''
+      '`restore-db` restores into a new database and refuses the configured'
+      'source database or an existing target. Validate the restored database'
+      'before changing application configuration or removing the old database.'
+    )
   fi
 
   write_manifest_file "$MANIFEST_DIR/README.md" 0644 \
@@ -553,7 +678,10 @@ write_project_readme() {
     'sudo server-infra-backup project install --check' \
     'sudo server-infra-backup project install' \
     'sudo server-infra-backup project list' \
+    'sudo server-infra-backup project recovery-list' \
+    "${producer_commands[@]}" \
     '```' \
+    "${producer_notes[@]}" \
     '' \
     'After restoring the data snapshot into a separate directory:' \
     '' \
@@ -742,6 +870,127 @@ install_file_atomic() {
   fi
 }
 
+detect_git_recovery_metadata() {
+  local manifest_relative
+  local recovery_manifest_file
+  local tracked_changes
+
+  RECOVERY_REPOSITORY_URL=""
+  RECOVERY_DEPLOY_COMMIT=""
+
+  if ! command -v git >/dev/null 2>&1; then
+    warn "Git is unavailable; project recovery metadata will be incomplete"
+    return
+  fi
+  if ! git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree \
+    >/dev/null 2>&1; then
+    warn "Project root is not a Git checkout; recovery metadata will be incomplete"
+    return
+  fi
+  case "$MANIFEST_DIR" in
+    "$PROJECT_ROOT"/*)
+      manifest_relative="${MANIFEST_DIR#"$PROJECT_ROOT"/}"
+      ;;
+    *)
+      fail "Project manifest must be inside its Git checkout for recovery"
+      ;;
+  esac
+  for recovery_manifest_file in \
+    source.conf \
+    paths \
+    excludes \
+    freshness \
+    restore-check.sh \
+    README.md; do
+    if ! git -C "$PROJECT_ROOT" ls-files \
+      --error-unmatch \
+      -- "$manifest_relative/$recovery_manifest_file" >/dev/null 2>&1; then
+      fail "Project backup manifest must be committed before installation"
+    fi
+  done
+  if ! tracked_changes="$(
+    git -C "$PROJECT_ROOT" status \
+      --porcelain \
+      --untracked-files=no 2>/dev/null
+  )"; then
+    fail "Unable to inspect tracked Git changes for recovery metadata"
+  fi
+  [[ -z "$tracked_changes" ]] || \
+    fail "Project has tracked Git changes that cannot be recovered exactly"
+
+  RECOVERY_REPOSITORY_URL="$(
+    git -C "$PROJECT_ROOT" remote get-url origin 2>/dev/null || true
+  )"
+  RECOVERY_DEPLOY_COMMIT="$(
+    git -C "$PROJECT_ROOT" rev-parse --verify HEAD 2>/dev/null || true
+  )"
+  if [[ -z "$RECOVERY_REPOSITORY_URL" ]]; then
+    warn "Git origin is not configured; repository recovery URL is missing"
+  else
+    validate_repository_url "$RECOVERY_REPOSITORY_URL"
+  fi
+  if [[ -z "$RECOVERY_DEPLOY_COMMIT" ]]; then
+    warn "Git HEAD is unavailable; deployed commit is missing"
+  else
+    validate_deploy_commit "$RECOVERY_DEPLOY_COMMIT"
+  fi
+}
+
+write_recovery_metadata_atomic() {
+  local destination_file="$1"
+  local destination_dir="${destination_file%/*}"
+  local temporary_file
+
+  temporary_file="$(
+    mktemp "$destination_dir/.${destination_file##*/}.tmp.XXXXXX"
+  )"
+  if ! printf '%s\n' \
+    "RECOVERY_VERSION=1" \
+    "REPOSITORY_URL=$RECOVERY_REPOSITORY_URL" \
+    "DEPLOY_COMMIT=$RECOVERY_DEPLOY_COMMIT" > "$temporary_file"; then
+    rm -f -- "$temporary_file"
+    fail "Unable to prepare $destination_file"
+  fi
+  chmod 0640 "$temporary_file"
+  chown root:root "$temporary_file"
+  if ! mv -f -- "$temporary_file" "$destination_file"; then
+    rm -f -- "$temporary_file"
+    fail "Unable to install $destination_file"
+  fi
+}
+
+validate_recovery_metadata_file() {
+  local recovery_file="$1"
+  local allowed_keys=$'\nRECOVERY_VERSION\nREPOSITORY_URL\nDEPLOY_COMMIT\n'
+  local seen_keys=$'\n'
+  local line=""
+  local line_number=0
+  local recovery_version
+  local repository_url
+  local deploy_commit
+
+  [[ -f "$recovery_file" && ! -L "$recovery_file" ]] || \
+    fail "Invalid project recovery metadata: $recovery_file"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    parse_env_line "$line" "$recovery_file" "$line_number"
+    [[ "$PARSED_ENV_KIND" == "assignment" ]] || continue
+    [[ "$allowed_keys" == *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Unknown key $PARSED_ENV_KEY in $recovery_file"
+    [[ "$seen_keys" != *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Duplicate key $PARSED_ENV_KEY in $recovery_file"
+    seen_keys+="$PARSED_ENV_KEY"$'\n'
+  done < "$recovery_file"
+
+  recovery_version="$(read_required_value "$recovery_file" "RECOVERY_VERSION")"
+  [[ "$recovery_version" == "1" ]] || \
+    fail "Unsupported RECOVERY_VERSION in $recovery_file"
+  repository_url="$(read_optional_value "$recovery_file" "REPOSITORY_URL")"
+  deploy_commit="$(read_optional_value "$recovery_file" "DEPLOY_COMMIT")"
+  validate_repository_url "$repository_url"
+  validate_deploy_commit "$deploy_commit"
+}
+
 write_unit_atomic() {
   local destination_file="$1"
   shift
@@ -762,6 +1011,7 @@ run_install() {
   local service_name
   local timer_name
   local installed_source_type=""
+  local recovery_file
 
   load_manifest
   validate_runtime_inputs
@@ -772,6 +1022,8 @@ run_install() {
   active_source_env="$active_source_dir/source.conf"
   service_name="server-infra-backup-project-$SOURCE_NAME.service"
   timer_name="server-infra-backup-project-$SOURCE_NAME.timer"
+  recovery_file="$active_source_dir/recovery.conf"
+  detect_git_recovery_metadata
 
   if [[ -e "$active_source_dir" || -L "$active_source_dir" ]]; then
     [[ -d "$active_source_dir" && ! -L "$active_source_dir" ]] || \
@@ -788,6 +1040,12 @@ run_install() {
   log "Source: $SOURCE_NAME"
   log "Source type: $SOURCE_TYPE"
   log "Active configuration: $active_source_dir"
+  if [[ -n "$RECOVERY_REPOSITORY_URL" ]]; then
+    log "Recovery repository: $RECOVERY_REPOSITORY_URL"
+  fi
+  if [[ -n "$RECOVERY_DEPLOY_COMMIT" ]]; then
+    log "Recovery commit: $RECOVERY_DEPLOY_COMMIT"
+  fi
   if [[ "$SOURCE_TYPE" == "postgres-compose" ]]; then
     require_command docker
     log "Staging directory: $STAGING_DIR"
@@ -827,6 +1085,7 @@ run_install() {
   install_file_atomic "$MANIFEST_DIR/paths" "$active_source_dir/paths" 0640
   install_file_atomic "$MANIFEST_DIR/excludes" "$active_source_dir/excludes" 0640
   install_file_atomic "$MANIFEST_DIR/freshness" "$active_source_dir/freshness" 0640
+  write_recovery_metadata_atomic "$recovery_file"
 
   if [[ "$SOURCE_TYPE" == "files-only" ]]; then
     systemctl disable --now "$timer_name" >/dev/null 2>&1 || true
@@ -989,6 +1248,337 @@ run_list() {
     listed=$((listed + 1))
   done
   ((listed > 0)) || log "No project backup sources installed"
+}
+
+run_recovery_list() {
+  local sources_root="$CONFIG_ROOT/backup/sources.d"
+  local source_dirs=()
+  local source_dir
+  local source_env
+  local recovery_file
+  local source_name
+  local source_type
+  local project_root
+  local repository_url
+  local deploy_commit
+  local listed=0
+
+  validate_absolute_path "$CONFIG_ROOT" "Configuration root"
+  [[ -e "$sources_root" ]] || {
+    log "No project backup sources installed"
+    return
+  }
+  [[ -d "$sources_root" && ! -L "$sources_root" ]] || \
+    fail "Invalid backup sources root: $sources_root"
+
+  printf 'NAME\tTYPE\tPROJECT_ROOT\tREPOSITORY_URL\tDEPLOY_COMMIT\n'
+  shopt -s nullglob
+  source_dirs=("$sources_root"/*)
+  shopt -u nullglob
+  for source_dir in "${source_dirs[@]}"; do
+    source_env="$source_dir/source.conf"
+    recovery_file="$source_dir/recovery.conf"
+    [[ -f "$source_env" && ! -L "$source_env" ]] || \
+      fail "Invalid installed source: $source_dir"
+    source_name="$(read_required_value "$source_env" "SOURCE_NAME")"
+    source_type="$(read_required_value "$source_env" "SOURCE_TYPE")"
+    project_root="$(read_required_value "$source_env" "PROJECT_ROOT")"
+    validate_source_name "$source_name"
+    case "$source_type" in
+      files-only | postgres-compose)
+        ;;
+      *)
+        fail "Unsupported SOURCE_TYPE=$source_type in $source_env"
+        ;;
+    esac
+    validate_absolute_path "$project_root" "Installed PROJECT_ROOT"
+    repository_url=""
+    deploy_commit=""
+    if [[ -e "$recovery_file" || -L "$recovery_file" ]]; then
+      validate_recovery_metadata_file "$recovery_file"
+      repository_url="$(read_optional_value "$recovery_file" "REPOSITORY_URL")"
+      deploy_commit="$(read_optional_value "$recovery_file" "DEPLOY_COMMIT")"
+    fi
+    [[ -n "$repository_url" ]] || repository_url="MISSING"
+    [[ -n "$deploy_commit" ]] || deploy_commit="MISSING"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$source_name" \
+      "$source_type" \
+      "$project_root" \
+      "$repository_url" \
+      "$deploy_commit"
+    listed=$((listed + 1))
+  done
+  ((listed > 0)) || log "No project backup sources installed"
+}
+
+resolve_installed_postgres_source() {
+  local active_source_dir
+  local active_source_env
+  local requested_source_name
+  local installed_source_name
+
+  if [[ -z "$SOURCE_NAME" ]]; then
+    use_default_manifest
+    load_manifest
+  else
+    validate_source_name "$SOURCE_NAME"
+  fi
+  requested_source_name="$SOURCE_NAME"
+
+  validate_absolute_path "$CONFIG_ROOT" "Configuration root"
+  active_source_dir="$CONFIG_ROOT/backup/sources.d/$requested_source_name"
+  active_source_env="$active_source_dir/source.conf"
+  [[ -d "$active_source_dir" && ! -L "$active_source_dir" ]] || \
+    fail "Installed project backup source not found: $requested_source_name"
+  [[ -f "$active_source_env" && ! -L "$active_source_env" ]] || \
+    fail "Installed source manifest not found: $active_source_env"
+
+  MANIFEST_DIR="$active_source_dir"
+  load_manifest
+  installed_source_name="$(
+    read_required_value "$active_source_env" "SOURCE_NAME"
+  )"
+  [[ "$installed_source_name" == "$requested_source_name" ]] || \
+    fail "Installed source name does not match its directory"
+  [[ "$SOURCE_TYPE" == "postgres-compose" ]] || \
+    fail "Project operation requires a PostgreSQL backup source: $SOURCE_NAME"
+
+  PROJECT_SERVICE_NAME="server-infra-backup-project-$SOURCE_NAME.service"
+  PROJECT_TIMER_NAME="server-infra-backup-project-$SOURCE_NAME.timer"
+}
+
+run_project_dump() {
+  resolve_installed_postgres_source
+  require_command systemctl
+
+  log "Starting PostgreSQL dump for $SOURCE_NAME"
+  systemctl start "$PROJECT_SERVICE_NAME"
+  ok "PostgreSQL dump completed: $SOURCE_NAME"
+}
+
+run_project_status() {
+  resolve_installed_postgres_source
+  require_command systemctl
+
+  systemctl status \
+    --no-pager \
+    --full \
+    "$PROJECT_SERVICE_NAME" \
+    "$PROJECT_TIMER_NAME"
+}
+
+run_project_logs() {
+  resolve_installed_postgres_source
+  require_command journalctl
+
+  journalctl \
+    --no-pager \
+    --unit "$PROJECT_SERVICE_NAME" \
+    --lines 100
+}
+
+validate_restore_database_name() {
+  local database_name="$1"
+
+  [[ "$database_name" =~ ^[a-z][a-z0-9_]*$ ]] || \
+    fail "Target database must use lowercase snake_case"
+  ((${#database_name} <= 63)) || \
+    fail "Target database must not exceed 63 characters"
+}
+
+build_restore_compose_args() {
+  RESTORE_COMPOSE_ARGS=(
+    compose
+    --project-directory "$PROJECT_ROOT"
+  )
+  if [[ -n "$COMPOSE_ENV_FILE" ]]; then
+    RESTORE_COMPOSE_ARGS+=(--env-file "$COMPOSE_ENV_FILE")
+  fi
+  RESTORE_COMPOSE_ARGS+=(-f "$COMPOSE_FILE")
+}
+
+cleanup_restore_database() {
+  local cleanup_target=""
+
+  if [[ -n "$RESTORE_CONTAINER_DUMP" ]]; then
+    docker "${RESTORE_COMPOSE_ARGS[@]}" \
+      exec -T "$COMPOSE_SERVICE" \
+      rm -f -- "$RESTORE_CONTAINER_DUMP" >/dev/null 2>&1 || \
+      warn "Unable to remove temporary dump from the PostgreSQL container"
+    RESTORE_CONTAINER_DUMP=""
+  fi
+
+  if [[ "$RESTORE_DB_CREATED" == "1" && "$RESTORE_DB_SUCCESS" != "1" ]]; then
+    docker "${RESTORE_COMPOSE_ARGS[@]}" \
+      exec -T "$COMPOSE_SERVICE" \
+      dropdb \
+      --username "$RESTORE_DATABASE_USER" \
+      --maintenance-db "$RESTORE_MAINTENANCE_DB" \
+      --if-exists \
+      "$RESTORE_TARGET_DB" >/dev/null 2>&1 || \
+      warn "Unable to remove incomplete target database: $RESTORE_TARGET_DB"
+  fi
+
+  if [[ -n "$RESTORE_WORK" ]]; then
+    cleanup_target="$RESTORE_WORK"
+    case "$cleanup_target" in
+      "${PROJECT_RESTORE_ROOT%/}/restore-db-$SOURCE_NAME-"*)
+        rm -rf -- "$cleanup_target" || \
+          warn "Unable to remove temporary restore directory: $cleanup_target"
+        ;;
+      *)
+        warn "Refusing to remove unexpected restore directory: $cleanup_target"
+        ;;
+    esac
+    RESTORE_WORK=""
+  fi
+}
+
+run_project_restore_database() {
+  local source_identity
+  local source_database
+  local database_exists
+  local restored_dump
+
+  [[ -n "$RESTORE_TARGET_DB" ]] || \
+    fail "restore-db requires --target-db"
+  validate_restore_database_name "$RESTORE_TARGET_DB"
+  [[ "$RESTORE_SNAPSHOT" == "latest" || \
+    "$RESTORE_SNAPSHOT" =~ ^[0-9a-f]{8,64}$ ]] || \
+    fail "Snapshot must be latest or an 8-64 character lowercase hex ID"
+  validate_positive_integer "$RESTORE_JOBS" "Restore jobs"
+  ((RESTORE_JOBS <= 32)) || fail "Restore jobs must not exceed 32"
+
+  resolve_installed_postgres_source
+  validate_runtime_inputs
+  validate_absolute_path "$PROJECT_RESTORE_ROOT" "Project restore root"
+  validate_no_symlink_components "$PROJECT_RESTORE_ROOT" "Project restore root"
+  [[ -x "$BACKUP_EXECUTABLE" ]] || \
+    fail "Backup restore executable not found: $BACKUP_EXECUTABLE"
+  require_command docker
+  require_command install
+  require_command mktemp
+  require_command rm
+  if [[ "${CONFIG_ROOT%/}" == "/etc/server-infra" ]]; then
+    [[ "$(uname -s)" == "Linux" ]] || fail "Production restore requires Linux"
+    [[ "$EUID" == "0" ]] || fail "Production restore requires root privileges"
+  fi
+
+  build_restore_compose_args
+  source_identity="$(
+    docker "${RESTORE_COMPOSE_ARGS[@]}" \
+      exec -T "$COMPOSE_SERVICE" \
+      sh -eu -c '
+        database_user="${POSTGRES_USER:-postgres}"
+        database_name="${POSTGRES_DB:-$database_user}"
+        printf "SERVER_INFRA_DB_USER=%s\n" "$database_user"
+        printf "SERVER_INFRA_DB_NAME=%s\n" "$database_name"
+      '
+  )"
+  RESTORE_DATABASE_USER="${source_identity%%$'\n'*}"
+  [[ "$RESTORE_DATABASE_USER" == SERVER_INFRA_DB_USER=* ]] || \
+    fail "Unable to determine the configured PostgreSQL user"
+  RESTORE_DATABASE_USER="${RESTORE_DATABASE_USER#SERVER_INFRA_DB_USER=}"
+  source_database="${source_identity#*$'\n'}"
+  [[ "$source_database" != "$source_identity" ]] || \
+    fail "Unable to determine the configured PostgreSQL database"
+  source_database="${source_database%%$'\n'*}"
+  [[ "$source_database" == SERVER_INFRA_DB_NAME=* ]] || \
+    fail "Unable to determine the configured PostgreSQL database"
+  source_database="${source_database#SERVER_INFRA_DB_NAME=}"
+  [[ -n "$RESTORE_DATABASE_USER" && -n "$source_database" ]] || \
+    fail "PostgreSQL user or database is empty"
+  [[ "$RESTORE_TARGET_DB" != "$source_database" ]] || \
+    fail "Target database must differ from the configured source database"
+
+  database_exists="$(
+    docker "${RESTORE_COMPOSE_ARGS[@]}" \
+      exec -T "$COMPOSE_SERVICE" \
+      psql \
+      --username "$RESTORE_DATABASE_USER" \
+      --dbname "$RESTORE_MAINTENANCE_DB" \
+      --tuples-only \
+      --no-align \
+      --set "target_db=$RESTORE_TARGET_DB" \
+      --command "SELECT 1 FROM pg_database WHERE datname = :'target_db';"
+  )"
+  [[ -z "${database_exists//[[:space:]]/}" ]] || \
+    fail "Target database already exists: $RESTORE_TARGET_DB"
+
+  if [[ "$EUID" == "0" ]]; then
+    install -d -o root -g root -m 0700 "$PROJECT_RESTORE_ROOT"
+  else
+    install -d -m 0700 "$PROJECT_RESTORE_ROOT"
+  fi
+  RESTORE_WORK="$(
+    mktemp -d \
+      "${PROJECT_RESTORE_ROOT%/}/restore-db-$SOURCE_NAME-XXXXXX"
+  )"
+  chmod 0700 "$RESTORE_WORK"
+  trap cleanup_restore_database EXIT
+
+  log "Restoring data snapshot $RESTORE_SNAPSHOT for $SOURCE_NAME"
+  "$BACKUP_EXECUTABLE" \
+    --config-root "$CONFIG_ROOT" \
+    restore \
+    --kind data \
+    --snapshot "$RESTORE_SNAPSHOT" \
+    --include "$STAGING_DIR/postgres.dump" \
+    --target "$RESTORE_WORK"
+
+  restored_dump="$RESTORE_WORK$STAGING_DIR/postgres.dump"
+  [[ -f "$restored_dump" && ! -L "$restored_dump" && -s "$restored_dump" ]] || \
+    fail "Restored PostgreSQL dump is missing or empty: $restored_dump"
+
+  RESTORE_CONTAINER_DUMP="$(
+    docker "${RESTORE_COMPOSE_ARGS[@]}" \
+      exec -T "$COMPOSE_SERVICE" \
+      sh -eu -c '
+        umask 077
+        mktemp "$1"
+      ' sh "/tmp/server-infra-restore-$SOURCE_NAME.XXXXXX"
+  )"
+  RESTORE_CONTAINER_DUMP="${RESTORE_CONTAINER_DUMP%%$'\n'*}"
+  [[ "$RESTORE_CONTAINER_DUMP" =~ \
+    ^/tmp/server-infra-restore-$SOURCE_NAME\.[a-zA-Z0-9]+$ ]] || \
+    fail "Container returned an unsafe temporary dump path"
+  docker "${RESTORE_COMPOSE_ARGS[@]}" \
+    exec -T "$COMPOSE_SERVICE" \
+    sh -eu -c '
+      dump_path="$1"
+      cat > "$dump_path"
+    ' sh "$RESTORE_CONTAINER_DUMP" < "$restored_dump"
+  docker "${RESTORE_COMPOSE_ARGS[@]}" \
+    exec -T "$COMPOSE_SERVICE" \
+    pg_restore --list "$RESTORE_CONTAINER_DUMP" >/dev/null
+
+  log "Creating isolated target database: $RESTORE_TARGET_DB"
+  docker "${RESTORE_COMPOSE_ARGS[@]}" \
+    exec -T "$COMPOSE_SERVICE" \
+    createdb \
+    --username "$RESTORE_DATABASE_USER" \
+    --maintenance-db "$RESTORE_MAINTENANCE_DB" \
+    --template template0 \
+    "$RESTORE_TARGET_DB"
+  RESTORE_DB_CREATED=1
+
+  log "Restoring PostgreSQL dump with $RESTORE_JOBS parallel jobs"
+  docker "${RESTORE_COMPOSE_ARGS[@]}" \
+    exec -T "$COMPOSE_SERVICE" \
+    pg_restore \
+    --exit-on-error \
+    --no-owner \
+    --no-acl \
+    --jobs "$RESTORE_JOBS" \
+    --username "$RESTORE_DATABASE_USER" \
+    --dbname "$RESTORE_TARGET_DB" \
+    "$RESTORE_CONTAINER_DUMP"
+
+  RESTORE_DB_SUCCESS=1
+  ok "PostgreSQL database restored: $RESTORE_TARGET_DB"
+  log "The configured source database was not changed: $source_database"
+  log "Validate the restored database before switching the application"
 }
 
 run_remove() {
@@ -1183,6 +1773,27 @@ parse_arguments() {
         HELPER_EXECUTABLE="$2"
         shift 2
         ;;
+      --target-db)
+        [[ "$OPERATION" == "restore-db" ]] || \
+          fail "--target-db is supported only by restore-db"
+        (($# >= 2)) || fail "Missing value for --target-db"
+        RESTORE_TARGET_DB="$2"
+        shift 2
+        ;;
+      --snapshot)
+        [[ "$OPERATION" == "restore-db" ]] || \
+          fail "--snapshot is supported only by restore-db"
+        (($# >= 2)) || fail "Missing value for --snapshot"
+        RESTORE_SNAPSHOT="$2"
+        shift 2
+        ;;
+      --jobs)
+        [[ "$OPERATION" == "restore-db" ]] || \
+          fail "--jobs is supported only by restore-db"
+        (($# >= 2)) || fail "Missing value for --jobs"
+        RESTORE_JOBS="$2"
+        shift 2
+        ;;
       --check)
         CHECK_ONLY=1
         shift
@@ -1205,8 +1816,7 @@ parse_arguments() {
     esac
   done
 
-  if [[ "$OPERATION" == "dump" ]]; then
-    [[ -n "$source_config" ]] || fail "dump requires --source-config"
+  if [[ "$OPERATION" == "dump" && -n "$source_config" ]]; then
     DUMP_SOURCE_CONFIG="$source_config"
   elif [[ -n "$source_config" ]]; then
     fail "--source-config is supported only by dump"
@@ -1247,13 +1857,33 @@ main() {
       parse_arguments "$@"
       run_list
       ;;
+    recovery-list)
+      parse_arguments "$@"
+      run_recovery_list
+      ;;
     remove)
       parse_arguments "$@"
       run_remove
       ;;
     dump)
       parse_arguments "$@"
-      run_dump "$DUMP_SOURCE_CONFIG"
+      if [[ -n "$DUMP_SOURCE_CONFIG" ]]; then
+        run_dump "$DUMP_SOURCE_CONFIG"
+      else
+        run_project_dump
+      fi
+      ;;
+    status)
+      parse_arguments "$@"
+      run_project_status
+      ;;
+    logs)
+      parse_arguments "$@"
+      run_project_logs
+      ;;
+    restore-db)
+      parse_arguments "$@"
+      run_project_restore_database
       ;;
     "")
       usage

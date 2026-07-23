@@ -18,20 +18,22 @@ usage() {
   cat <<'USAGE'
 Usage:
   scripts/deploy.sh <environment>
-  scripts/deploy.sh --config-root <absolute-path> --check
-  scripts/deploy.sh --config-root <absolute-path> --apply [--allow-new-project]
+  scripts/deploy.sh --check [--config-root <absolute-path>]
+  scripts/deploy.sh --apply [--config-root <absolute-path>] \
+    [--allow-new-project]
 
 Examples:
   scripts/deploy.sh prod-app
-  scripts/deploy.sh --config-root /etc/server-infra --check
-  scripts/deploy.sh --config-root /etc/server-infra --apply
+  scripts/deploy.sh --check
+  scripts/deploy.sh --apply
 
 The positional environment form is the legacy rollback path.
 
-The explicit config-root form requires exactly one operation:
+The operation form uses /etc/server-infra by default:
   --check  Run all validation without changing runtime state.
   --apply  Run the same preflight, then deploy.
 
+Use --config-root only for a non-standard configuration directory.
 By default, --apply requires every expected Compose project to exist already.
 Use --allow-new-project only when intentionally deploying a new Compose
 module.
@@ -514,7 +516,7 @@ deploy_external_environment() {
 }
 
 main() {
-  local config_root=""
+  local config_root="/etc/server-infra"
   local config_root_set=0
   local operation=""
   local allow_new_project=0
@@ -568,9 +570,10 @@ main() {
     esac
   done
 
-  if [[ "$config_root_set" == "1" ]]; then
+  if [[ -n "$operation" || "$config_root_set" == "1" || \
+    "$allow_new_project" == "1" ]]; then
     [[ -z "$environment_name" ]] || \
-      fail "Do not combine an environment name with --config-root"
+      fail "Do not combine an environment name with external deployment options"
     [[ -n "$operation" ]] || \
       fail "External configuration requires exactly one of --check or --apply"
     if [[ "$allow_new_project" == "1" && "$operation" != "apply" ]]; then
@@ -582,9 +585,6 @@ main() {
   fi
 
   [[ -n "$environment_name" ]] || { usage; exit 1; }
-  [[ -z "$operation" ]] || fail "--check and --apply require --config-root"
-  [[ "$allow_new_project" == "0" ]] || \
-    fail "--allow-new-project requires --config-root and --apply"
 
   require_command docker
   docker compose version >/dev/null || fail "Docker Compose is not available"
