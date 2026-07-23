@@ -4,10 +4,10 @@
 
 Accepted.
 
-Migration status: Phase 1 repository guardrails and Phase 2 explicit external
-configuration validation and deployment integration are implemented. CI
-wiring, a dedicated history secret scan, host preparation, and host cutover
-remain.
+Migration status: Phase 1 repository guardrails, Phase 2 explicit external
+configuration validation and deployment integration, and the Phase 3
+idempotent host-layout installer are implemented. CI wiring, a dedicated
+history secret scan, actual host preparation, and host cutover remain.
 
 ## Context
 
@@ -209,6 +209,11 @@ are written to temporary files, validated, assigned their final ownership and
 permissions, and atomically renamed into place.
 
 The old runtime files remain untouched.
+
+The repository provides `scripts/install.sh` for this phase. It requires an
+explicit `--check` or `--apply`, selects modules generically through metadata,
+and can install only `*.example` files. Apply requires Linux and root and uses
+the shared `/run/server-infra/operation.lock`.
 
 The initial proxy runtime file must account for every variable referenced by
 the deployed Caddyfile, including:

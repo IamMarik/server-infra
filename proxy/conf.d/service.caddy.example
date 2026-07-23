@@ -1,0 +1,7 @@
+# Target: /etc/server-infra/proxy/conf.d/<service>.caddy
+# Required permissions: root:root 0640
+# Replace the invalid domain and generic upstream before activation.
+
+service.example.invalid {
+	reverse_proxy service:3000
+}

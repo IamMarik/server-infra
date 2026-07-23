@@ -27,6 +27,30 @@ require_command() {
   command -v "$command_name" >/dev/null 2>&1 || fail "Required command not found: $command_name"
 }
 
+release_deployment_lock() {
+  if [[ -n "${DEPLOYMENT_LOCK_DIR:-}" && -d "$DEPLOYMENT_LOCK_DIR" ]]; then
+    rmdir "$DEPLOYMENT_LOCK_DIR" 2>/dev/null || \
+      warn "Unable to release deployment lock: $DEPLOYMENT_LOCK_DIR"
+  fi
+
+  DEPLOYMENT_LOCK_DIR=""
+}
+
+acquire_deployment_lock() {
+  local lock_root="${1:-/run/server-infra}"
+
+  [[ -d "$lock_root" ]] || fail "Runtime lock directory not found: $lock_root"
+  [[ ! -L "$lock_root" ]] || fail "Runtime lock directory must not be a symlink: $lock_root"
+
+  DEPLOYMENT_LOCK_DIR="$lock_root/operation.lock"
+
+  if ! mkdir "$DEPLOYMENT_LOCK_DIR" 2>/dev/null; then
+    fail "Another server-infra install or deployment is running"
+  fi
+
+  trap release_deployment_lock EXIT
+}
+
 parse_env_line() {
   local raw_line="$1"
   local source_name="$2"
@@ -117,6 +141,84 @@ read_env_value() {
   done < "$env_file"
 
   return 1
+}
+
+validate_relative_config_path() {
+  local relative_path="$1"
+
+  [[ -n "$relative_path" ]] || fail "Empty module configuration path"
+  [[ "$relative_path" != /* ]] || fail "Module configuration path must be relative"
+  [[ "$relative_path" != *".."* ]] || fail "Module configuration path must not contain .."
+  [[ "$relative_path" =~ ^[a-z0-9]([a-z0-9./-]*[a-z0-9])?$ ]] || \
+    fail "Invalid module configuration path: $relative_path"
+  [[ "$relative_path" != *"//"* ]] || \
+    fail "Invalid module configuration path: $relative_path"
+  [[ "/$relative_path/" != *"/."* ]] || \
+    fail "Hidden module configuration paths are not supported: $relative_path"
+}
+
+validate_config_root_path() {
+  local config_root="$1"
+  local normalized_root="${config_root%/}"
+
+  [[ "$config_root" == /* ]] || fail "--config-root must be an absolute path"
+  [[ "$config_root" != *".."* ]] || fail "--config-root must not contain .."
+  [[ "$config_root" != *"//"* ]] || fail "--config-root must not contain //"
+
+  case "$normalized_root" in
+    "" | / | /etc | /var | /run | /usr | /opt | /root | /home | /tmp)
+      fail "Refusing unsafe configuration root: $config_root"
+      ;;
+  esac
+}
+
+managed_path_mode() {
+  local managed_path="$1"
+
+  case "$(uname -s)" in
+    Linux)
+      stat -c '%a' "$managed_path"
+      ;;
+    Darwin)
+      stat -f '%Lp' "$managed_path"
+      ;;
+    *)
+      fail "Unsupported platform for permission validation"
+      ;;
+  esac
+}
+
+validate_managed_path() {
+  local managed_path="$1"
+  local expected_type="$2"
+  local expected_mode="${3#0}"
+  local actual_mode
+  local actual_owner
+
+  [[ ! -L "$managed_path" ]] || \
+    fail "Managed path must not be a symlink: $managed_path"
+
+  case "$expected_type" in
+    directory)
+      [[ -d "$managed_path" ]] || fail "Managed directory not found: $managed_path"
+      ;;
+    file)
+      [[ -f "$managed_path" ]] || fail "Managed file not found: $managed_path"
+      ;;
+    *)
+      fail "Unknown managed path type: $expected_type"
+      ;;
+  esac
+
+  actual_mode="$(managed_path_mode "$managed_path")"
+  [[ "$actual_mode" == "$expected_mode" ]] || \
+    fail "Expected mode 0$expected_mode for $managed_path; found 0$actual_mode"
+
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    actual_owner="$(stat -c '%U:%G' "$managed_path")"
+    [[ "$actual_owner" == "root:root" ]] || \
+      fail "Expected owner root:root for $managed_path; found $actual_owner"
+  fi
 }
 
 require_environment() {

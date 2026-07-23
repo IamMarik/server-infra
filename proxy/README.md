@@ -30,13 +30,13 @@ The target host-owned route fragments belong in:
 The tracked Caddyfile is temporarily preserved during migration. Concrete
 domains and application upstreams must move to host-owned route fragments.
 
-The legacy deployment command still reads:
+The legacy rollback command still reads:
 
 ```text
 environments/<environment>/proxy/config.env
 ```
 
-until the explicit external configuration mode is implemented.
+during the migration window.
 
 Reusable native Caddy configuration lives in:
 
@@ -46,10 +46,22 @@ proxy/Caddyfile
 
 ## Deployment
 
-This module is deployed through the environment deploy script:
+Prepare the host layout without changing services:
+
+```bash
+scripts/install.sh --module proxy --check
+```
+
+The legacy rollback deployment remains:
 
 ```bash
 scripts/deploy.sh prod-app
+```
+
+The external deployment preflight is:
+
+```bash
+scripts/deploy.sh --config-root /etc/server-infra --check
 ```
 
 ## Operations

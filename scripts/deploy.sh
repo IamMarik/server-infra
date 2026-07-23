@@ -203,6 +203,7 @@ deploy_external_environment() {
     return
   fi
 
+  acquire_deployment_lock "/run/server-infra"
   ensure_docker_network "server-infra"
 
   for module_name in "${EXTERNAL_MODULES[@]}"; do

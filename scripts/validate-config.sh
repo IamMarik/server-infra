@@ -64,11 +64,15 @@ read_active_value() {
 
 validate_server_config() {
   local server_file="$CONFIG_ROOT/server.env"
+  local modules_file="$CONFIG_ROOT/modules.env"
   local config_version
   local instance
   local environment
   local timezone
 
+  validate_managed_path "$CONFIG_ROOT" directory 0750
+  validate_managed_path "$server_file" file 0640
+  validate_managed_path "$modules_file" file 0640
   validate_env_file "$server_file"
 
   config_version="$(read_active_value "$server_file" "SERVER_INFRA_CONFIG_VERSION")"
@@ -98,32 +102,65 @@ validate_module_runtime() {
   local runtime_file="$CONFIG_ROOT/$module_name/runtime.env"
   local description
   local module_version
+  local module_driver
   local required_env
+  local runtime_mode
+  local config_dirs
   local required_keys=()
+  local config_paths=()
   local required_key
+  local config_path
   local seen_required_keys=$'\n'
 
   [[ -d "$module_dir" ]] || fail "Module directory not found: $module_name"
   [[ -f "$manifest_file" ]] || fail "Module manifest not found: $manifest_file"
-  [[ -f "$module_dir/docker-compose.yml" ]] || \
-    fail "Compose file not found for module: $module_name"
 
   validate_env_file "$manifest_file"
   description="$(read_declared_value "$manifest_file" "MODULE_DESCRIPTION")"
   module_version="$(read_declared_value "$manifest_file" "MODULE_VERSION")"
+  module_driver="$(read_declared_value "$manifest_file" "MODULE_DRIVER")"
   required_env="$(read_declared_value "$manifest_file" "REQUIRED_ENV")"
+  runtime_mode="$(read_declared_value "$manifest_file" "RUNTIME_ENV_MODE")"
+  config_dirs="$(read_declared_value "$manifest_file" "REQUIRED_CONFIG_DIRS")"
 
   [[ -n "$description" ]] || fail "MODULE_DESCRIPTION is empty for $module_name"
   [[ "$module_version" =~ ^[0-9]+$ ]] || \
     fail "MODULE_VERSION must be numeric for $module_name"
+  [[ "$runtime_mode" == "0600" || "$runtime_mode" == "0640" ]] || \
+    fail "RUNTIME_ENV_MODE must be 0600 or 0640 for $module_name"
+
+  case "$module_driver" in
+    compose)
+      [[ -f "$module_dir/docker-compose.yml" ]] || \
+        fail "Compose file not found for module: $module_name"
+      ;;
+    host)
+      ;;
+    *)
+      fail "Unsupported MODULE_DRIVER for $module_name: $module_driver"
+      ;;
+  esac
+
+  validate_managed_path "$CONFIG_ROOT/$module_name" directory 0750
+
+  if [[ -n "$config_dirs" ]]; then
+    read -r -a config_paths <<< "$config_dirs"
+    for config_path in "${config_paths[@]}"; do
+      validate_relative_config_path "$config_path"
+      validate_managed_path \
+        "$CONFIG_ROOT/$module_name/$config_path" directory 0750
+    done
+  fi
 
   if [[ -n "$required_env" ]]; then
     read -r -a required_keys <<< "$required_env"
   fi
 
   if ((${#required_keys[@]} > 0)); then
+    validate_managed_path "$runtime_file" file "$runtime_mode"
     validate_env_file "$runtime_file"
   elif [[ -f "$runtime_file" ]]; then
+    validate_managed_path "$runtime_file" file "$runtime_mode"
     validate_env_file "$runtime_file"
   fi
 
@@ -194,7 +231,8 @@ parse_arguments() {
 main() {
   parse_arguments "$@"
 
-  [[ "$CONFIG_ROOT" == /* ]] || fail "--config-root must be an absolute path"
+  require_command stat
+  validate_config_root_path "$CONFIG_ROOT"
   [[ -d "$CONFIG_ROOT" ]] || fail "Configuration root not found: $CONFIG_ROOT"
 
   validate_server_config

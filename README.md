@@ -91,6 +91,19 @@ in `SERVER_INFRA_INSTANCE` cannot silently create new empty named volumes.
 `--allow-new-project` is reserved for intentional first deployment of a new
 module.
 
+Preview host layout preparation for the proxy:
+
+```bash
+./scripts/install.sh --module proxy --check
+```
+
+On the Linux host, apply creates only directories and optional `*.example`
+files. It never creates active runtime files or secrets:
+
+```bash
+sudo ./scripts/install.sh --module proxy --apply --install-examples
+```
+
 ## Documentation
 
 - `ARCHITECTURE.md` explains the system model.

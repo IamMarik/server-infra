@@ -50,6 +50,7 @@ check_required_examples() {
     "server.env.example"
     "modules.env.example"
     "proxy/runtime.env.example"
+    "proxy/conf.d/service.caddy.example"
   )
   local example_path
   local missing=0
