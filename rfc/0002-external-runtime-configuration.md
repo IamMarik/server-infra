@@ -4,9 +4,10 @@
 
 Accepted.
 
-Migration status: Phase 1 repository guardrails and the Phase 2 read-only
-external configuration preflight are implemented. CI wiring, a dedicated
-history secret scan, deployment integration, and host cutover remain.
+Migration status: Phase 1 repository guardrails and Phase 2 explicit external
+configuration validation and deployment integration are implemented. CI
+wiring, a dedicated history secret scan, host preparation, and host cutover
+remain.
 
 ## Context
 
@@ -166,10 +167,15 @@ The configuration reader must:
 
 The legacy mode remains available only for the rollback window.
 
-The repository provides `scripts/validate-config.sh` as the first Phase 2
-deliverable. It validates an explicit external configuration root without
-executing configuration files or changing Docker and services. Deployment
-scripts do not use the external configuration yet.
+The repository provides `scripts/validate-config.sh` for read-only
+configuration validation. `scripts/deploy.sh --config-root ... --check` adds
+Compose resolution without runtime changes. External deployment is enabled
+only by an explicit `--config-root ... --apply`; the positional environment
+mode remains the rollback path.
+
+External apply also requires the expected Compose project to exist. An
+explicit `--allow-new-project` is required for an intentional first deployment
+of a new module and must not be used for the initial proxy migration.
 
 The current Compose expression:
 

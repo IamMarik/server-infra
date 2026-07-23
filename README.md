@@ -71,6 +71,26 @@ host:
 ./scripts/validate-config.sh --config-root /etc/server-infra
 ```
 
+Run the complete deployment preflight, including Docker Compose resolution,
+without changing runtime state:
+
+```bash
+./scripts/deploy.sh --config-root /etc/server-infra --check
+```
+
+External deployment remains opt-in during migration. The positional
+environment command is retained as the explicit rollback path. Applying
+external configuration requires an additional explicit operation:
+
+```bash
+./scripts/deploy.sh --config-root /etc/server-infra --apply
+```
+
+For migration, apply requires the expected Compose project to exist so a typo
+in `SERVER_INFRA_INSTANCE` cannot silently create new empty named volumes.
+`--allow-new-project` is reserved for intentional first deployment of a new
+module.
+
 ## Documentation
 
 - `ARCHITECTURE.md` explains the system model.
