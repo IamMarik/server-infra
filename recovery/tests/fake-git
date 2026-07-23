@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+printf '%s\n' "$*" >> "$FAKE_GIT_LOG"
+
+git_root=""
+if [[ "${1:-}" == "-C" ]]; then
+  git_root="$2"
+  shift 2
+fi
+
+if [[ "$git_root" == "$FAKE_INFRA_ROOT" ]]; then
+  case "$*" in
+    "rev-parse --is-inside-work-tree")
+      printf '%s\n' "true"
+      ;;
+    "remote get-url origin")
+      printf '%s\n' "$FAKE_INFRA_REPOSITORY_URL"
+      ;;
+    "rev-parse HEAD")
+      printf '%s\n' "$FAKE_INFRA_DEPLOY_COMMIT"
+      ;;
+    "status --porcelain --untracked-files=no")
+      ;;
+    *)
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "${1:-}" == "clone" ]]; then
+  clone_url="${*: -2:1}"
+  clone_target="${*: -1}"
+  [[ "$clone_url" == "$FAKE_PROJECT_REPOSITORY_URL" ]]
+  mkdir -p "$clone_target/.git"
+  printf '%s\n' "$clone_url" > "$clone_target/.git/fake-origin"
+  exit 0
+fi
+
+[[ -n "$git_root" && -d "$git_root/.git" ]]
+case "$*" in
+  "rev-parse --is-inside-work-tree")
+    printf '%s\n' "true"
+    ;;
+  "remote get-url origin")
+    cat "$git_root/.git/fake-origin"
+    ;;
+  "rev-parse HEAD")
+    cat "$git_root/.git/fake-head"
+    ;;
+  "status --porcelain --untracked-files=no")
+    ;;
+  "fetch --no-tags origin $FAKE_PROJECT_DEPLOY_COMMIT")
+    ;;
+  "-c core.hooksPath=/dev/null checkout --detach $FAKE_PROJECT_DEPLOY_COMMIT")
+    printf '%s\n' "$FAKE_PROJECT_DEPLOY_COMMIT" \
+      > "$git_root/.git/fake-head"
+    mkdir -p "$git_root/.server-infra/backup"
+    printf '%s\n' "SOURCE_VERSION=1" \
+      > "$git_root/.server-infra/backup/source.conf"
+    ;;
+  *)
+    exit 1
+    ;;
+esac

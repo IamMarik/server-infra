@@ -28,6 +28,7 @@ RESTORE_SNAPSHOT="latest"
 RESTORE_KIND=""
 RESTORE_INCLUDE=""
 RESTORE_TEST_TARGET=""
+ALLOW_MISSING_PROJECT_PATHS=0
 DATA_PATHS=()
 PATHS_FILES=()
 EXCLUDES_FILES=()
@@ -36,7 +37,8 @@ FRESHNESS_FILES=()
 usage() {
   cat <<'USAGE'
 Usage:
-  server-infra-backup [--config-root <absolute-path>] validate
+  server-infra-backup [--config-root <absolute-path>] \
+    validate [--allow-missing-project-paths]
   server-infra-backup [--config-root <absolute-path>] init
   server-infra-backup [--config-root <absolute-path>] run
   server-infra-backup [--config-root <absolute-path>] retention
@@ -52,6 +54,8 @@ Usage:
 
 Operations:
   validate   Validate configuration without contacting remote services.
+             --allow-missing-project-paths skips only project checkout,
+             Compose file, and Docker availability checks during VM recovery.
   init       Explicitly initialize the configured restic repository.
   run        Create configuration and data snapshots, then optionally retain.
   retention  Apply the configured retention policy explicitly.
@@ -303,8 +307,10 @@ validate_source_manifest() {
   [[ "$source_name" == "$expected_name" ]] || \
     fail "SOURCE_NAME must match its sources.d directory: $expected_name"
   validate_absolute_path "$project_root" "PROJECT_ROOT in $manifest_file"
-  [[ -d "$project_root" && ! -L "$project_root" ]] || \
-    fail "Project root not found for backup source $source_name"
+  if [[ "$ALLOW_MISSING_PROJECT_PATHS" != "1" ]]; then
+    [[ -d "$project_root" && ! -L "$project_root" ]] || \
+      fail "Project root not found for backup source $source_name"
+  fi
 
   case "$source_type" in
     postgres-compose)
@@ -339,14 +345,16 @@ validate_source_manifest() {
       validate_absolute_path "$staging_dir" "STAGING_DIR in $manifest_file"
       [[ "${staging_dir##*/}" == "$source_name" ]] || \
         fail "STAGING_DIR must end with SOURCE_NAME in $manifest_file"
-      [[ -f "$compose_file" && ! -L "$compose_file" ]] || \
-        fail "Compose file not found for backup source $source_name"
-      if [[ -n "$compose_env_file" ]]; then
-        [[ -f "$compose_env_file" && ! -L "$compose_env_file" ]] || \
-          fail "Compose env file not found for backup source $source_name"
+      if [[ "$ALLOW_MISSING_PROJECT_PATHS" != "1" ]]; then
+        [[ -f "$compose_file" && ! -L "$compose_file" ]] || \
+          fail "Compose file not found for backup source $source_name"
+        if [[ -n "$compose_env_file" ]]; then
+          [[ -f "$compose_env_file" && ! -L "$compose_env_file" ]] || \
+            fail "Compose env file not found for backup source $source_name"
+        fi
+        command -v docker >/dev/null 2>&1 || \
+          fail "Docker is required by PostgreSQL backup source $source_name"
       fi
-      command -v docker >/dev/null 2>&1 || \
-        fail "Docker is required by PostgreSQL backup source $source_name"
 
       grep -F -x -- "$staging_dir" "$source_dir/paths" >/dev/null || \
         fail "Source paths must include STAGING_DIR for $source_name"
@@ -1135,6 +1143,7 @@ parse_arguments() {
   local restore_snapshot_set=0
   local restore_kind_set=0
   local restore_include_set=0
+  local allow_missing_project_paths_set=0
 
   while (($# > 0)); do
     case "$1" in
@@ -1218,6 +1227,13 @@ parse_arguments() {
         restore_include_set=1
         shift
         ;;
+      --allow-missing-project-paths)
+        [[ "$allow_missing_project_paths_set" == "0" ]] || \
+          fail "--allow-missing-project-paths may be specified only once"
+        ALLOW_MISSING_PROJECT_PATHS=1
+        allow_missing_project_paths_set=1
+        shift
+        ;;
       --help | -h)
         usage
         exit 0
@@ -1273,6 +1289,10 @@ main() {
     (-n "$RESTORE_TARGET" || "$RESTORE_SNAPSHOT" != "latest" || \
     -n "$RESTORE_KIND" || -n "$RESTORE_INCLUDE") ]]; then
     fail "Restore options are supported only by the restore operation"
+  fi
+  if [[ "$OPERATION" != "validate" && \
+    "$ALLOW_MISSING_PROJECT_PATHS" == "1" ]]; then
+    fail "--allow-missing-project-paths is supported only by validate"
   fi
 
   case "$OPERATION" in

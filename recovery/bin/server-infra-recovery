@@ -16,10 +16,13 @@ WORK_ROOT="/var/cache/server-infra/recovery"
 OPERATION=""
 BREAK_GLASS_FILE=""
 SNAPSHOT_ID=""
+PROJECT_NAME=""
+GIT_USER=""
 TEMP_FILE=""
 LOCK_DIR=""
 RESTORE_TARGET=""
 INSTALL_TEMP=""
+PROJECT_CLONE_TEMP=""
 CONFIG_INSTALLED_BY_RUN=0
 
 recovery_log() {
@@ -52,6 +55,13 @@ Usage:
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] \
     select-data --break-glass <absolute-path> --snapshot <exact-id>
+  server-infra-recovery [--state-root <absolute-path>] \
+    [--config-root <absolute-path>] \
+    projects-plan --break-glass <absolute-path>
+  server-infra-recovery [--state-root <absolute-path>] \
+    [--config-root <absolute-path>] \
+    clone-project --break-glass <absolute-path> \
+    --name <source-name> --git-user <ordinary-user>
 
 Operations:
   init
@@ -71,9 +81,14 @@ Operations:
     List data snapshots after configuration recovery is complete.
   select-data
     Verify and pin one data snapshot for every project in this recovery.
+  projects-plan
+    Validate and print the recovered project Git inventory.
+  clone-project
+    Clone one project as an ordinary user and detach it at the recorded commit.
 
-The implementation does not yet restore project files or databases, deploy
-infrastructure, or start traffic. Follow backup/RECOVERY.md for those phases.
+The implementation does not yet restore project files or databases, install
+project backup sources, deploy infrastructure, or start traffic. Follow
+backup/RECOVERY.md for those phases.
 
 Defaults to:
   --state-root /var/lib/server-infra/recovery
@@ -141,6 +156,22 @@ file_owner_id() {
   esac
 }
 
+file_group_id() {
+  local file_path="$1"
+
+  case "$(uname -s)" in
+    Linux)
+      stat -c '%g' "$file_path"
+      ;;
+    Darwin)
+      stat -f '%g' "$file_path"
+      ;;
+    *)
+      fail "Unsupported platform for ownership validation"
+      ;;
+  esac
+}
+
 is_placeholder_value() {
   local value="$1"
 
@@ -187,6 +218,33 @@ validate_repository_url() {
         fail "Git repository URL must not contain embedded credentials"
     fi
   fi
+}
+
+validate_source_name() {
+  local source_name="$1"
+
+  [[ "$source_name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
+    fail "Project source name must use lowercase kebab-case"
+}
+
+validate_deploy_commit() {
+  local deploy_commit="$1"
+
+  [[ "$deploy_commit" =~ ^[0-9a-f]{40}$ || \
+    "$deploy_commit" =~ ^[0-9a-f]{64}$ ]] || \
+    fail "Project deploy commit must be a full lowercase object ID"
+}
+
+validate_git_user() {
+  local git_user="$1"
+  local git_uid
+
+  [[ "$git_user" =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || \
+    fail "Git user has an invalid account name"
+  git_uid="$(id -u "$git_user" 2>/dev/null)" || \
+    fail "Git user does not exist: $git_user"
+  [[ "$git_uid" != "0" ]] || \
+    fail "Project Git operations must not run as root"
 }
 
 validate_state_root() {
@@ -604,6 +662,14 @@ acquire_recovery_lock() {
 cleanup() {
   local cleanup_status=0
 
+  if [[ -n "$PROJECT_CLONE_TEMP" && -d "$PROJECT_CLONE_TEMP" && \
+    -n "${RECOVERY_SESSION_ID:-}" && \
+    "$PROJECT_CLONE_TEMP" == */.*.recovery-"$RECOVERY_SESSION_ID" && \
+    ! -L "$PROJECT_CLONE_TEMP" ]]; then
+    rm -rf -- "$PROJECT_CLONE_TEMP"
+  fi
+  PROJECT_CLONE_TEMP=""
+
   if [[ "$CONFIG_INSTALLED_BY_RUN" == "1" && \
     -n "$CONFIG_ROOT" && -d "$CONFIG_ROOT" && \
     -n "$INSTALL_TEMP" && ! -e "$INSTALL_TEMP" ]]; then
@@ -881,7 +947,10 @@ validate_recovered_configuration() {
 validate_live_configuration() {
   validate_recovered_configuration "$CONFIG_ROOT"
   "$REPOSITORY_ROOT/backup/bin/server-infra-backup" \
-    --config-root "$CONFIG_ROOT" validate >/dev/null
+    --config-root "$CONFIG_ROOT" \
+    validate --allow-missing-project-paths >/dev/null
+  "$REPOSITORY_ROOT/backup/bin/server-infra-backup" \
+    project recovery-list --config-root "$CONFIG_ROOT" >/dev/null
 }
 
 run_config_snapshots() {
@@ -1067,6 +1136,310 @@ run_select_data() {
   recovery_ok "data snapshot selected for every project: $SNAPSHOT_ID"
 }
 
+validate_projects_phase_ready() {
+  validate_configuration_phase_complete
+  [[ "$RECOVERY_PHASE_DATA" == "complete" ]] || \
+    fail "An exact data snapshot must be selected before project recovery"
+  [[ -n "$RECOVERY_DATA_SNAPSHOT" ]] || \
+    fail "Completed data phase is missing its snapshot ID"
+}
+
+load_project_record() {
+  local source_dir="$1"
+  local source_file="$source_dir/source.conf"
+  local recovery_file="$source_dir/recovery.conf"
+  local allowed_recovery_keys=$'\nRECOVERY_VERSION\nREPOSITORY_URL\nDEPLOY_COMMIT\n'
+  local seen_recovery_keys=$'\n'
+  local line=""
+  local line_number=0
+  local recovery_version
+  local project_config_file
+
+  [[ -d "$source_dir" && ! -L "$source_dir" ]] || \
+    fail "Project source is not a regular directory: $source_dir"
+  [[ "$(file_mode "$source_dir")" == "750" ]] || \
+    fail "Project source directory must have mode 0750: $source_dir"
+  [[ "$(file_owner_id "$source_dir")" == "$(id -u)" && \
+    "$(file_group_id "$source_dir")" == "$(id -g)" ]] || \
+    fail "Project source directory has unexpected ownership: $source_dir"
+  for project_config_file in \
+    "$source_file" \
+    "$source_dir/paths" \
+    "$source_dir/excludes" \
+    "$source_dir/freshness" \
+    "$recovery_file"; do
+    [[ -f "$project_config_file" && ! -L "$project_config_file" ]] || \
+      fail "Project recovery file is missing or unsafe: $project_config_file"
+    [[ "$(file_mode "$project_config_file")" == "640" ]] || \
+      fail "Project recovery file must have mode 0640: $project_config_file"
+    [[ "$(file_owner_id "$project_config_file")" == "$(id -u)" && \
+      "$(file_group_id "$project_config_file")" == "$(id -g)" ]] || \
+      fail "Project recovery file has unexpected ownership: $project_config_file"
+  done
+  validate_env_file "$recovery_file"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    parse_env_line "$line" "$recovery_file" "$line_number"
+    [[ "$PARSED_ENV_KIND" == "assignment" ]] || continue
+    [[ "$allowed_recovery_keys" == \
+      *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Unknown key $PARSED_ENV_KEY in $recovery_file"
+    [[ "$seen_recovery_keys" != \
+      *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Duplicate key $PARSED_ENV_KEY in $recovery_file"
+    seen_recovery_keys+="$PARSED_ENV_KEY"$'\n'
+  done < "$recovery_file"
+
+  SELECTED_PROJECT_NAME="$(
+    read_required_env_value "$source_file" "SOURCE_NAME"
+  )"
+  SELECTED_PROJECT_TYPE="$(
+    read_required_env_value "$source_file" "SOURCE_TYPE"
+  )"
+  SELECTED_PROJECT_ROOT="$(
+    read_required_env_value "$source_file" "PROJECT_ROOT"
+  )"
+  recovery_version="$(
+    read_required_env_value "$recovery_file" "RECOVERY_VERSION"
+  )"
+  SELECTED_PROJECT_REPOSITORY_URL="$(
+    read_required_env_value "$recovery_file" "REPOSITORY_URL"
+  )"
+  SELECTED_PROJECT_DEPLOY_COMMIT="$(
+    read_required_env_value "$recovery_file" "DEPLOY_COMMIT"
+  )"
+
+  [[ "$SELECTED_PROJECT_NAME" == "${source_dir##*/}" ]] || \
+    fail "Project source directory does not match SOURCE_NAME"
+  validate_source_name "$SELECTED_PROJECT_NAME"
+  case "$SELECTED_PROJECT_TYPE" in
+    files-only | postgres-compose)
+      ;;
+    *)
+      fail "Unsupported project source type: $SELECTED_PROJECT_TYPE"
+      ;;
+  esac
+  validate_absolute_path "$SELECTED_PROJECT_ROOT" "Project root"
+  validate_no_symlink_components "$SELECTED_PROJECT_ROOT" "Project root"
+  case "${SELECTED_PROJECT_ROOT%/}" in
+    "" | / | /etc | /opt | /srv | /home | /root | /usr | /var)
+      fail "Refusing unsafe project root: $SELECTED_PROJECT_ROOT"
+      ;;
+  esac
+  ! paths_overlap "$SELECTED_PROJECT_ROOT" "$CONFIG_ROOT" || \
+    fail "Project root must not overlap active configuration"
+  ! paths_overlap "$SELECTED_PROJECT_ROOT" "$STATE_ROOT" || \
+    fail "Project root must not overlap recovery state"
+  ! paths_overlap "$SELECTED_PROJECT_ROOT" "$REPOSITORY_ROOT" || \
+    fail "Project root must not overlap the server-infra repository"
+
+  [[ "$recovery_version" == "1" ]] || \
+    fail "Unsupported RECOVERY_VERSION in $recovery_file"
+  validate_repository_url "$SELECTED_PROJECT_REPOSITORY_URL"
+  validate_deploy_commit "$SELECTED_PROJECT_DEPLOY_COMMIT"
+}
+
+discover_project_inventory() {
+  local sources_root="$CONFIG_ROOT/backup/sources.d"
+  local source_dirs=()
+  local source_dir
+  local seen_names=$'\n'
+  local seen_roots=$'\n'
+
+  [[ -d "$sources_root" && ! -L "$sources_root" ]] || \
+    fail "No recovered project inventory found at $sources_root"
+
+  shopt -s nullglob
+  source_dirs=("$sources_root"/*)
+  shopt -u nullglob
+  ((${#source_dirs[@]} > 0)) || \
+    fail "Recovered project inventory is empty"
+
+  for source_dir in "${source_dirs[@]}"; do
+    load_project_record "$source_dir"
+    [[ "$seen_names" != *$'\n'"$SELECTED_PROJECT_NAME"$'\n'* ]] || \
+      fail "Duplicate project name in recovered inventory"
+    [[ "$seen_roots" != *$'\n'"$SELECTED_PROJECT_ROOT"$'\n'* ]] || \
+      fail "Duplicate project root in recovered inventory"
+    seen_names+="$SELECTED_PROJECT_NAME"$'\n'
+    seen_roots+="$SELECTED_PROJECT_ROOT"$'\n'
+  done
+}
+
+select_project_record() {
+  local source_dir="$CONFIG_ROOT/backup/sources.d/$PROJECT_NAME"
+
+  validate_source_name "$PROJECT_NAME"
+  load_project_record "$source_dir"
+  [[ "$SELECTED_PROJECT_NAME" == "$PROJECT_NAME" ]] || \
+    fail "Selected project does not match its recovered source"
+}
+
+run_git_as_user() {
+  local target_uid
+  local git_environment=(
+    "GIT_TERMINAL_PROMPT=0"
+    "GIT_SSH_COMMAND=ssh -o BatchMode=yes"
+  )
+
+  target_uid="$(id -u "$GIT_USER")"
+  if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+    validate_absolute_path "$SSH_AUTH_SOCK" "SSH agent socket"
+    [[ -S "$SSH_AUTH_SOCK" ]] || \
+      fail "SSH_AUTH_SOCK does not point to a socket"
+    git_environment+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+  fi
+
+  if [[ "$(id -u)" == "$target_uid" ]]; then
+    env "${git_environment[@]}" git "$@"
+  else
+    [[ "$(id -u)" == "0" ]] || \
+      fail "Changing to the Git user requires root"
+    require_command sudo
+    sudo -H -u "$GIT_USER" -- env "${git_environment[@]}" git "$@"
+  fi
+}
+
+validate_project_checkout() {
+  local project_root="$1"
+  local current_url
+  local current_ref
+
+  [[ -d "$project_root" && ! -L "$project_root" ]] || \
+    fail "Project checkout is not a regular directory: $project_root"
+  [[ "$(file_owner_id "$project_root")" == "$(id -u "$GIT_USER")" ]] || \
+    fail "Project checkout does not belong to $GIT_USER"
+  run_git_as_user -C "$project_root" \
+    rev-parse --is-inside-work-tree >/dev/null 2>&1 || \
+    fail "Project root is not a Git checkout: $project_root"
+  current_url="$(
+    run_git_as_user -C "$project_root" remote get-url origin
+  )" || fail "Unable to read project origin: $project_root"
+  current_ref="$(
+    run_git_as_user -C "$project_root" rev-parse HEAD
+  )" || fail "Unable to read project commit: $project_root"
+  [[ "$current_url" == "$SELECTED_PROJECT_REPOSITORY_URL" ]] || \
+    fail "Existing project origin differs from recovered inventory"
+  [[ "$current_ref" == "$SELECTED_PROJECT_DEPLOY_COMMIT" ]] || \
+    fail "Existing project commit differs from recovered inventory"
+  [[ -z "$(
+    run_git_as_user -C "$project_root" \
+      status --porcelain --untracked-files=no
+  )" ]] || fail "Existing project has modified tracked files"
+}
+
+run_projects_plan() {
+  local sources_root
+  local source_dirs=()
+  local source_dir
+  local checkout_state
+
+  load_recovery_context
+  validate_projects_phase_ready
+  discover_project_inventory
+  sources_root="$CONFIG_ROOT/backup/sources.d"
+  shopt -s nullglob
+  source_dirs=("$sources_root"/*)
+  shopt -u nullglob
+
+  printf 'NAME\tTYPE\tCHECKOUT\tPROJECT_ROOT\tREPOSITORY_URL\tDEPLOY_COMMIT\tDATA_SNAPSHOT\n'
+  for source_dir in "${source_dirs[@]}"; do
+    load_project_record "$source_dir"
+    checkout_state="absent"
+    if [[ -e "$SELECTED_PROJECT_ROOT" || -L "$SELECTED_PROJECT_ROOT" ]]; then
+      checkout_state="present"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$SELECTED_PROJECT_NAME" \
+      "$SELECTED_PROJECT_TYPE" \
+      "$checkout_state" \
+      "$SELECTED_PROJECT_ROOT" \
+      "$SELECTED_PROJECT_REPOSITORY_URL" \
+      "$SELECTED_PROJECT_DEPLOY_COMMIT" \
+      "$RECOVERY_DATA_SNAPSHOT"
+  done
+}
+
+run_clone_project() {
+  local project_parent
+  local project_basename
+  local target_uid
+  local target_gid
+
+  [[ -n "$PROJECT_NAME" ]] || fail "clone-project requires --name"
+  [[ -n "$GIT_USER" ]] || fail "clone-project requires --git-user"
+  validate_git_user "$GIT_USER"
+  load_recovery_context
+  validate_projects_phase_ready
+  discover_project_inventory
+  select_project_record
+  require_command git
+  require_command mv
+
+  acquire_recovery_lock
+  trap cleanup EXIT
+  validate_state_file
+
+  if [[ "$RECOVERY_PHASE_PROJECTS" == "pending" ]]; then
+    RECOVERY_PHASE_PROJECTS="in-progress"
+    write_state_file
+  else
+    [[ "$RECOVERY_PHASE_PROJECTS" == "in-progress" ]] || \
+      fail "Project cloning is not allowed after project recovery is complete"
+  fi
+
+  if [[ -e "$SELECTED_PROJECT_ROOT" || -L "$SELECTED_PROJECT_ROOT" ]]; then
+    validate_project_checkout "$SELECTED_PROJECT_ROOT"
+    recovery_ok \
+      "project checkout already matches recovered inventory: $PROJECT_NAME"
+    return
+  fi
+
+  project_parent="${SELECTED_PROJECT_ROOT%/*}"
+  project_basename="${SELECTED_PROJECT_ROOT##*/}"
+  [[ -n "$project_parent" ]] || project_parent="/"
+  [[ -d "$project_parent" && ! -L "$project_parent" ]] || \
+    fail "Project parent directory not found: $project_parent"
+  validate_no_symlink_components "$project_parent" "Project parent"
+
+  PROJECT_CLONE_TEMP="$project_parent/.${project_basename}.recovery-$RECOVERY_SESSION_ID"
+  [[ ! -e "$PROJECT_CLONE_TEMP" && ! -L "$PROJECT_CLONE_TEMP" ]] || \
+    fail "Managed project clone staging path already exists: $PROJECT_CLONE_TEMP"
+  mkdir -m 0700 "$PROJECT_CLONE_TEMP"
+  target_uid="$(id -u "$GIT_USER")"
+  target_gid="$(id -g "$GIT_USER")"
+  if [[ "$(id -u)" != "$target_uid" ]]; then
+    chown "$target_uid:$target_gid" "$PROJECT_CLONE_TEMP"
+  fi
+
+  recovery_log \
+    "Cloning $PROJECT_NAME as $GIT_USER at $SELECTED_PROJECT_DEPLOY_COMMIT"
+  run_git_as_user clone \
+    --no-checkout \
+    --origin origin \
+    --config core.hooksPath=/dev/null \
+    -- "$SELECTED_PROJECT_REPOSITORY_URL" "$PROJECT_CLONE_TEMP"
+  run_git_as_user -C "$PROJECT_CLONE_TEMP" \
+    fetch --no-tags origin "$SELECTED_PROJECT_DEPLOY_COMMIT"
+  run_git_as_user -C "$PROJECT_CLONE_TEMP" \
+    -c core.hooksPath=/dev/null \
+    checkout --detach "$SELECTED_PROJECT_DEPLOY_COMMIT"
+  validate_project_checkout "$PROJECT_CLONE_TEMP"
+
+  [[ ! -e "$SELECTED_PROJECT_ROOT" && ! -L "$SELECTED_PROJECT_ROOT" ]] || \
+    fail "Project root appeared during clone; refusing to overwrite it"
+  mv -n -- "$PROJECT_CLONE_TEMP" "$SELECTED_PROJECT_ROOT"
+  [[ -d "$SELECTED_PROJECT_ROOT" && ! -e "$PROJECT_CLONE_TEMP" ]] || \
+    fail "Unable to install project checkout without overwriting existing data"
+  PROJECT_CLONE_TEMP=""
+  validate_project_checkout "$SELECTED_PROJECT_ROOT"
+
+  recovery_ok \
+    "project cloned at exact recovered commit: $SELECTED_PROJECT_ROOT"
+  recovery_warn "Project files and database are not restored; keep the application stopped"
+}
+
 print_phase() {
   local phase_number="$1"
   local phase_state="$2"
@@ -1130,6 +1503,8 @@ parse_arguments() {
   local config_root_set=0
   local work_root_set=0
   local snapshot_set=0
+  local project_name_set=0
+  local git_user_set=0
 
   while (($# > 0)); do
     case "$1" in
@@ -1213,12 +1588,44 @@ parse_arguments() {
         snapshot_set=1
         shift
         ;;
+      --name)
+        (($# >= 2)) || fail "Missing value for --name"
+        [[ "$project_name_set" == "0" ]] || \
+          fail "--name may be specified only once"
+        PROJECT_NAME="$2"
+        project_name_set=1
+        shift 2
+        ;;
+      --name=*)
+        [[ "$project_name_set" == "0" ]] || \
+          fail "--name may be specified only once"
+        PROJECT_NAME="${1#*=}"
+        [[ -n "$PROJECT_NAME" ]] || fail "Missing value for --name"
+        project_name_set=1
+        shift
+        ;;
+      --git-user)
+        (($# >= 2)) || fail "Missing value for --git-user"
+        [[ "$git_user_set" == "0" ]] || \
+          fail "--git-user may be specified only once"
+        GIT_USER="$2"
+        git_user_set=1
+        shift 2
+        ;;
+      --git-user=*)
+        [[ "$git_user_set" == "0" ]] || \
+          fail "--git-user may be specified only once"
+        GIT_USER="${1#*=}"
+        [[ -n "$GIT_USER" ]] || fail "Missing value for --git-user"
+        git_user_set=1
+        shift
+        ;;
       --help | -h)
         usage
         exit 0
         ;;
       init | plan | status | config-snapshots | restore-config | \
-      data-snapshots | select-data)
+      data-snapshots | select-data | projects-plan | clone-project)
         [[ -z "$OPERATION" ]] || fail "Specify exactly one operation"
         OPERATION="$1"
         shift
@@ -1236,26 +1643,52 @@ parse_arguments() {
         fail "--snapshot is supported only by restore-config"
       [[ "$config_root_set" == "0" && "$work_root_set" == "0" ]] || \
         fail "--config-root and --work-root are supported only by restore-config"
+      [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
+        fail "--name and --git-user are supported only by clone-project"
       ;;
     restore-config)
       [[ -n "$SNAPSHOT_ID" ]] || fail "restore-config requires --snapshot"
+      [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
+        fail "--name and --git-user are supported only by clone-project"
       ;;
     data-snapshots)
       [[ -z "$SNAPSHOT_ID" ]] || \
         fail "--snapshot is supported only by restore-config and select-data"
       [[ "$work_root_set" == "0" ]] || \
         fail "--work-root is supported only by restore-config"
+      [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
+        fail "--name and --git-user are supported only by clone-project"
       ;;
     select-data)
       [[ -n "$SNAPSHOT_ID" ]] || fail "select-data requires --snapshot"
       [[ "$work_root_set" == "0" ]] || \
         fail "--work-root is supported only by restore-config"
+      [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
+        fail "--name and --git-user are supported only by clone-project"
+      ;;
+    projects-plan)
+      [[ -z "$SNAPSHOT_ID" ]] || \
+        fail "--snapshot is not supported by projects-plan"
+      [[ "$work_root_set" == "0" ]] || \
+        fail "--work-root is supported only by restore-config"
+      [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
+        fail "--name and --git-user are supported only by clone-project"
+      ;;
+    clone-project)
+      [[ -z "$SNAPSHOT_ID" ]] || \
+        fail "--snapshot is not supported by clone-project"
+      [[ "$work_root_set" == "0" ]] || \
+        fail "--work-root is supported only by restore-config"
+      [[ -n "$PROJECT_NAME" ]] || fail "clone-project requires --name"
+      [[ -n "$GIT_USER" ]] || fail "clone-project requires --git-user"
       ;;
     plan | status)
       [[ -z "$BREAK_GLASS_FILE" && -z "$SNAPSHOT_ID" ]] || \
         fail "Break-glass and snapshot options are not supported by $OPERATION"
       [[ "$config_root_set" == "0" && "$work_root_set" == "0" ]] || \
         fail "--config-root and --work-root are supported only by restore-config"
+      [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
+        fail "--name and --git-user are supported only by clone-project"
       ;;
   esac
   if [[ "$OPERATION" != "plan" && "$OPERATION" != "status" && \
@@ -1289,6 +1722,12 @@ main() {
       ;;
     select-data)
       run_select_data
+      ;;
+    projects-plan)
+      run_projects_plan
+      ;;
+    clone-project)
+      run_clone_project
       ;;
   esac
 }

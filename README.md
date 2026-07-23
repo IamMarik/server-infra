@@ -185,9 +185,6 @@ sudo ./recovery/bin/server-infra-recovery restore-config \
   --snapshot <config-snapshot-id>
 ```
 
-Project data and deployment phases remain operator-guided. See
-`recovery/README.md`.
-
 After configuration recovery, pin one data point for every project:
 
 ```bash
@@ -197,6 +194,21 @@ sudo ./recovery/bin/server-infra-recovery select-data \
   --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --snapshot <data-snapshot-id>
 ```
+
+Then validate the recovered project inventory and recreate each exact Git
+checkout as an ordinary user:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery projects-plan \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery clone-project \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --name <project-name> \
+  --git-user ubuntu
+```
+
+Project file and database restoration, service validation, and traffic
+cutover remain operator-guided. See `recovery/README.md`.
 
 ## Documentation
 

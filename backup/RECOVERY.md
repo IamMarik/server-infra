@@ -179,18 +179,31 @@ SERVER_INFRA_ROOT="$(pwd -P)"
 Read the recovered inventory:
 
 ```bash
-sudo "$SERVER_INFRA_ROOT/backup/bin/server-infra-backup" \
-  project recovery-list
+sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" projects-plan \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
 ```
 
-For each project:
+Create the parent of a recorded `PROJECT_ROOT` first if it is absent. Then
+clone each project as the ordinary deployment user:
 
-1. Clone `REPOSITORY_URL` into `PROJECT_ROOT`.
-2. Check out `DEPLOY_COMMIT`.
-3. Restore only the declared `.env`, uploads, and other application paths from
+```bash
+sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" clone-project \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --name <project-name> \
+  --git-user ubuntu
+```
+
+The command reads `PROJECT_ROOT`, `REPOSITORY_URL`, and the full
+`DEPLOY_COMMIT` from the recovered root-owned inventory. It refuses to run Git
+as root or overwrite an existing mismatched path. Repeating it validates and
+accepts an already matching checkout.
+
+For each cloned project:
+
+1. Restore only the declared `.env`, uploads, and other application paths from
    the temporary data tree.
-4. Run `"$SERVER_INFRA_ROOT/backup/bin/server-infra-backup" project validate`.
-5. Run `sudo "$SERVER_INFRA_ROOT/backup/bin/server-infra-backup" project
+2. Run `"$SERVER_INFRA_ROOT/backup/bin/server-infra-backup" project validate`.
+3. Run `sudo "$SERVER_INFRA_ROOT/backup/bin/server-infra-backup" project
    install`.
 
 Do not copy a restored data tree blindly over a Git checkout.

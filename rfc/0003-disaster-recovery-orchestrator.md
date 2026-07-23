@@ -152,9 +152,18 @@ The third increment implements:
 - one immutable data snapshot ID shared by every project restore;
 - idempotent reselection of the same ID and refusal of a different ID.
 
-Project reconstruction, application validation, deployment, and finalization
-remain documented manual operations until their contracts are separately
-implemented and tested.
+The fourth increment implements:
+
+- `projects-plan --break-glass`;
+- strict validation of recovered `source.conf` and `recovery.conf` identity;
+- `clone-project --break-glass --name --git-user`;
+- Git execution as an explicit non-root user;
+- atomic installation only into an absent recorded `PROJECT_ROOT`;
+- exact origin and commit verification with idempotent retry behavior.
+
+Project file and PostgreSQL restoration, application validation, deployment,
+and finalization remain documented manual operations until their contracts are
+separately implemented and tested.
 
 ## Consequences
 

@@ -45,7 +45,8 @@ case "${1:-}" in
     [[ -n "$target" ]]
 
     restored_root="$target$FAKE_CONFIG_ROOT"
-    mkdir -p "$restored_root/backup"
+    project_source_root="$restored_root/backup/sources.d/test-app"
+    mkdir -p "$project_source_root"
     printf '%s\n' \
       "SERVER_INFRA_CONFIG_VERSION=1" \
       "SERVER_INFRA_INSTANCE=acceptance" \
@@ -71,19 +72,43 @@ case "${1:-}" in
     printf '%s\n' "/srv/test-data" > "$restored_root/backup/paths"
     : > "$restored_root/backup/excludes"
     : > "$restored_root/backup/freshness"
+    printf '%s\n' \
+      "SOURCE_VERSION=1" \
+      "SOURCE_NAME=test-app" \
+      "SOURCE_TYPE=files-only" \
+      "PROJECT_ROOT=$FAKE_PROJECT_ROOT" \
+      > "$project_source_root/source.conf"
+    printf '%s\n' "$FAKE_PROJECT_ROOT/.env" \
+      > "$project_source_root/paths"
+    : > "$project_source_root/excludes"
+    : > "$project_source_root/freshness"
+    printf '%s\n' \
+      "RECOVERY_VERSION=1" \
+      "REPOSITORY_URL=$FAKE_PROJECT_REPOSITORY_URL" \
+      "DEPLOY_COMMIT=$FAKE_PROJECT_DEPLOY_COMMIT" \
+      > "$project_source_root/recovery.conf"
     if [[ "${FAKE_RESTORE_INVALID:-0}" != "1" ]]; then
       printf '%s\n' "test-restic-password" \
         > "$restored_root/backup/restic-password"
       chmod 0600 "$restored_root/backup/restic-password"
     fi
 
-    chmod 0750 "$restored_root" "$restored_root/backup"
+    chmod 0750 \
+      "$restored_root" \
+      "$restored_root/backup" \
+      "$restored_root/backup/sources.d" \
+      "$project_source_root"
     chmod 0640 \
       "$restored_root/server.env" \
       "$restored_root/modules.env" \
       "$restored_root/backup/paths" \
       "$restored_root/backup/excludes" \
-      "$restored_root/backup/freshness"
+      "$restored_root/backup/freshness" \
+      "$project_source_root/source.conf" \
+      "$project_source_root/paths" \
+      "$project_source_root/excludes" \
+      "$project_source_root/freshness" \
+      "$project_source_root/recovery.conf"
     chmod 0600 "$restored_root/backup/runtime.env"
     ;;
   *)

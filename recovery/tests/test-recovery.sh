@@ -25,12 +25,22 @@ PLAN_OUTPUT="$TEST_ROOT/plan.log"
 STATUS_OUTPUT="$TEST_ROOT/status.log"
 SNAPSHOTS_OUTPUT="$TEST_ROOT/snapshots.log"
 DATA_SNAPSHOTS_OUTPUT="$TEST_ROOT/data-snapshots.log"
+PROJECTS_PLAN_OUTPUT="$TEST_ROOT/projects-plan.log"
 RESTIC_LOG="$TEST_ROOT/restic.log"
+GIT_LOG="$TEST_ROOT/git.log"
+PROJECT_ROOT="$TEST_ROOT/projects/test-app"
 RECOVERY="$REPOSITORY_ROOT/recovery/bin/server-infra-recovery"
 TEST_REPOSITORY_URL="git@github.com:example/server-infra.git"
 TEST_REPOSITORY_REF="0123456789abcdef0123456789abcdef01234567"
+TEST_PROJECT_REPOSITORY_URL="git@github.com:example/test-app.git"
+TEST_PROJECT_DEPLOY_COMMIT="abcdef0123456789abcdef0123456789abcdef01"
+TEST_GIT_USER="$(id -un)"
 
 cleanup() {
+  if [[ "${RECOVERY_TEST_KEEP:-0}" == "1" ]]; then
+    printf '[recovery-test] preserved test root: %s\n' "$TEST_ROOT" >&2
+    return
+  fi
   rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
@@ -85,29 +95,16 @@ write_break_glass() {
 }
 
 mkdir -p "$TEST_BIN"
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -Eeuo pipefail' \
-  'case "$*" in' \
-  '  *"rev-parse --is-inside-work-tree")' \
-  '    printf "%s\n" "true"' \
-  '    ;;' \
-  '  *"remote get-url origin")' \
-  '    printf "%s\n" "git@github.com:example/server-infra.git"' \
-  '    ;;' \
-  '  *"rev-parse HEAD")' \
-  '    printf "%s\n" "0123456789abcdef0123456789abcdef01234567"' \
-  '    ;;' \
-  '  *"status --porcelain --untracked-files=no")' \
-  '    ;;' \
-  '  *)' \
-  '    exit 1' \
-  '    ;;' \
-  'esac' \
-  > "$TEST_BIN/git"
-chmod 0755 "$TEST_BIN/git"
+ln -s "$REPOSITORY_ROOT/recovery/tests/fake-git" "$TEST_BIN/git"
 ln -s "$REPOSITORY_ROOT/recovery/tests/fake-restic" "$TEST_BIN/restic"
 export FAKE_RESTIC_LOG="$RESTIC_LOG"
+export FAKE_GIT_LOG="$GIT_LOG"
+export FAKE_INFRA_ROOT="$REPOSITORY_ROOT"
+export FAKE_INFRA_REPOSITORY_URL="$TEST_REPOSITORY_URL"
+export FAKE_INFRA_DEPLOY_COMMIT="$TEST_REPOSITORY_REF"
+export FAKE_PROJECT_ROOT="$PROJECT_ROOT"
+export FAKE_PROJECT_REPOSITORY_URL="$TEST_PROJECT_REPOSITORY_URL"
+export FAKE_PROJECT_DEPLOY_COMMIT="$TEST_PROJECT_DEPLOY_COMMIT"
 
 write_break_glass \
   "$BREAK_GLASS_FILE" \
@@ -268,6 +265,81 @@ if FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   fail_test "Data selection accepted another snapshot after pinning"
 fi
 
+SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  projects-plan \
+  --break-glass "$BREAK_GLASS_FILE" > "$PROJECTS_PLAN_OUTPUT"
+assert_contains "$PROJECTS_PLAN_OUTPUT" \
+  $'test-app\tfiles-only\tabsent'
+assert_contains "$PROJECTS_PLAN_OUTPUT" "$TEST_PROJECT_REPOSITORY_URL"
+assert_contains "$PROJECTS_PLAN_OUTPUT" "$TEST_PROJECT_DEPLOY_COMMIT"
+assert_contains "$PROJECTS_PLAN_OUTPUT" $'\tdeadbeef'
+
+if SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  clone-project \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user root >/dev/null 2>&1; then
+  fail_test "Project clone accepted root as the Git user"
+fi
+
+if SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  clone-project \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user "$TEST_GIT_USER" >/dev/null 2>&1; then
+  fail_test "Project clone created an unapproved missing parent directory"
+fi
+[[ ! -e "$PROJECT_ROOT" ]] || \
+  fail_test "Failed project clone created its target"
+
+mkdir -p "${PROJECT_ROOT%/*}"
+SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  clone-project \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user "$TEST_GIT_USER" >> "$COMMAND_OUTPUT" 2>&1
+[[ -d "$PROJECT_ROOT/.git" ]] || \
+  fail_test "Project checkout was not installed"
+assert_contains "$PROJECT_ROOT/.git/fake-origin" \
+  "$TEST_PROJECT_REPOSITORY_URL"
+assert_contains "$PROJECT_ROOT/.git/fake-head" \
+  "$TEST_PROJECT_DEPLOY_COMMIT"
+assert_contains "$STATE_FILE" "RECOVERY_PHASE_PROJECTS=in-progress"
+
+SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  projects-plan \
+  --break-glass "$BREAK_GLASS_FILE" > "$PROJECTS_PLAN_OUTPUT"
+assert_contains "$PROJECTS_PLAN_OUTPUT" \
+  $'test-app\tfiles-only\tpresent'
+
+CLONE_LINES_BEFORE="$(grep -c '^clone ' "$GIT_LOG")"
+SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  clone-project \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user "$TEST_GIT_USER" >> "$COMMAND_OUTPUT" 2>&1
+CLONE_LINES_AFTER="$(grep -c '^clone ' "$GIT_LOG")"
+[[ "$CLONE_LINES_BEFORE" == "$CLONE_LINES_AFTER" ]] || \
+  fail_test "Repeated clone-project cloned the repository again"
+
 PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   --state-root "$STATE_ROOT" plan > "$PLAN_OUTPUT"
 assert_contains "$PLAN_OUTPUT" \
@@ -319,6 +391,8 @@ for secret_value in \
     "$STATUS_OUTPUT" \
     "$SNAPSHOTS_OUTPUT" \
     "$DATA_SNAPSHOTS_OUTPUT" \
+    "$PROJECTS_PLAN_OUTPUT" \
+    "$GIT_LOG" \
     "$RESTIC_LOG" >/dev/null; then
     fail_test "Secret value escaped from the break-glass record"
   fi
@@ -355,4 +429,4 @@ if PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   fail_test "Recovery accepted a symlinked break-glass record"
 fi
 
-printf '[recovery-test][ok] resumable config restore and pinned data snapshot passed\n'
+printf '[recovery-test][ok] config, data, and exact project checkout recovery passed\n'

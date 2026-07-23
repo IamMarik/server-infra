@@ -27,9 +27,11 @@ The current implementation provides:
 - `restore-config` to pin, restore, validate, and install one snapshot.
 - `data-snapshots` to list data snapshots after configuration recovery;
 - `select-data` to validate and pin one data snapshot for all projects.
+- `projects-plan` to validate and print the recovered Git inventory;
+- `clone-project` to recreate one checkout at its recorded exact commit.
 
-It does not yet restore project files or databases, clone projects, deploy
-infrastructure, or start public traffic.
+It does not yet restore project files or databases, reinstall project backup
+sources, deploy infrastructure, or start public traffic.
 
 ## Security model
 
@@ -87,6 +89,15 @@ The selected snapshot must match both the server instance and
 `server-infra-data` tag. Once stored, another snapshot ID is rejected so all
 project restores use one consistent recovery point.
 
+Project cloning is allowed only after that data point is pinned. The recovered
+`source.conf` and `recovery.conf` remain authoritative for the project name,
+type, destination, repository URL, and full commit. Git runs as the explicit
+ordinary account passed with `--git-user`; it never runs as root. The command
+clones into a same-filesystem staging directory, validates origin, commit,
+ownership, and tracked-file cleanliness, then installs only when
+`PROJECT_ROOT` is absent. A matching existing checkout is accepted on retry;
+anything different is left untouched and rejected.
+
 ## Operations
 
 After fencing the failed VM, authorizing temporary Git access, cloning
@@ -122,6 +133,28 @@ sudo ./recovery/bin/server-infra-recovery select-data \
   --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --snapshot <data-snapshot-id>
 ```
+
+Validate the project inventory, then recreate one checkout. Repeat
+`clone-project` for each row in dependency order:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery projects-plan \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
+
+sudo ./recovery/bin/server-infra-recovery clone-project \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --name <project-name> \
+  --git-user ubuntu
+```
+
+The parent of the recorded `PROJECT_ROOT` must already exist. For SSH remotes,
+the selected Git user must have temporary repository access through its own
+SSH key. With agent forwarding, preserve the socket when entering `sudo`, for
+example `sudo --preserve-env=SSH_AUTH_SOCK ...`.
+
+`clone-project` deliberately stops after the exact Git checkout. It does not
+copy `.env` or uploads, restore PostgreSQL, install the recovered project
+source, or start Compose services.
 
 The restore uses `/var/cache/server-infra/recovery` for a root-only restic
 cache and temporary extraction. Plaintext extraction is removed on success or
@@ -176,5 +209,9 @@ Run without contacting GitHub, Backblaze, or a real restic repository:
   selected before the host configuration is trustworthy.
 - `data snapshot is already pinned` prevents different projects from using
   different points in time.
+- `project parent directory not found` means the parent of recovered
+  `PROJECT_ROOT` must be created before cloning.
+- `existing project ... differs` protects a non-empty or mismatched checkout
+  from being overwritten.
 - An existing session is never silently replaced. Session reset will be a
   separate, explicitly destructive operation if it is introduced later.

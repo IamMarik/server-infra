@@ -385,6 +385,17 @@ fails instead of silently copying an old database dump.
 
 ## Operations
 
+Validate the complete active configuration and current project runtime paths:
+
+```bash
+sudo ./scripts/backup.sh validate
+```
+
+`validate --allow-missing-project-paths` is reserved for the disaster-recovery
+orchestrator before application checkouts exist. It still validates backup
+runtime values and project manifest structure; routine preflight must not use
+this exception.
+
 Initialize a new repository explicitly:
 
 ```bash
