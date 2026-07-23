@@ -4,8 +4,8 @@
 
 Accepted.
 
-Migration status: repository prerequisites partially implemented; host cutover
-not started.
+Migration status: Phase 1 repository guardrails implemented; CI wiring and a
+dedicated history secret scan remain; host cutover not started.
 
 ## Context
 
@@ -129,16 +129,19 @@ Without changing host behavior:
 Concrete environment directories and the legacy deployment path remain
 available during this phase.
 
-The current main branch has partially completed this phase:
+The repository implements the documentation, example, and filename-guard
+portion of this phase:
 
+- root `server.env.example` and `modules.env.example` contracts exist;
 - `proxy/runtime.env.example` exists;
-- `proxy/runtime.env` and known Caddy backup filenames are ignored;
+- known runtime, credential, private-key, and Caddy backup filenames are
+  ignored;
+- `scripts/check-repository.sh` rejects forbidden tracked filenames even when
+  `.gitignore` is bypassed;
 - the custom Porkbun-enabled Caddy build is defined in Git.
 
-The example is not yet a complete proxy contract because the current
-Caddyfile also references `CADDY_EMAIL`, `STATUS_DOMAIN`, and other routing
-values. Repository-wide runtime filename protection, tracked-file validation,
-secret scanning, and history review are still required.
+CI integration, a dedicated secret scanner, history review, and rotation of
+any previously committed secret are still required.
 
 The concrete `pathetic.gay`, `saveproof.app`, and `saveproof.org` routes in the
 repository Caddyfile are temporary migration input. They must move to host

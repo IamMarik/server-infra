@@ -1,8 +1,26 @@
-# Local environment files
-environments/**/server.env
-environments/**/modules.env
-environments/**/config.env
-!environments/**/*.example
+# Host runtime configuration
+**/server.env
+**/server.env.*
+**/modules.env
+**/modules.env.*
+**/config.env
+**/config.env.*
+**/runtime.env
+**/runtime.env.*
+
+# Secrets and private keys
+**/restic-password
+**/restic-password.*
+**/*.secret
+**/*.pem
+**/*.key
+**/id_rsa
+**/id_ed25519
+**/credentials
+**/credentials.json
+
+# Safe configuration contracts remain trackable
+!**/*.example
 
 # OS/editor
 .DS_Store
@@ -12,7 +30,5 @@ environments/**/config.env
 # Runtime
 *.log
 backups/
-proxy/runtime.env
 proxy/Caddyfile.backup*
 proxy/Caddyfile.before-*
-

@@ -4,7 +4,10 @@
 
 `server-infra` manages reusable server-level infrastructure.
 
-It is intentionally independent from applications. The same repository should be able to configure an application server, a database-only server, a monitoring server, or a future staging server by changing only the selected environment.
+It is intentionally independent from applications. The same repository should
+be able to configure an application server, a database-only server, a
+monitoring server, or a future staging server by changing only host-owned
+runtime configuration.
 
 ## Boundaries
 
@@ -26,21 +29,25 @@ This repository does not own:
 
 ## Core concepts
 
-### Environment
+### Host configuration
 
-An environment describes a server role.
+Host configuration describes a server identity, role, and enabled modules.
 
-Example:
+Target:
 
 ```text
-environments/prod-app/
+/etc/server-infra/
 ├── server.env
 ├── modules.env
-├── proxy/
-└── monitoring/
+├── proxy/runtime.env
+└── monitoring/runtime.env
 ```
 
-The environment decides which modules are enabled and provides environment-specific values.
+The host decides which modules are enabled and provides concrete runtime
+values. The repository provides only the contract and safe examples.
+
+The repository-local `environments/<environment>` model remains temporarily as
+an explicit migration and rollback mechanism.
 
 ### Module
 
@@ -62,11 +69,11 @@ Scripts must be idempotent and deterministic. Running the same script multiple t
 ## Deployment flow
 
 ```text
-Environment
+Host configuration
   ↓
 Enabled modules
   ↓
-Module docker-compose.yml + environment config
+Module docker-compose.yml + host runtime config
   ↓
 Docker Compose
   ↓
@@ -77,15 +84,30 @@ The deployment engine should deploy modules generically. It should not contain m
 
 ## Configuration model
 
-Configuration belongs to environments.
+Git is the source of truth for reusable infrastructure code, configuration
+contracts, schemas, documentation, and safe examples.
 
-Modules define reusable structure. Environments provide concrete values.
+Each deployed Linux host owns its active runtime configuration under:
 
-Secrets and machine-specific values must not be committed. Commit `*.example` files instead.
+```text
+/etc/server-infra/
+```
+
+Modules define reusable structure. A host selects enabled modules and provides
+concrete values without changing the repository.
+
+Secrets, domains, server names, application routes, and machine-specific values
+must not be committed. Commit deliberately invalid `*.example` files instead.
+
+The tracked `environments/` layout is a legacy deployment contract retained
+only for the migration described in
+`rfc/0002-external-runtime-configuration.md`. New runtime configuration must not
+be added there.
 
 ## Engineering principles
 
-1. Git is the source of truth.
+1. Git is the source of truth for reusable infrastructure and configuration
+   contracts, not deployed runtime values or secrets.
 2. Infrastructure never knows applications.
 3. Environments describe servers.
 4. Modules are reusable capabilities.

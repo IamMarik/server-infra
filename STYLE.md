@@ -26,6 +26,21 @@ All shell scripts must:
 - Use named volumes for persistent service data.
 - Do not commit secrets.
 
+## Configuration
+
+- Active host configuration belongs under `/etc/server-infra`.
+- Use `runtime.env` as the main runtime environment filename for a module.
+- Append `.example` to the complete runtime filename for tracked examples.
+- Examples must use deliberately invalid domains, credentials, and tokens.
+- Document whether each example value is required, sensitive, and operationally
+  disruptive to change.
+- Use uppercase snake case for environment variables.
+- Prefix repository orchestration variables with `SERVER_INFRA_`.
+- Preserve upstream-standard names such as `RESTIC_*` and `AWS_*`.
+- Do not source host runtime configuration as executable shell code.
+- Do not commit domains, server names, application routes, passwords, private
+  keys, API tokens, or provider credentials.
+
 ## Documentation
 
 Module READMEs should include:
