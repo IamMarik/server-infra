@@ -64,6 +64,13 @@ Validate that known runtime and secret filenames are not tracked:
 This check is safe to run locally and in CI. It does not read or print runtime
 secret contents.
 
+Validate an external host configuration without executing it or changing the
+host:
+
+```bash
+./scripts/validate-config.sh --config-root /etc/server-infra
+```
+
 ## Documentation
 
 - `ARCHITECTURE.md` explains the system model.

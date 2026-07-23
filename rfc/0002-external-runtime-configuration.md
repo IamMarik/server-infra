@@ -4,8 +4,9 @@
 
 Accepted.
 
-Migration status: Phase 1 repository guardrails implemented; CI wiring and a
-dedicated history secret scan remain; host cutover not started.
+Migration status: Phase 1 repository guardrails and the Phase 2 read-only
+external configuration preflight are implemented. CI wiring, a dedicated
+history secret scan, deployment integration, and host cutover remain.
 
 ## Context
 
@@ -164,6 +165,11 @@ The configuration reader must:
 - support a preflight that makes no runtime changes.
 
 The legacy mode remains available only for the rollback window.
+
+The repository provides `scripts/validate-config.sh` as the first Phase 2
+deliverable. It validates an explicit external configuration root without
+executing configuration files or changing Docker and services. Deployment
+scripts do not use the external configuration yet.
 
 The current Compose expression:
 

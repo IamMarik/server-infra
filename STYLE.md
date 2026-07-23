@@ -38,6 +38,11 @@ All shell scripts must:
 - Prefix repository orchestration variables with `SERVER_INFRA_`.
 - Preserve upstream-standard names such as `RESTIC_*` and `AWS_*`.
 - Do not source host runtime configuration as executable shell code.
+- Runtime environment files support blank lines, whole-line comments, and one
+  uppercase `KEY=VALUE` assignment per line.
+- A complete value may be wrapped in matching single or double quotes. Values
+  are treated literally; shell expansion, `export`, and inline comments are not
+  supported.
 - Do not commit domains, server names, application routes, passwords, private
   keys, API tokens, or provider credentials.
 
