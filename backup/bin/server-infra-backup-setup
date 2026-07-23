@@ -205,9 +205,11 @@ collect_values() {
   prompt_secret password_confirmation "Repeat restic repository password"
   [[ "$RESTIC_PASSWORD" == "$password_confirmation" ]] || \
     fail "Restic repository passwords do not match"
-  prompt_value BACKUP_PUSH_URL "Uptime Kuma backup push URL" ""
-  prompt_value CHECK_PUSH_URL "Uptime Kuma check push URL" ""
-  prompt_value RESTORE_PUSH_URL "Uptime Kuma restore-test push URL" ""
+  if confirm "Enable Uptime Kuma monitoring?"; then
+    prompt_value BACKUP_PUSH_URL "Uptime Kuma backup push URL" ""
+    prompt_value CHECK_PUSH_URL "Uptime Kuma check push URL" ""
+    prompt_value RESTORE_PUSH_URL "Uptime Kuma restore-test push URL" ""
+  fi
   add_backup_module
 }
 
@@ -215,6 +217,7 @@ validate_values() {
   local region
   local timezone_file="/usr/share/zoneinfo/$TIMEZONE"
   local push_url
+  local configured_push_urls=0
 
   [[ "$INSTANCE" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
     fail "Server instance must use lowercase kebab-case"
@@ -240,10 +243,15 @@ validate_values() {
   ((${#RESTIC_PASSWORD} >= 20)) || \
     fail "Restic repository password must contain at least 20 characters"
   for push_url in "$BACKUP_PUSH_URL" "$CHECK_PUSH_URL" "$RESTORE_PUSH_URL"; do
-    [[ "$push_url" == https://* ]] || fail "Push monitor URLs must use HTTPS"
-    [[ "$push_url" != *"?"* && "$push_url" != *"#"* ]] || \
-      fail "Push monitor URLs must not contain query strings or fragments"
+    if [[ -n "$push_url" ]]; then
+      configured_push_urls=$((configured_push_urls + 1))
+      [[ "$push_url" == https://* ]] || fail "Push monitor URLs must use HTTPS"
+      [[ "$push_url" != *"?"* && "$push_url" != *"#"* ]] || \
+        fail "Push monitor URLs must not contain query strings or fragments"
+    fi
   done
+  [[ "$configured_push_urls" == "0" || "$configured_push_urls" == "3" ]] || \
+    fail "Push monitor URLs must be either all configured or all empty"
   AWS_DEFAULT_REGION="$region"
 }
 
@@ -452,6 +460,11 @@ main() {
   log "Timezone: $TIMEZONE"
   log "Repository: s3:https://$S3_ENDPOINT/$BUCKET/$REPOSITORY_PREFIX"
   log "Enabled modules: $ENABLED_MODULES"
+  if [[ -n "$BACKUP_PUSH_URL" ]]; then
+    log "Uptime Kuma monitoring: enabled"
+  else
+    log "Uptime Kuma monitoring: disabled"
+  fi
   log "Retention and prune will remain disabled"
   confirm "Write active server and backup configuration?" || \
     fail "Setup cancelled; no changes made"

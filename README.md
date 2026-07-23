@@ -122,8 +122,8 @@ sudo ./scripts/backup-setup.sh
 ```
 
 The wizard creates root-owned active configuration, preserves existing base
-path lists, keeps retention disabled, and validates the result. Secrets are
-never accepted as command-line arguments.
+path lists, keeps retention disabled, optionally configures Uptime Kuma, and
+validates the result. Secrets are never accepted as command-line arguments.
 
 Initialize a PostgreSQL Compose backup source from an application repository:
 

@@ -183,6 +183,21 @@ read_active_value() {
   printf '%s' "$value"
 }
 
+read_optional_value() {
+  local env_file="$1"
+  local key="$2"
+  local value
+
+  if ! value="$(read_env_value "$env_file" "$key")"; then
+    fail "Missing key $key in $env_file"
+  fi
+  if [[ -n "$value" ]] && is_placeholder_value "$value"; then
+    fail "Placeholder value for optional key $key in $env_file"
+  fi
+
+  printf '%s' "$value"
+}
+
 validate_known_runtime_keys() {
   local allowed_keys=$'\nRESTIC_REPOSITORY\nRESTIC_PASSWORD_FILE\nAWS_ACCESS_KEY_ID\nAWS_SECRET_ACCESS_KEY\nAWS_DEFAULT_REGION\nUPTIME_KUMA_BACKUP_PUSH_URL\nUPTIME_KUMA_CHECK_PUSH_URL\nUPTIME_KUMA_RESTORE_TEST_PUSH_URL\nBACKUP_KEEP_DAILY\nBACKUP_KEEP_WEEKLY\nBACKUP_KEEP_MONTHLY\nBACKUP_RETENTION_ENABLED\nBACKUP_PRUNE_ENABLED\n'
   local seen_keys=$'\n'
@@ -577,6 +592,7 @@ validate_push_url() {
 load_configuration() {
   local server_file="$CONFIG_ROOT/server.env"
   local password_mode
+  local configured_push_urls=0
 
   validate_absolute_path "$CONFIG_ROOT" "Configuration root"
   case "${CONFIG_ROOT%/}" in
@@ -612,13 +628,13 @@ load_configuration() {
   AWS_SECRET_ACCESS_KEY="$(read_active_value "$RUNTIME_FILE" "AWS_SECRET_ACCESS_KEY")"
   AWS_DEFAULT_REGION="$(read_active_value "$RUNTIME_FILE" "AWS_DEFAULT_REGION")"
   UPTIME_KUMA_BACKUP_PUSH_URL="$(
-    read_active_value "$RUNTIME_FILE" "UPTIME_KUMA_BACKUP_PUSH_URL"
+    read_optional_value "$RUNTIME_FILE" "UPTIME_KUMA_BACKUP_PUSH_URL"
   )"
   UPTIME_KUMA_CHECK_PUSH_URL="$(
-    read_active_value "$RUNTIME_FILE" "UPTIME_KUMA_CHECK_PUSH_URL"
+    read_optional_value "$RUNTIME_FILE" "UPTIME_KUMA_CHECK_PUSH_URL"
   )"
   UPTIME_KUMA_RESTORE_TEST_PUSH_URL="$(
-    read_active_value "$RUNTIME_FILE" "UPTIME_KUMA_RESTORE_TEST_PUSH_URL"
+    read_optional_value "$RUNTIME_FILE" "UPTIME_KUMA_RESTORE_TEST_PUSH_URL"
   )"
   BACKUP_KEEP_DAILY="$(read_active_value "$RUNTIME_FILE" "BACKUP_KEEP_DAILY")"
   BACKUP_KEEP_WEEKLY="$(read_active_value "$RUNTIME_FILE" "BACKUP_KEEP_WEEKLY")"
@@ -644,15 +660,27 @@ load_configuration() {
 
   [[ "$AWS_DEFAULT_REGION" =~ ^[a-z0-9][a-z0-9-]*$ ]] || \
     fail "AWS_DEFAULT_REGION has an invalid format"
-  validate_push_url \
+  for push_url in \
     "$UPTIME_KUMA_BACKUP_PUSH_URL" \
-    "UPTIME_KUMA_BACKUP_PUSH_URL"
-  validate_push_url \
     "$UPTIME_KUMA_CHECK_PUSH_URL" \
-    "UPTIME_KUMA_CHECK_PUSH_URL"
-  validate_push_url \
-    "$UPTIME_KUMA_RESTORE_TEST_PUSH_URL" \
-    "UPTIME_KUMA_RESTORE_TEST_PUSH_URL"
+    "$UPTIME_KUMA_RESTORE_TEST_PUSH_URL"; do
+    if [[ -n "$push_url" ]]; then
+      configured_push_urls=$((configured_push_urls + 1))
+    fi
+  done
+  [[ "$configured_push_urls" == "0" || "$configured_push_urls" == "3" ]] || \
+    fail "Uptime Kuma push URLs must be either all configured or all empty"
+  if [[ "$configured_push_urls" == "3" ]]; then
+    validate_push_url \
+      "$UPTIME_KUMA_BACKUP_PUSH_URL" \
+      "UPTIME_KUMA_BACKUP_PUSH_URL"
+    validate_push_url \
+      "$UPTIME_KUMA_CHECK_PUSH_URL" \
+      "UPTIME_KUMA_CHECK_PUSH_URL"
+    validate_push_url \
+      "$UPTIME_KUMA_RESTORE_TEST_PUSH_URL" \
+      "UPTIME_KUMA_RESTORE_TEST_PUSH_URL"
+  fi
   validate_positive_integer "$BACKUP_KEEP_DAILY" "BACKUP_KEEP_DAILY"
   validate_positive_integer "$BACKUP_KEEP_WEEKLY" "BACKUP_KEEP_WEEKLY"
   validate_positive_integer "$BACKUP_KEEP_MONTHLY" "BACKUP_KEEP_MONTHLY"
@@ -739,7 +767,11 @@ push_status() {
   local status="$1"
   local message="$2"
 
-  [[ -n "$ACTIVE_PUSH_URL" ]] || fail "No active push monitor configured"
+  if [[ -z "$ACTIVE_PUSH_URL" ]]; then
+    warn "$ACTIVE_MONITOR_LABEL monitoring is disabled; status was not reported"
+    return
+  fi
+  require_command curl
   curl \
     --fail \
     --silent \
@@ -838,7 +870,6 @@ run_backup() {
   ACTIVE_PUSH_URL="$UPTIME_KUMA_BACKUP_PUSH_URL"
   ACTIVE_MONITOR_LABEL="Backup"
   require_command restic
-  require_command curl
   prepare_runtime
   acquire_job_lock
 
@@ -894,7 +925,6 @@ run_check() {
   ACTIVE_PUSH_URL="$UPTIME_KUMA_CHECK_PUSH_URL"
   ACTIVE_MONITOR_LABEL="Repository check"
   require_command restic
-  require_command curl
   prepare_runtime
   acquire_job_lock
 
@@ -1047,7 +1077,6 @@ run_restore_test() {
   ACTIVE_PUSH_URL="$UPTIME_KUMA_RESTORE_TEST_PUSH_URL"
   ACTIVE_MONITOR_LABEL="Restore test"
   require_command restic
-  require_command curl
   prepare_runtime
   acquire_job_lock
 

@@ -32,6 +32,29 @@ assert_contains() {
     fail_test "Expected '$expected' in $file_path"
 }
 
+write_runtime() {
+  local backup_push_url="$1"
+  local check_push_url="$2"
+  local restore_push_url="$3"
+
+  cat > "$CONFIG_ROOT/backup/runtime.env" <<EOF
+RESTIC_REPOSITORY=s3:https://s3.example.test/test-bucket
+RESTIC_PASSWORD_FILE=$CONFIG_ROOT/backup/restic-password
+AWS_ACCESS_KEY_ID=test-key
+AWS_SECRET_ACCESS_KEY=test-secret
+AWS_DEFAULT_REGION=test-region
+UPTIME_KUMA_BACKUP_PUSH_URL=$backup_push_url
+UPTIME_KUMA_CHECK_PUSH_URL=$check_push_url
+UPTIME_KUMA_RESTORE_TEST_PUSH_URL=$restore_push_url
+BACKUP_KEEP_DAILY=14
+BACKUP_KEEP_WEEKLY=8
+BACKUP_KEEP_MONTHLY=12
+BACKUP_RETENTION_ENABLED=false
+BACKUP_PRUNE_ENABLED=false
+EOF
+  chmod 0600 "$CONFIG_ROOT/backup/runtime.env"
+}
+
 if [[ "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]]; then
   printf '[backup-test][skip] Linux permission checks require root\n'
   exit 0
@@ -48,21 +71,7 @@ EOF
 cat > "$CONFIG_ROOT/modules.env" <<'EOF'
 ENABLED_MODULES=backup
 EOF
-cat > "$CONFIG_ROOT/backup/runtime.env" <<EOF
-RESTIC_REPOSITORY=s3:https://s3.example.test/test-bucket
-RESTIC_PASSWORD_FILE=$CONFIG_ROOT/backup/restic-password
-AWS_ACCESS_KEY_ID=test-key
-AWS_SECRET_ACCESS_KEY=test-secret
-AWS_DEFAULT_REGION=test-region
-UPTIME_KUMA_BACKUP_PUSH_URL=https://status.example.test/api/push/backup-monitor
-UPTIME_KUMA_CHECK_PUSH_URL=https://status.example.test/api/push/check-monitor
-UPTIME_KUMA_RESTORE_TEST_PUSH_URL=https://status.example.test/api/push/restore-monitor
-BACKUP_KEEP_DAILY=14
-BACKUP_KEEP_WEEKLY=8
-BACKUP_KEEP_MONTHLY=12
-BACKUP_RETENTION_ENABLED=false
-BACKUP_PRUNE_ENABLED=false
-EOF
+write_runtime "" "" ""
 cat > "$CONFIG_ROOT/backup/paths" <<EOF
 $TEST_ROOT/data
 EOF
@@ -148,8 +157,24 @@ RUNNER="$REPOSITORY_ROOT/backup/bin/server-infra-backup"
 "$REPOSITORY_ROOT/scripts/validate-config.sh" --config-root "$CONFIG_ROOT"
 "$REPOSITORY_ROOT/scripts/deploy.sh" --config-root "$CONFIG_ROOT" --check
 "$RUNNER" --config-root "$CONFIG_ROOT" validate
+: > "$CURL_LOG"
 "$RUNNER" --config-root "$CONFIG_ROOT" check
 assert_contains "$RESTIC_LOG" "check "
+if [[ -s "$CURL_LOG" ]]; then
+  fail_test "Disabled monitoring unexpectedly invoked curl"
+fi
+
+write_runtime "https://status.example.test/api/push/backup-monitor" "" ""
+if "$RUNNER" --config-root "$CONFIG_ROOT" validate; then
+  fail_test "Runner unexpectedly accepted partially configured monitoring"
+fi
+
+write_runtime \
+  "https://status.example.test/api/push/backup-monitor" \
+  "https://status.example.test/api/push/check-monitor" \
+  "https://status.example.test/api/push/restore-monitor"
+"$RUNNER" --config-root "$CONFIG_ROOT" validate
+"$RUNNER" --config-root "$CONFIG_ROOT" check
 assert_contains "$CURL_LOG" "https://status.example.test/api/push/check-monitor"
 assert_contains "$CURL_LOG" "status=up"
 
@@ -215,4 +240,4 @@ fi
 assert_contains "$CURL_LOG" "status=down"
 assert_contains "$CURL_LOG" "Repository check failed on test-server"
 
-printf '[backup-test][ok] runner safety and lifecycle checks passed\n'
+printf '[backup-test][ok] optional monitoring, safety, and lifecycle checks passed\n'

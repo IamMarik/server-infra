@@ -42,7 +42,7 @@ Use the following stack:
 - the Backblaze S3-compatible API as the restic backend;
 - systemd timers for scheduling;
 - native database dump tools before restic snapshots;
-- Uptime Kuma push monitoring for backup job results.
+- optional Uptime Kuma push monitoring for backup job results.
 
 ### Module Model
 
@@ -256,8 +256,8 @@ Host configuration owns:
 - the restic repository URL;
 - Backblaze credentials and any required S3-compatible endpoint settings;
 - the repository password file location;
-- separate Uptime Kuma push URLs for backup, repository check, and restore
-  test jobs;
+- optional, separate Uptime Kuma push URLs for backup, repository check, and
+  restore test jobs;
 - required dump freshness markers and their maximum age;
 - schedule and retention overrides.
 
@@ -265,8 +265,9 @@ The implementation should preserve upstream-standard variables such as
 `RESTIC_*` and `AWS_*`. It must avoid storing the same endpoint, bucket, or
 repository value in multiple configuration keys.
 
-Backup, repository check, and restore test jobs use distinct push monitors so
-that a successful daily backup cannot hide a failed weekly or monthly job.
+When monitoring is enabled, backup, repository check, and restore test jobs use
+distinct push monitors so that a successful daily backup cannot hide a failed
+weekly or monthly job. All three URLs are configured together or left empty.
 
 The repository is initialized only through an explicit operator command.
 Scheduled jobs must fail when the configured repository does not exist and
@@ -303,7 +304,8 @@ A backup job is not considered operational until all of the following succeed:
 3. `restic check` succeeds.
 4. A snapshot is restored to a temporary location.
 5. A database dump, when present, passes an application-owned restore test.
-6. Uptime Kuma reports the scheduled job as healthy.
+6. Uptime Kuma reports the scheduled job as healthy, when monitoring is
+   configured.
 
 Restore operations must target an empty temporary directory by default.
 Restoring in place requires an explicit operator action.
@@ -347,8 +349,8 @@ overrides remain before the phase is complete.
 - Add repository filename guard coverage for backup secrets and active files.
 - Implement explicit repository initialization.
 - Implement configuration and data snapshots with distinct tags.
-- Implement Uptime Kuma success and failure reporting without printing push
-  URLs.
+- Implement optional Uptime Kuma success and failure reporting without
+  printing push URLs.
 - Install and enable the daily systemd timer only after active configuration
   validates.
 
@@ -385,7 +387,7 @@ For each server:
    and permissions.
 8. Restore and import each required database dump through its owning
    application procedure.
-9. Confirm all configured push monitors report healthy.
+9. Confirm all configured push monitors report healthy, when enabled.
 10. Enable timers.
 11. Validate Object Lock or versioning and retention behavior before enabling
     automatic prune.

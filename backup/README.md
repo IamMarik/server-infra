@@ -16,11 +16,12 @@ data snapshot in a server-owned restic repository.
   `/usr/local/libexec/server-infra/backup/`;
 - an interactive server setup wizard that writes secrets without terminal
   echo or command-line arguments;
-- separate Uptime Kuma push reporting for backup, repository check, and
-  restore-test jobs.
+- optional, separate Uptime Kuma push reporting for backup, repository check,
+  and restore-test jobs.
 
-The host must provide `restic`, `curl`, and system CA certificates. Deployment
-checks runtime commands before changing host artifacts.
+The host must provide `restic` and system CA certificates. `curl` is required
+only when Uptime Kuma monitoring is enabled. Deployment checks mandatory
+runtime commands before changing host artifacts.
 
 ## Configuration
 
@@ -41,8 +42,10 @@ Active configuration belongs under:
 └── restic-password
 ```
 
-`runtime.env` is mode `0600` because it contains provider credentials and a
-push-monitor URL. Use `runtime.env.example` as the key contract.
+`runtime.env` is mode `0600` because it contains provider credentials and may
+contain push-monitor URLs. Use `runtime.env.example` as the key contract.
+Leave all three `UPTIME_KUMA_*` values empty to disable monitoring; partial
+monitor configuration is rejected.
 
 `paths` contains one absolute data source per line. The runner rejects broad
 roots and backs up `/etc/server-infra` separately without data excludes.
@@ -102,6 +105,7 @@ The wizard:
 - constructs the restic repository URL from the Backblaze endpoint, bucket,
   and repository prefix;
 - reads the Backblaze secret and restic password without terminal echo;
+- optionally collects three Uptime Kuma push URLs;
 - adds `backup` while preserving other explicitly configured modules;
 - creates active files atomically with root ownership and required modes;
 - preserves existing `paths`, `excludes`, and `freshness`;
@@ -372,8 +376,11 @@ journalctl -u server-infra-backup-check.service
 journalctl -u server-infra-backup-restore-test.service
 ```
 
-Create three independent Uptime Kuma push monitors. A successful daily backup
-must not mask a failed weekly check or monthly restore test.
+Uptime Kuma is optional. When it is enabled, create three independent push
+monitors: a successful daily backup must not mask a failed weekly check or
+monthly restore test. Leave all three URLs empty when monitoring is not yet
+available. Scheduled jobs then continue normally and log that status reporting
+was skipped.
 
 Run the module lifecycle and safety test without contacting a real repository
 or monitor:

@@ -10,6 +10,9 @@ CONFIG_ROOT="$TEST_ROOT/etc/server-infra"
 LOCK_ROOT="$TEST_ROOT/run/server-infra"
 OUTPUT_FILE="$TEST_ROOT/setup.log"
 SECOND_OUTPUT_FILE="$TEST_ROOT/setup-second.log"
+MONITORED_CONFIG_ROOT="$TEST_ROOT/monitored/etc/server-infra"
+MONITORED_LOCK_ROOT="$TEST_ROOT/monitored/run/server-infra"
+MONITORED_OUTPUT_FILE="$TEST_ROOT/monitored/setup.log"
 SETUP="$REPOSITORY_ROOT/scripts/backup-setup.sh"
 
 cleanup() {
@@ -63,9 +66,7 @@ printf '%s\n' \
   "testApplicationSecret" \
   "test-restic-password-with-32-chars" \
   "test-restic-password-with-32-chars" \
-  "https://status.example.test/api/push/backup" \
-  "https://status.example.test/api/push/check" \
-  "https://status.example.test/api/push/restore" \
+  "n" \
   "y" |
   SERVER_INFRA_BACKUP_LOCK_ROOT="$LOCK_ROOT" \
     "$SETUP" --config-root "$CONFIG_ROOT" > "$OUTPUT_FILE" 2>&1
@@ -79,6 +80,13 @@ assert_contains "$CONFIG_ROOT/backup/runtime.env" \
   "RESTIC_REPOSITORY=s3:https://s3.us-west-004.backblazeb2.com/litevi-backups/litevi-acceptance"
 assert_contains "$CONFIG_ROOT/backup/runtime.env" \
   "AWS_DEFAULT_REGION=us-west-004"
+assert_contains "$CONFIG_ROOT/backup/runtime.env" \
+  "UPTIME_KUMA_BACKUP_PUSH_URL="
+assert_contains "$CONFIG_ROOT/backup/runtime.env" \
+  "UPTIME_KUMA_CHECK_PUSH_URL="
+assert_contains "$CONFIG_ROOT/backup/runtime.env" \
+  "UPTIME_KUMA_RESTORE_TEST_PUSH_URL="
+assert_contains "$OUTPUT_FILE" "Uptime Kuma monitoring: disabled"
 assert_contains "$CONFIG_ROOT/backup/paths" "/srv/custom-data"
 [[ "$(file_mode "$CONFIG_ROOT/server.env")" == "640" ]] || \
   fail_test "server.env mode is not 0640"
@@ -100,4 +108,36 @@ SERVER_INFRA_BACKUP_LOCK_ROOT="$LOCK_ROOT" \
   "$SETUP" --config-root "$CONFIG_ROOT" > "$SECOND_OUTPUT_FILE" 2>&1
 assert_contains "$SECOND_OUTPUT_FILE" "backup configuration is already complete"
 
-printf '[backup-setup-test][ok] setup, permissions, secrecy, and rerun passed\n'
+mkdir -p "$MONITORED_CONFIG_ROOT/backup"
+cp "$REPOSITORY_ROOT/server.env.example" "$MONITORED_CONFIG_ROOT/server.env"
+cp "$REPOSITORY_ROOT/modules.env.example" "$MONITORED_CONFIG_ROOT/modules.env"
+
+printf '%s\n' \
+  "monitored-server" \
+  "production" \
+  "Etc/UTC" \
+  "s3.us-west-004.backblazeb2.com" \
+  "monitored-backups" \
+  "monitored-server" \
+  "monitoredApplicationKeyId" \
+  "monitoredApplicationSecret" \
+  "monitored-restic-password-32-chars" \
+  "monitored-restic-password-32-chars" \
+  "y" \
+  "https://status.example.test/api/push/backup" \
+  "https://status.example.test/api/push/check" \
+  "https://status.example.test/api/push/restore" \
+  "y" |
+  SERVER_INFRA_BACKUP_LOCK_ROOT="$MONITORED_LOCK_ROOT" \
+    "$SETUP" --config-root "$MONITORED_CONFIG_ROOT" \
+      > "$MONITORED_OUTPUT_FILE" 2>&1
+
+assert_contains "$MONITORED_CONFIG_ROOT/backup/runtime.env" \
+  "UPTIME_KUMA_BACKUP_PUSH_URL=https://status.example.test/api/push/backup"
+assert_contains "$MONITORED_CONFIG_ROOT/backup/runtime.env" \
+  "UPTIME_KUMA_CHECK_PUSH_URL=https://status.example.test/api/push/check"
+assert_contains "$MONITORED_CONFIG_ROOT/backup/runtime.env" \
+  "UPTIME_KUMA_RESTORE_TEST_PUSH_URL=https://status.example.test/api/push/restore"
+assert_contains "$MONITORED_OUTPUT_FILE" "Uptime Kuma monitoring: enabled"
+
+printf '[backup-setup-test][ok] optional monitoring, permissions, secrecy, and rerun passed\n'
