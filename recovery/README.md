@@ -124,7 +124,15 @@ anything different is left untouched and rejected.
 ## Operations
 
 After fencing the failed VM, authorizing temporary Git access, cloning
-`server-infra`, and checking out the break-glass ref:
+`server-infra`, and checking out the break-glass ref, prepare the clean host
+without creating active configuration:
+
+```bash
+./scripts/bootstrap.sh --check
+sudo ./scripts/bootstrap.sh --apply
+```
+
+Then initialize the recovery session:
 
 ```bash
 sudo ./recovery/bin/server-infra-recovery init \
@@ -234,7 +242,8 @@ manager, and remove temporary plaintext copies after recovery.
 
 ## Recovery order
 
-1. Fence the failed server and authorize temporary Git access.
+1. Fence the failed server, authorize temporary Git access, and bootstrap the
+   clean host.
 2. Verify this repository and its exact commit.
 3. Restore and validate `/etc/server-infra`.
 4. Select one exact data snapshot for the entire recovery.

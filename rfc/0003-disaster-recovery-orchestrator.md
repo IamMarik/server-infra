@@ -51,6 +51,10 @@ minimum manual entry procedure is:
 4. clone the repository URL from the break-glass record;
 5. check out its exact recorded commit.
 
+The operator then runs the common clean-host bootstrap defined in RFC 0004
+before initializing the recovery session. Bootstrap installs the required
+tools and shared runtime roots without creating `/etc/server-infra`.
+
 Copying an existing private SSH key to the failed server's replacement is not
 part of the workflow. Git credentials are not stored in restic or recovery
 state.

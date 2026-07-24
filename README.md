@@ -25,6 +25,7 @@ server-infra/
 ├── rfc/
 ├── scripts/
 ├── environments/
+├── bootstrap/
 ├── proxy/
 ├── monitoring/
 ├── backup/
@@ -58,6 +59,21 @@ capabilities are implemented incrementally.
 The `environments/` flow is retained temporarily for rollback while runtime
 configuration migrates to `/etc/server-infra`. Do not add new runtime values
 or secrets to the repository.
+
+## Clean host bootstrap
+
+After creating a Debian or Ubuntu VM, establishing SSH access, and cloning
+this repository, prepare the common host foundation:
+
+```bash
+./scripts/bootstrap.sh --check
+sudo ./scripts/bootstrap.sh --apply
+```
+
+Bootstrap installs Git, the OpenSSH client, CA certificates, curl, restic,
+Docker Engine, and Docker Compose, then prepares the shared runtime roots. It
+never creates `/etc/server-infra`, changes SSH or firewall policy, or starts
+public infrastructure. See `bootstrap/README.md`.
 
 ## Repository check
 
@@ -164,11 +180,12 @@ sudo server-infra-backup project restore-db \
 ```
 
 For complete VM loss, keep the secret break-glass record outside the server
-and follow [backup/RECOVERY.md](backup/RECOVERY.md). On the clean replacement
-host, initialize a non-secret resumable session after cloning the exact
-server-infra ref:
+and follow [backup/RECOVERY.md](backup/RECOVERY.md). On the replacement host,
+clone the exact server-infra ref, apply the common bootstrap, then initialize
+a non-secret resumable session:
 
 ```bash
+sudo ./scripts/bootstrap.sh --apply
 sudo ./recovery/bin/server-infra-recovery init \
   --break-glass /home/ubuntu/server-infra-break-glass.txt
 sudo ./recovery/bin/server-infra-recovery plan
@@ -231,5 +248,9 @@ cutover remain operator-guided. See `recovery/README.md`.
   configuration migration.
 - `rfc/0003-disaster-recovery-orchestrator.md` defines the approved recovery
   workflow and resumable state.
+- `rfc/0004-clean-host-bootstrap.md` defines reproducible preparation of a
+  clean Debian or Ubuntu host.
+- `bootstrap/README.md` documents clean-host preparation and its security
+  boundary.
 - `backup/RECOVERY.md` defines the complete-server recovery runbook and
   break-glass record.

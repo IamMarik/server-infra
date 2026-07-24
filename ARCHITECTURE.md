@@ -148,6 +148,26 @@ A script performs one operational action, such as deploy, health, logs, or boots
 
 Scripts must be idempotent and deterministic. Running the same script multiple times should converge to the same server state.
 
+### Clean host bootstrap
+
+Bootstrap prepares the operating-system foundation before active host
+configuration exists. It installs common tooling and creates shared runtime,
+state, and cache roots, but it never creates `/etc/server-infra`, application
+state, or public routes.
+
+The same bootstrap contract precedes both a new-host setup and disaster
+recovery:
+
+```text
+trusted repository checkout
+  -> clean host bootstrap
+  -> create OR restore /etc/server-infra
+  -> deploy OR recover projects
+```
+
+The approved package, Docker, and security boundaries are defined in
+`rfc/0004-clean-host-bootstrap.md`.
+
 ### Recovery workflow
 
 `recovery/` is an operator workflow, not a module. It does not have a module
@@ -241,4 +261,6 @@ be added there.
 
 The approved `backup/` top-level module and its host-driver requirements are
 defined in `rfc/0001-backup-stack.md`. The approved non-module `recovery/`
-workflow is defined in `rfc/0003-disaster-recovery-orchestrator.md`.
+workflow is defined in `rfc/0003-disaster-recovery-orchestrator.md`. The
+common pre-configuration host preparation contract is defined in
+`rfc/0004-clean-host-bootstrap.md`.

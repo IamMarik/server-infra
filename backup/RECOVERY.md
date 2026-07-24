@@ -82,9 +82,22 @@ to both old and recovered databases.
 
 ### 2. Prepare a clean host
 
-Install the operating system, SSH access, Docker Compose, Git, and system CA
-certificates. Authorize a fresh Git key, then clone the server-infra repository
-from the break-glass record and check out its recorded ref.
+Install the operating system and establish SSH access. Authorize a fresh Git
+key, then obtain the server-infra repository from the break-glass record and
+check out its recorded ref. If the base image does not contain Git, install
+only enough tooling to obtain that initial trusted checkout or transfer it
+from the operator workstation.
+
+Run the common clean-host bootstrap:
+
+```bash
+./scripts/bootstrap.sh --check
+sudo ./scripts/bootstrap.sh --apply
+```
+
+It installs the remaining Git, OpenSSH client, CA, curl, restic, and Docker
+requirements and prepares shared runtime roots. It does not create
+`/etc/server-infra`, change SSH or firewall policy, or start public services.
 
 Initialize the recovery session. This verifies the break-glass record against
 the checkout without copying its secrets:
@@ -93,12 +106,6 @@ the checkout without copying its secrets:
 sudo ./recovery/bin/server-infra-recovery init \
   --break-glass /home/ubuntu/server-infra-break-glass.txt
 sudo ./recovery/bin/server-infra-recovery plan
-```
-
-Install restic:
-
-```bash
-sudo ./scripts/install-restic.sh --apply
 ```
 
 ### 3. Restore host configuration

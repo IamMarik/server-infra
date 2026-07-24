@@ -2035,7 +2035,8 @@ run_plan() {
   validate_state_file
 
   printf 'Recovery plan for %s\n\n' "$RECOVERY_INSTANCE"
-  print_phase 0 "manual" "Fence the failed server and authorize temporary Git access"
+  print_phase 0 "manual" \
+    "Fence the failed server, authorize Git, and bootstrap the clean host"
   print_phase 1 "$RECOVERY_PHASE_REPOSITORY" \
     "Verify server-infra repository and exact commit"
   print_phase 2 "$RECOVERY_PHASE_CONFIG" \
