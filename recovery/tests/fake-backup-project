@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+[[ -n "${FAKE_PROJECT_HELPER_LOG:-}" ]]
+[[ "${SERVER_INFRA_BACKUP_EXECUTABLE:-}" == \
+  "${FAKE_EXPECTED_BACKUP_EXECUTABLE:-}" ]]
+
+if [[ "${1:-}" == "recovery-list" ]]; then
+  [[ "${2:-}" == "--config-root" ]]
+  [[ "${3:-}" == "${FAKE_EXPECTED_CONFIG_ROOT:-}" ]]
+  [[ $# -eq 3 ]]
+  exit 0
+fi
+
+[[ "${1:-}" == "restore-db" ]]
+printf '%s ' "$@" >> "$FAKE_PROJECT_HELPER_LOG"
+printf '\n' >> "$FAKE_PROJECT_HELPER_LOG"
+shift
+
+source_name=""
+snapshot_id=""
+target_database=""
+restore_jobs=""
+config_root=""
+
+while (($# > 0)); do
+  case "$1" in
+    --name)
+      source_name="$2"
+      shift 2
+      ;;
+    --snapshot)
+      snapshot_id="$2"
+      shift 2
+      ;;
+    --target-db)
+      target_database="$2"
+      shift 2
+      ;;
+    --jobs)
+      restore_jobs="$2"
+      shift 2
+      ;;
+    --config-root)
+      config_root="$2"
+      shift 2
+      ;;
+    *)
+      exit 1
+      ;;
+  esac
+done
+
+[[ "$source_name" == "${FAKE_EXPECTED_PROJECT_NAME:-}" ]]
+[[ "$snapshot_id" == "${FAKE_EXPECTED_DATA_SNAPSHOT:-}" ]]
+[[ "$target_database" == "${FAKE_EXPECTED_TARGET_DATABASE:-}" ]]
+[[ "$restore_jobs" == "${FAKE_EXPECTED_RESTORE_JOBS:-}" ]]
+[[ "$config_root" == "${FAKE_EXPECTED_CONFIG_ROOT:-}" ]]
+
+if [[ "${FAKE_PROJECT_HELPER_FAIL:-0}" == "1" ]]; then
+  exit 1
+fi
+
+printf '[fake-backup-project][ok] restored %s\n' "$target_database"

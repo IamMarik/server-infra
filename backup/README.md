@@ -352,6 +352,11 @@ Compose service user, creates a new empty database from `template0`, and runs
 `pg_restore` from that regular archive file. Other project files in the data
 snapshot are not downloaded.
 
+During complete-server recovery, use
+`server-infra-recovery restore-project-db` instead of calling this primitive
+directly. The orchestrator supplies the one snapshot already pinned for the
+session and records the isolated target database for safe retries.
+
 The PostgreSQL Compose service must be running and its standard `postgres`
 maintenance database must be available. The configured source database itself
 does not need to accept connections or still exist.

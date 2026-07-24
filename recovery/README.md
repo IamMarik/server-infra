@@ -31,9 +31,11 @@ The current implementation provides:
 - `clone-project` to recreate one checkout at its recorded exact commit.
 - `restore-project-files` to restore declared non-database paths from the
   pinned data snapshot without overwriting live paths.
+- `restore-project-db` to invoke the generic PostgreSQL restore primitive with
+  that same pinned snapshot and one explicitly named isolated target database.
 
-It does not yet restore databases, reinstall project backup sources, deploy
-infrastructure, or start public traffic.
+It does not reinstall project backup sources, validate applications, switch
+their connection settings, deploy infrastructure, or start public traffic.
 
 ## Security model
 
@@ -65,6 +67,12 @@ rejected. Every declared path is installed only when its destination is
 absent; a pre-existing destination must exactly match the selected snapshot.
 Ownership and modes from the snapshot are preserved.
 
+Database restoration also revalidates the exact checkout and requires project
+file restoration to be complete. It passes the already pinned snapshot to the
+backup module's constrained PostgreSQL helper. That helper restores only
+`postgres.dump`, refuses an existing or configured source database, and does
+not change application connection settings.
+
 ## Session state
 
 Default state:
@@ -85,8 +93,9 @@ only:
 - the pinned configuration snapshot and, later, data snapshot;
 - phase statuses.
 
-Each project state stores only its name, the same pinned data snapshot ID, and
-file/database phase statuses. It contains no restored application values.
+Each project state stores only its name, the same pinned data snapshot ID,
+file/database phase statuses, and the non-secret target database name once a
+database restore begins. It contains no restored application values.
 
 `init` never overwrites an existing session. Re-running it with the same
 break-glass record validates and reuses that session. A mismatch fails.
@@ -190,6 +199,31 @@ cache and temporary extraction. Plaintext extraction is removed on success or
 handled failure. The cache can remain because restic stores repository cache
 data, not plaintext configuration secrets.
 
+For a PostgreSQL project, start only its recorded Compose database service;
+keep the application stopped. Then restore the pinned dump into a new
+database:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery restore-project-db \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --name <project-name> \
+  --git-user ubuntu \
+  --target-db <project>_recovered \
+  --jobs 4
+```
+
+The recovered host must first have the backup runtime layout prepared with
+`sudo ./scripts/install.sh --module backup --apply`, as shown in the complete
+runbook. This creates `/run/server-infra` without deploying Caddy or starting
+public services.
+
+There is deliberately no `--snapshot` option: the command uses the immutable
+ID recorded by `select-data`. `--jobs` controls parallel `pg_restore` workers
+and defaults to `4`. The target name is persisted before remote restore work;
+a retry must use the same name. The helper creates only that isolated
+database. Validate it with application-owned checks before manually changing
+the application's connection settings or starting application services.
+
 Use `--state-root` only for tests or an explicitly reviewed non-standard host
 layout. `--config-root` and `--work-root` exist for tests and reviewed
 non-standard hosts; production recovery uses their defaults.
@@ -247,5 +281,12 @@ Run without contacting GitHub, Backblaze, or a real restic repository:
 - A file restore left `in-progress` can be rerun. Already installed matching
   paths are accepted, and plaintext extraction is removed after each handled
   invocation.
+- A failed database restore remains `in-progress` and is retried with the same
+  `--target-db`. The PostgreSQL helper removes a target that it created during
+  a handled failed restore.
+- If the process was killed after PostgreSQL completed but before recovery
+  state was updated, the existing target is intentionally not trusted or
+  overwritten automatically. Validate that database and reconcile the
+  recovery session before proceeding.
 - An existing session is never silently replaced. Session reset will be a
   separate, explicitly destructive operation if it is introduced later.

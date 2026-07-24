@@ -26,6 +26,7 @@ STATUS_OUTPUT="$TEST_ROOT/status.log"
 SNAPSHOTS_OUTPUT="$TEST_ROOT/snapshots.log"
 DATA_SNAPSHOTS_OUTPUT="$TEST_ROOT/data-snapshots.log"
 PROJECTS_PLAN_OUTPUT="$TEST_ROOT/projects-plan.log"
+PROJECT_HELPER_LOG="$TEST_ROOT/project-helper.log"
 RESTIC_LOG="$TEST_ROOT/restic.log"
 GIT_LOG="$TEST_ROOT/git.log"
 PROJECT_ROOT="$TEST_ROOT/projects/test-app"
@@ -107,6 +108,14 @@ export FAKE_PROJECT_ROOT="$PROJECT_ROOT"
 export FAKE_PROJECT_STAGING_DIR="$PROJECT_STAGING_DIR"
 export FAKE_PROJECT_REPOSITORY_URL="$TEST_PROJECT_REPOSITORY_URL"
 export FAKE_PROJECT_DEPLOY_COMMIT="$TEST_PROJECT_DEPLOY_COMMIT"
+export FAKE_PROJECT_HELPER_LOG="$PROJECT_HELPER_LOG"
+export FAKE_EXPECTED_BACKUP_EXECUTABLE="$REPOSITORY_ROOT/backup/bin/server-infra-backup"
+export FAKE_EXPECTED_PROJECT_NAME="test-app"
+export FAKE_EXPECTED_DATA_SNAPSHOT="deadbeef"
+export FAKE_EXPECTED_TARGET_DATABASE="test_app_recovered"
+export FAKE_EXPECTED_RESTORE_JOBS="3"
+export FAKE_EXPECTED_CONFIG_ROOT="$CONFIG_ROOT"
+export SERVER_INFRA_BACKUP_PROJECT_EXECUTABLE="$REPOSITORY_ROOT/recovery/tests/fake-backup-project"
 
 write_break_glass \
   "$BREAK_GLASS_FILE" \
@@ -417,6 +426,84 @@ PATH="$TEST_BIN:$PATH" "$RECOVERY" \
 assert_contains "$PLAN_OUTPUT" \
   "Next: restore projects in dependency order."
 
+if SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  FAKE_PROJECT_HELPER_FAIL=1 PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  restore-project-db \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user "$TEST_GIT_USER" \
+  --target-db test_app_recovered \
+  --jobs 3 >/dev/null 2>&1; then
+  fail_test "Failed database helper was reported as successful"
+fi
+assert_contains "$PROJECT_STATE_FILE" \
+  "PROJECT_DATABASE_STATUS=in-progress"
+assert_contains "$PROJECT_STATE_FILE" \
+  "PROJECT_DATABASE_TARGET=test_app_recovered"
+
+PROJECT_HELPER_LINES_BEFORE="$(wc -l < "$PROJECT_HELPER_LOG")"
+if SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  restore-project-db \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user "$TEST_GIT_USER" \
+  --target-db another_database \
+  --jobs 3 >/dev/null 2>&1; then
+  fail_test "Database retry accepted another target database"
+fi
+PROJECT_HELPER_LINES_AFTER="$(wc -l < "$PROJECT_HELPER_LOG")"
+[[ "$PROJECT_HELPER_LINES_BEFORE" == "$PROJECT_HELPER_LINES_AFTER" ]] || \
+  fail_test "Rejected database target contacted the backup helper"
+
+SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  restore-project-db \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user "$TEST_GIT_USER" \
+  --target-db test_app_recovered \
+  --jobs 3 >> "$COMMAND_OUTPUT" 2>&1
+assert_contains "$PROJECT_HELPER_LOG" \
+  "restore-db --config-root $CONFIG_ROOT --name test-app --snapshot deadbeef --target-db test_app_recovered --jobs 3"
+assert_contains "$PROJECT_STATE_FILE" "PROJECT_DATABASE_STATUS=complete"
+assert_contains "$STATE_FILE" "RECOVERY_PHASE_PROJECTS=complete"
+
+PROJECT_HELPER_LINES_BEFORE="$(wc -l < "$PROJECT_HELPER_LOG")"
+SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  restore-project-db \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user "$TEST_GIT_USER" \
+  --target-db test_app_recovered \
+  --jobs 3 >> "$COMMAND_OUTPUT" 2>&1
+PROJECT_HELPER_LINES_AFTER="$(wc -l < "$PROJECT_HELPER_LOG")"
+[[ "$PROJECT_HELPER_LINES_BEFORE" == "$PROJECT_HELPER_LINES_AFTER" ]] || \
+  fail_test "Repeated completed database restore contacted the helper"
+
+SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  projects-plan \
+  --break-glass "$BREAK_GLASS_FILE" > "$PROJECTS_PLAN_OUTPUT"
+assert_contains "$PROJECTS_PLAN_OUTPUT" \
+  $'test-app\tpostgres-compose\tpresent\tcomplete\tcomplete\ttest_app_recovered'
+
+PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" plan > "$PLAN_OUTPUT"
+assert_contains "$PLAN_OUTPUT" \
+  "Next: verify services before enabling public traffic."
+
 PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   --state-root "$RESUME_STATE_ROOT" \
   init --break-glass "$BREAK_GLASS_FILE" >/dev/null 2>&1
@@ -465,6 +552,7 @@ for secret_value in \
     "$SNAPSHOTS_OUTPUT" \
     "$DATA_SNAPSHOTS_OUTPUT" \
     "$PROJECTS_PLAN_OUTPUT" \
+    "$PROJECT_HELPER_LOG" \
     "$GIT_LOG" \
     "$RESTIC_LOG" >/dev/null; then
     fail_test "Secret value escaped from the break-glass record"
@@ -502,4 +590,4 @@ if PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   fail_test "Recovery accepted a symlinked break-glass record"
 fi
 
-printf '[recovery-test][ok] config, data, checkout, and project files recovery passed\n'
+printf '[recovery-test][ok] config, data, checkout, files, and database recovery passed\n'

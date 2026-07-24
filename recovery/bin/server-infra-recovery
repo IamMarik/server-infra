@@ -18,6 +18,8 @@ BREAK_GLASS_FILE=""
 SNAPSHOT_ID=""
 PROJECT_NAME=""
 GIT_USER=""
+TARGET_DATABASE=""
+RESTORE_JOBS=4
 TEMP_FILE=""
 LOCK_DIR=""
 RESTORE_TARGET=""
@@ -69,6 +71,11 @@ Usage:
     [--config-root <absolute-path>] [--work-root <absolute-path>] \
     restore-project-files --break-glass <absolute-path> \
     --name <source-name> --git-user <ordinary-user>
+  server-infra-recovery [--state-root <absolute-path>] \
+    [--config-root <absolute-path>] \
+    restore-project-db --break-glass <absolute-path> \
+    --name <source-name> --git-user <ordinary-user> \
+    --target-db <new-database> [--jobs <count>]
 
 Operations:
   init
@@ -95,10 +102,13 @@ Operations:
   restore-project-files
     Restore declared application files from the pinned data snapshot without
     restoring the PostgreSQL staging directory or overwriting existing paths.
+  restore-project-db
+    Restore PostgreSQL from the pinned data snapshot into one new database.
+    The configured source database and application connection remain unchanged.
 
-The implementation does not yet restore databases, install project backup
-sources, deploy infrastructure, or start traffic. Follow backup/RECOVERY.md
-for those phases.
+The implementation does not install project backup sources, deploy
+infrastructure, validate applications, switch databases, or start traffic.
+Follow backup/RECOVERY.md for those phases.
 
 Defaults to:
   --state-root /var/lib/server-infra/recovery
@@ -243,6 +253,21 @@ validate_deploy_commit() {
   [[ "$deploy_commit" =~ ^[0-9a-f]{40}$ || \
     "$deploy_commit" =~ ^[0-9a-f]{64}$ ]] || \
     fail "Project deploy commit must be a full lowercase object ID"
+}
+
+validate_database_name() {
+  local database_name="$1"
+
+  [[ "$database_name" =~ ^[a-z][a-z0-9_]*$ ]] || \
+    fail "Target database must use lowercase snake_case"
+  ((${#database_name} <= 63)) || \
+    fail "Target database must not exceed 63 characters"
+}
+
+validate_restore_jobs() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]] || \
+    fail "Restore jobs must be a positive integer"
+  ((10#$1 <= 32)) || fail "Restore jobs must not exceed 32"
 }
 
 validate_git_user() {
@@ -1371,7 +1396,7 @@ validate_project_state_storage() {
 }
 
 validate_project_state_file() {
-  local allowed_keys=$'\nPROJECT_RECOVERY_STATE_VERSION\nPROJECT_NAME\nPROJECT_DATA_SNAPSHOT\nPROJECT_FILES_STATUS\nPROJECT_DATABASE_STATUS\n'
+  local allowed_keys=$'\nPROJECT_RECOVERY_STATE_VERSION\nPROJECT_NAME\nPROJECT_DATA_SNAPSHOT\nPROJECT_FILES_STATUS\nPROJECT_DATABASE_STATUS\nPROJECT_DATABASE_TARGET\n'
   local seen_keys=$'\n'
   local line=""
   local line_number=0
@@ -1413,6 +1438,9 @@ validate_project_state_file() {
   PROJECT_DATABASE_STATUS="$(
     read_required_env_value "$PROJECT_STATE_FILE" "PROJECT_DATABASE_STATUS"
   )"
+  PROJECT_DATABASE_TARGET="$(
+    read_env_value "$PROJECT_STATE_FILE" "PROJECT_DATABASE_TARGET" || true
+  )"
 
   [[ "$PROJECT_RECOVERY_STATE_VERSION" == "1" ]] || \
     fail "Unsupported project recovery state version"
@@ -1437,9 +1465,19 @@ validate_project_state_file() {
   if [[ "$SELECTED_PROJECT_TYPE" == "files-only" ]]; then
     [[ "$PROJECT_DATABASE_STATUS" == "not-applicable" ]] || \
       fail "Files-only project must not have database recovery state"
+    [[ -z "$PROJECT_DATABASE_TARGET" ]] || \
+      fail "Files-only project must not have a database target"
   else
     [[ "$PROJECT_DATABASE_STATUS" != "not-applicable" ]] || \
       fail "PostgreSQL project is missing database recovery state"
+    if [[ "$PROJECT_DATABASE_STATUS" == "pending" ]]; then
+      [[ -z "$PROJECT_DATABASE_TARGET" ]] || \
+        fail "Pending PostgreSQL recovery must not have a database target"
+    else
+      [[ -n "$PROJECT_DATABASE_TARGET" ]] || \
+        fail "Started PostgreSQL recovery is missing its database target"
+      validate_database_name "$PROJECT_DATABASE_TARGET"
+    fi
   fi
 }
 
@@ -1460,6 +1498,7 @@ write_project_state_file() {
     printf '%s\n' "PROJECT_DATA_SNAPSHOT=$PROJECT_STATE_DATA_SNAPSHOT"
     printf '%s\n' "PROJECT_FILES_STATUS=$PROJECT_FILES_STATUS"
     printf '%s\n' "PROJECT_DATABASE_STATUS=$PROJECT_DATABASE_STATUS"
+    printf '%s\n' "PROJECT_DATABASE_TARGET=$PROJECT_DATABASE_TARGET"
   } > "$TEMP_FILE"
   chmod 0600 "$TEMP_FILE"
 
@@ -1501,6 +1540,7 @@ ensure_project_state() {
     printf '%s\n' "PROJECT_DATA_SNAPSHOT=$RECOVERY_DATA_SNAPSHOT"
     printf '%s\n' "PROJECT_FILES_STATUS=pending"
     printf '%s\n' "PROJECT_DATABASE_STATUS=$initial_database_status"
+    printf '%s\n' "PROJECT_DATABASE_TARGET="
   } > "$TEMP_FILE"
   chmod 0600 "$TEMP_FILE"
   if ! ln "$TEMP_FILE" "$PROJECT_STATE_FILE"; then
@@ -1771,6 +1811,81 @@ run_restore_project_files() {
   recovery_warn "PostgreSQL and application services remain untouched"
 }
 
+run_restore_project_database() {
+  local backup_executable="$REPOSITORY_ROOT/backup/bin/server-infra-backup"
+
+  [[ -n "$PROJECT_NAME" ]] || fail "restore-project-db requires --name"
+  [[ -n "$GIT_USER" ]] || fail "restore-project-db requires --git-user"
+  [[ -n "$TARGET_DATABASE" ]] || \
+    fail "restore-project-db requires --target-db"
+  validate_git_user "$GIT_USER"
+  validate_database_name "$TARGET_DATABASE"
+  validate_restore_jobs "$RESTORE_JOBS"
+  load_recovery_context
+  validate_projects_phase_ready
+  discover_project_inventory
+  select_project_record
+  [[ "$SELECTED_PROJECT_TYPE" == "postgres-compose" ]] || \
+    fail "restore-project-db supports only postgres-compose sources"
+  validate_project_checkout "$SELECTED_PROJECT_ROOT"
+  [[ -x "$backup_executable" && ! -L "$backup_executable" ]] || \
+    fail "Repository backup executable is not available"
+
+  acquire_recovery_lock
+  trap cleanup EXIT
+  validate_state_file
+  ensure_project_state
+
+  [[ "$PROJECT_FILES_STATUS" == "complete" ]] || \
+    fail "Project files must be restored before its database"
+  if [[ "$RECOVERY_PHASE_PROJECTS" == "pending" ]]; then
+    RECOVERY_PHASE_PROJECTS="in-progress"
+    write_state_file
+  else
+    [[ "$RECOVERY_PHASE_PROJECTS" == "in-progress" || \
+      "$RECOVERY_PHASE_PROJECTS" == "complete" ]] || \
+      fail "Project recovery phase is in an unsupported state"
+  fi
+
+  if [[ "$PROJECT_DATABASE_STATUS" == "complete" ]]; then
+    [[ "$PROJECT_DATABASE_TARGET" == "$TARGET_DATABASE" ]] || \
+      fail "Project database was already restored into another target"
+    refresh_projects_phase
+    recovery_ok \
+      "project database is already restored: $PROJECT_DATABASE_TARGET"
+    return
+  fi
+  if [[ "$PROJECT_DATABASE_STATUS" == "pending" ]]; then
+    PROJECT_DATABASE_STATUS="in-progress"
+    PROJECT_DATABASE_TARGET="$TARGET_DATABASE"
+    write_project_state_file
+  else
+    [[ "$PROJECT_DATABASE_STATUS" == "in-progress" ]] || \
+      fail "Project database restore is in an unsupported state"
+    [[ "$PROJECT_DATABASE_TARGET" == "$TARGET_DATABASE" ]] || \
+      fail "Project database restore is already pinned to another target"
+  fi
+
+  recovery_log \
+    "Restoring $PROJECT_NAME database from pinned snapshot $RECOVERY_DATA_SNAPSHOT"
+  SERVER_INFRA_BACKUP_EXECUTABLE="$backup_executable" \
+    "$backup_executable" \
+    project restore-db \
+    --config-root "$CONFIG_ROOT" \
+    --name "$PROJECT_NAME" \
+    --snapshot "$RECOVERY_DATA_SNAPSHOT" \
+    --target-db "$TARGET_DATABASE" \
+    --jobs "$RESTORE_JOBS"
+
+  PROJECT_DATABASE_STATUS="complete"
+  write_project_state_file
+  refresh_projects_phase
+  recovery_ok \
+    "project database restored into isolated target: $TARGET_DATABASE"
+  recovery_warn \
+    "Application validation and database cutover remain manual"
+}
+
 run_projects_plan() {
   local sources_root
   local source_dirs=()
@@ -1778,6 +1893,7 @@ run_projects_plan() {
   local checkout_state
   local files_state
   local database_state
+  local database_target
 
   load_recovery_context
   validate_projects_phase_ready
@@ -1787,12 +1903,13 @@ run_projects_plan() {
   source_dirs=("$sources_root"/*)
   shopt -u nullglob
 
-  printf 'NAME\tTYPE\tCHECKOUT\tFILES\tDATABASE\tPROJECT_ROOT\tREPOSITORY_URL\tDEPLOY_COMMIT\tDATA_SNAPSHOT\n'
+  printf 'NAME\tTYPE\tCHECKOUT\tFILES\tDATABASE\tDATABASE_TARGET\tPROJECT_ROOT\tREPOSITORY_URL\tDEPLOY_COMMIT\tDATA_SNAPSHOT\n'
   for source_dir in "${source_dirs[@]}"; do
     load_project_record "$source_dir"
     checkout_state="absent"
     files_state="not-started"
     database_state="not-started"
+    database_target="-"
     if [[ "$SELECTED_PROJECT_TYPE" == "files-only" ]]; then
       database_state="not-applicable"
     fi
@@ -1805,13 +1922,15 @@ run_projects_plan() {
       validate_project_state_file
       files_state="$PROJECT_FILES_STATUS"
       database_state="$PROJECT_DATABASE_STATUS"
+      database_target="${PROJECT_DATABASE_TARGET:--}"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$SELECTED_PROJECT_NAME" \
       "$SELECTED_PROJECT_TYPE" \
       "$checkout_state" \
       "$files_state" \
       "$database_state" \
+      "$database_target" \
       "$SELECTED_PROJECT_ROOT" \
       "$SELECTED_PROJECT_REPOSITORY_URL" \
       "$SELECTED_PROJECT_DEPLOY_COMMIT" \
@@ -1968,6 +2087,8 @@ parse_arguments() {
   local snapshot_set=0
   local project_name_set=0
   local git_user_set=0
+  local target_database_set=0
+  local restore_jobs_set=0
 
   while (($# > 0)); do
     case "$1" in
@@ -2083,13 +2204,45 @@ parse_arguments() {
         git_user_set=1
         shift
         ;;
+      --target-db)
+        (($# >= 2)) || fail "Missing value for --target-db"
+        [[ "$target_database_set" == "0" ]] || \
+          fail "--target-db may be specified only once"
+        TARGET_DATABASE="$2"
+        target_database_set=1
+        shift 2
+        ;;
+      --target-db=*)
+        [[ "$target_database_set" == "0" ]] || \
+          fail "--target-db may be specified only once"
+        TARGET_DATABASE="${1#*=}"
+        [[ -n "$TARGET_DATABASE" ]] || fail "Missing value for --target-db"
+        target_database_set=1
+        shift
+        ;;
+      --jobs)
+        (($# >= 2)) || fail "Missing value for --jobs"
+        [[ "$restore_jobs_set" == "0" ]] || \
+          fail "--jobs may be specified only once"
+        RESTORE_JOBS="$2"
+        restore_jobs_set=1
+        shift 2
+        ;;
+      --jobs=*)
+        [[ "$restore_jobs_set" == "0" ]] || \
+          fail "--jobs may be specified only once"
+        RESTORE_JOBS="${1#*=}"
+        [[ -n "$RESTORE_JOBS" ]] || fail "Missing value for --jobs"
+        restore_jobs_set=1
+        shift
+        ;;
       --help | -h)
         usage
         exit 0
         ;;
       init | plan | status | config-snapshots | restore-config | \
       data-snapshots | select-data | projects-plan | clone-project | \
-      restore-project-files)
+      restore-project-files | restore-project-db)
         [[ -z "$OPERATION" ]] || fail "Specify exactly one operation"
         OPERATION="$1"
         shift
@@ -2109,11 +2262,15 @@ parse_arguments() {
         fail "--config-root and --work-root are not supported by $OPERATION"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
         fail "--name and --git-user are supported only by project recovery operations"
+      [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
+        fail "--target-db and --jobs are supported only by restore-project-db"
       ;;
     restore-config)
       [[ -n "$SNAPSHOT_ID" ]] || fail "restore-config requires --snapshot"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
         fail "--name and --git-user are supported only by project recovery operations"
+      [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
+        fail "--target-db and --jobs are supported only by restore-project-db"
       ;;
     data-snapshots)
       [[ -z "$SNAPSHOT_ID" ]] || \
@@ -2122,6 +2279,8 @@ parse_arguments() {
         fail "--work-root is not supported by data-snapshots"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
         fail "--name and --git-user are supported only by project recovery operations"
+      [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
+        fail "--target-db and --jobs are supported only by restore-project-db"
       ;;
     select-data)
       [[ -n "$SNAPSHOT_ID" ]] || fail "select-data requires --snapshot"
@@ -2129,6 +2288,8 @@ parse_arguments() {
         fail "--work-root is not supported by select-data"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
         fail "--name and --git-user are supported only by project recovery operations"
+      [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
+        fail "--target-db and --jobs are supported only by restore-project-db"
       ;;
     projects-plan)
       [[ -z "$SNAPSHOT_ID" ]] || \
@@ -2137,6 +2298,8 @@ parse_arguments() {
         fail "--work-root is not supported by projects-plan"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
         fail "--name and --git-user are supported only by project recovery operations"
+      [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
+        fail "--target-db and --jobs are supported only by restore-project-db"
       ;;
     clone-project)
       [[ -z "$SNAPSHOT_ID" ]] || \
@@ -2145,6 +2308,8 @@ parse_arguments() {
         fail "--work-root is not supported by clone-project"
       [[ -n "$PROJECT_NAME" ]] || fail "clone-project requires --name"
       [[ -n "$GIT_USER" ]] || fail "clone-project requires --git-user"
+      [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
+        fail "--target-db and --jobs are supported only by restore-project-db"
       ;;
     restore-project-files)
       [[ -z "$SNAPSHOT_ID" ]] || \
@@ -2153,6 +2318,18 @@ parse_arguments() {
         fail "restore-project-files requires --name"
       [[ -n "$GIT_USER" ]] || \
         fail "restore-project-files requires --git-user"
+      [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
+        fail "--target-db and --jobs are supported only by restore-project-db"
+      ;;
+    restore-project-db)
+      [[ -z "$SNAPSHOT_ID" ]] || \
+        fail "--snapshot is not supported by restore-project-db"
+      [[ "$work_root_set" == "0" ]] || \
+        fail "--work-root is not supported by restore-project-db"
+      [[ -n "$PROJECT_NAME" ]] || fail "restore-project-db requires --name"
+      [[ -n "$GIT_USER" ]] || fail "restore-project-db requires --git-user"
+      [[ -n "$TARGET_DATABASE" ]] || \
+        fail "restore-project-db requires --target-db"
       ;;
     plan | status)
       [[ -z "$BREAK_GLASS_FILE" && -z "$SNAPSHOT_ID" ]] || \
@@ -2161,6 +2338,8 @@ parse_arguments() {
         fail "--config-root and --work-root are not supported by $OPERATION"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
         fail "--name and --git-user are supported only by project recovery operations"
+      [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
+        fail "--target-db and --jobs are supported only by restore-project-db"
       ;;
   esac
   if [[ "$OPERATION" != "plan" && "$OPERATION" != "status" && \
@@ -2203,6 +2382,9 @@ main() {
       ;;
     restore-project-files)
       run_restore_project_files
+      ;;
+    restore-project-db)
+      run_restore_project_database
       ;;
   esac
 }

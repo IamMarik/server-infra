@@ -171,9 +171,19 @@ The fifth increment implements:
 - refusal to overwrite a different existing path;
 - preservation of snapshot ownership and modes with resumable retry behavior.
 
-PostgreSQL restoration, application validation, deployment, and finalization
-remain documented manual operations until their contracts are separately
-implemented and tested.
+The sixth increment implements:
+
+- `restore-project-db --break-glass --name --git-user --target-db`;
+- use of the session's immutable data snapshot without an operator snapshot
+  argument;
+- persistence of the isolated target database before restore work begins;
+- constrained delegation to the backup module's PostgreSQL restore primitive;
+- refusal to change a target on retry and idempotent completed-state handling;
+- no application database promotion, connection change, or service cutover.
+
+Application validation, deployment, database cutover, and finalization remain
+documented manual operations until their contracts are separately implemented
+and tested.
 
 ## Consequences
 

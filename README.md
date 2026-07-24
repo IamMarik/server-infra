@@ -209,10 +209,16 @@ sudo ./recovery/bin/server-infra-recovery restore-project-files \
   --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --name <project-name> \
   --git-user ubuntu
+sudo ./recovery/bin/server-infra-recovery restore-project-db \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --name <project-name> \
+  --git-user ubuntu \
+  --target-db <project>_recovered
 ```
 
-Database restoration, service validation, and traffic cutover remain
-operator-guided. See `recovery/README.md`.
+The database command always uses the session's pinned data snapshot and
+restores into a new isolated database. Application validation and traffic
+cutover remain operator-guided. See `recovery/README.md`.
 
 ## Documentation
 

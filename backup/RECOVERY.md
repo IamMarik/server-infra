@@ -130,9 +130,15 @@ ID. Another snapshot is rejected for that recovery session.
 ### 4. Validate restored configuration
 
 ```bash
+sudo ./scripts/install.sh --module backup --apply
 ./scripts/validate-config.sh
 sudo ./scripts/deploy.sh --check
 ```
+
+The backup layout preparation is idempotent. At this stage it creates the
+runtime lock directory required by repository restore commands and confirms
+the recovered backup directory layout; it does not deploy units or start
+services.
 
 Do not apply the complete infrastructure yet. In particular, keep Caddy out of
 the traffic path until projects and databases are restored and validated.
@@ -215,11 +221,19 @@ Do not copy a restored data tree blindly over a Git checkout.
 Start only the PostgreSQL Compose service first. Keep the application stopped.
 
 ```bash
-sudo "$SERVER_INFRA_ROOT/backup/bin/server-infra-backup" project restore-db \
-  --snapshot <data-snapshot-id> \
+sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" \
+  restore-project-db \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --name <project-name> \
+  --git-user ubuntu \
   --target-db <project>_recovered \
   --jobs 4
 ```
+
+The recovery command supplies the data snapshot already pinned by
+`select-data`; do not enter it again. It also records the isolated target
+database before calling the backup module's PostgreSQL helper, so retries
+cannot drift to another target.
 
 Validate the restored database with the application-owned checks. Then update
 the application connection settings, recreate affected containers, and start

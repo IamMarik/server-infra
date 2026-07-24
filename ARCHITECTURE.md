@@ -168,6 +168,9 @@ state belongs outside Git under:
 
 The session and project state contain no provider credentials, restic
 password, Git private key, restored application value, or application secret.
+Project state may record the non-secret name of an isolated PostgreSQL restore
+target so an interrupted restore cannot silently continue into another
+database.
 The restored host configuration and project `recovery.conf` files remain the
 sources of truth; the orchestrator must not duplicate their values in a
 tracked server description.
