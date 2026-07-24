@@ -187,9 +187,7 @@ the same recovery state machine:
 
 ```bash
 sudo ./scripts/bootstrap.sh --apply
-sudo ./recovery/bin/server-infra-recovery-wizard \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
-  --git-user ubuntu
+sudo ./recovery/bin/server-infra-recovery-wizard
 ```
 
 The wizard validates remote backup access, asks for exact configuration and
@@ -197,26 +195,26 @@ data snapshot IDs, displays infrastructure as deferred work, and lets the
 operator select projects with checkbox-style toggles. PostgreSQL is restored
 into a new isolated database after starting only its Compose database service.
 It does not start applications, deploy Caddy, change DNS, or enable traffic.
+The default secret input is `server-infra-break-glass.txt` in the repository
+root; that filename is ignored by Git and must have mode `0600`. Git operations
+use the ordinary account from `SUDO_USER`, while root remains responsible only
+for host configuration and recovery state. Both defaults have explicit CLI
+overrides for non-standard layouts and automation.
 
 The non-interactive commands remain available for automation and diagnosis:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery init \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
-sudo ./recovery/bin/server-infra-recovery config-snapshots \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery init
+sudo ./recovery/bin/server-infra-recovery config-snapshots
 sudo ./recovery/bin/server-infra-recovery restore-config \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --snapshot <config-snapshot-id>
 ```
 
 After configuration recovery, pin one data point for every project:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery data-snapshots \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery data-snapshots
 sudo ./recovery/bin/server-infra-recovery select-data \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --snapshot <data-snapshot-id>
 ```
 
@@ -224,20 +222,13 @@ Then validate the recovered project inventory and recreate each exact Git
 checkout as an ordinary user:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery projects-plan \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery projects-plan
 sudo ./recovery/bin/server-infra-recovery clone-project \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
-  --name <project-name> \
-  --git-user ubuntu
+  --name <project-name>
 sudo ./recovery/bin/server-infra-recovery restore-project-files \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
-  --name <project-name> \
-  --git-user ubuntu
+  --name <project-name>
 sudo ./recovery/bin/server-infra-recovery restore-project-db \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --name <project-name> \
-  --git-user ubuntu \
   --target-db <project>_recovered \
   --start-service
 ```

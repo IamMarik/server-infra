@@ -9,6 +9,7 @@ REPOSITORY_ROOT="$(cd "$RECOVERY_ROOT/.." && pwd)"
 source "$REPOSITORY_ROOT/scripts/common.sh"
 
 STATE_VERSION=1
+DEFAULT_BREAK_GLASS_FILE="${SERVER_INFRA_BREAK_GLASS_FILE:-$REPOSITORY_ROOT/server-infra-break-glass.txt}"
 STATE_ROOT="/var/lib/server-infra/recovery"
 STATE_FILE=""
 CONFIG_ROOT="/etc/server-infra"
@@ -47,35 +48,35 @@ usage() {
   cat <<'USAGE'
 Usage:
   server-infra-recovery [--state-root <absolute-path>] \
-    init --break-glass <absolute-path>
+    init [--break-glass <absolute-path>]
   server-infra-recovery [--state-root <absolute-path>] plan
   server-infra-recovery [--state-root <absolute-path>] status
   server-infra-recovery [--state-root <absolute-path>] \
-    config-snapshots --break-glass <absolute-path>
+    config-snapshots [--break-glass <absolute-path>]
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] [--work-root <absolute-path>] \
-    restore-config --break-glass <absolute-path> --snapshot <exact-id>
+    restore-config [--break-glass <absolute-path>] --snapshot <exact-id>
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] \
-    data-snapshots --break-glass <absolute-path>
+    data-snapshots [--break-glass <absolute-path>]
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] \
-    select-data --break-glass <absolute-path> --snapshot <exact-id>
+    select-data [--break-glass <absolute-path>] --snapshot <exact-id>
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] \
-    projects-plan --break-glass <absolute-path>
+    projects-plan [--break-glass <absolute-path>]
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] \
-    clone-project --break-glass <absolute-path> \
-    --name <source-name> --git-user <ordinary-user>
+    clone-project [--break-glass <absolute-path>] \
+    --name <source-name> [--git-user <ordinary-user>]
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] [--work-root <absolute-path>] \
-    restore-project-files --break-glass <absolute-path> \
-    --name <source-name> --git-user <ordinary-user>
+    restore-project-files [--break-glass <absolute-path>] \
+    --name <source-name> [--git-user <ordinary-user>]
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] \
-    restore-project-db --break-glass <absolute-path> \
-    --name <source-name> --git-user <ordinary-user> \
+    restore-project-db [--break-glass <absolute-path>] \
+    --name <source-name> [--git-user <ordinary-user>] \
     --target-db <new-database> [--jobs <count>] [--start-service]
 
 Operations:
@@ -113,6 +114,8 @@ infrastructure, validate applications, switch databases, or start traffic.
 Follow backup/RECOVERY.md for those phases.
 
 Defaults to:
+  --break-glass <repository-root>/server-infra-break-glass.txt
+  --git-user SUDO_USER for project operations invoked through sudo
   --state-root /var/lib/server-infra/recovery
   --config-root /etc/server-infra
   --work-root /var/cache/server-infra/recovery
@@ -2272,6 +2275,18 @@ parse_arguments() {
   done
 
   [[ -n "$OPERATION" ]] || { usage; exit 1; }
+  if [[ "$OPERATION" != "plan" && "$OPERATION" != "status" && \
+    -z "$BREAK_GLASS_FILE" ]]; then
+    BREAK_GLASS_FILE="$DEFAULT_BREAK_GLASS_FILE"
+  fi
+  case "$OPERATION" in
+    clone-project | restore-project-files | restore-project-db)
+      if [[ -z "$GIT_USER" && -n "${SUDO_USER:-}" && \
+        "${SUDO_USER:-}" != "root" ]]; then
+        GIT_USER="$SUDO_USER"
+      fi
+      ;;
+  esac
   case "$OPERATION" in
     init | config-snapshots)
       [[ -z "$SNAPSHOT_ID" ]] || \
@@ -2376,10 +2391,6 @@ parse_arguments() {
         fail "--start-service is supported only by restore-project-db"
       ;;
   esac
-  if [[ "$OPERATION" != "plan" && "$OPERATION" != "status" && \
-    -z "$BREAK_GLASS_FILE" ]]; then
-    fail "$OPERATION requires --break-glass"
-  fi
 }
 
 main() {

@@ -142,9 +142,7 @@ sudo ./scripts/bootstrap.sh --apply
 Then initialize the recovery session:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery-wizard \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
-  --git-user ubuntu
+sudo ./recovery/bin/server-infra-recovery-wizard
 ```
 
 This recommended interactive path validates backup access, asks for exact
@@ -158,11 +156,20 @@ configured database service, and restores into that isolated database.
 Application startup, validation, connection cutover, infrastructure
 deployment, DNS, and traffic remain explicit later steps.
 
+The zero-option command expects
+`<repository-root>/server-infra-break-glass.txt`. The filename is ignored by
+Git, but the file remains a `0600` secret and should be removed from the
+replacement host after recovery. `--break-glass` overrides the path.
+
+The wizard requires root for `/etc` and recovery state. It infers the ordinary
+project owner from `SUDO_USER` so Git does not run as root and the recreated
+checkout can use that account's SSH access. Use `--git-user` only from a root
+shell, in automation, or when another deployment account owns the projects.
+
 Use the non-interactive interface for automation or individual retries:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery init \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery init
 
 sudo ./recovery/bin/server-infra-recovery plan
 sudo ./recovery/bin/server-infra-recovery status
@@ -172,22 +179,18 @@ List matching configuration snapshots, choose one explicit ID, then restore
 it:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery config-snapshots \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery config-snapshots
 
 sudo ./recovery/bin/server-infra-recovery restore-config \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --snapshot <config-snapshot-id>
 ```
 
 List and pin one data snapshot:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery data-snapshots \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery data-snapshots
 
 sudo ./recovery/bin/server-infra-recovery select-data \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --snapshot <data-snapshot-id>
 ```
 
@@ -195,13 +198,10 @@ Validate the project inventory, then recreate one checkout. Repeat
 `clone-project` for each row in dependency order:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery projects-plan \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery projects-plan
 
 sudo ./recovery/bin/server-infra-recovery clone-project \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
-  --name <project-name> \
-  --git-user ubuntu
+  --name <project-name>
 ```
 
 The parent of the recorded `PROJECT_ROOT` must already exist. For SSH remotes,
@@ -217,9 +217,7 @@ Restore the declared `.env`, uploads, and other non-database paths:
 
 ```bash
 sudo ./recovery/bin/server-infra-recovery restore-project-files \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
-  --name <project-name> \
-  --git-user ubuntu
+  --name <project-name>
 ```
 
 The command uses the data snapshot already recorded by `select-data`; it has
@@ -239,11 +237,10 @@ database:
 
 ```bash
 sudo ./recovery/bin/server-infra-recovery restore-project-db \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --name <project-name> \
-  --git-user ubuntu \
   --target-db <project>_recovered \
-  --jobs 4
+  --jobs 4 \
+  --start-service
 ```
 
 The recovered host must first have the backup runtime layout prepared with

@@ -23,6 +23,7 @@
 **/credentials.json
 **/break-glass.txt
 **/break-glass.txt.*
+/server-infra-break-glass.txt
 /recovery/session.env
 
 # Safe configuration contracts remain trackable

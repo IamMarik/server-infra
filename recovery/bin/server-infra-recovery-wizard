@@ -9,6 +9,7 @@ REPOSITORY_ROOT="$(cd "$RECOVERY_ROOT/.." && pwd)"
 source "$REPOSITORY_ROOT/scripts/common.sh"
 
 RECOVERY_EXECUTABLE="${SERVER_INFRA_RECOVERY_EXECUTABLE:-$WIZARD_BIN_DIR/server-infra-recovery}"
+DEFAULT_BREAK_GLASS_FILE="${SERVER_INFRA_BREAK_GLASS_FILE:-$REPOSITORY_ROOT/server-infra-break-glass.txt}"
 STATE_ROOT="/var/lib/server-infra/recovery"
 CONFIG_ROOT="/etc/server-infra"
 WORK_ROOT="/var/cache/server-infra/recovery"
@@ -41,7 +42,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   server-infra-recovery-wizard \
-    --break-glass <absolute-path> \
+    [--break-glass <absolute-path>] \
     [--git-user <ordinary-user>] \
     [--jobs <count>] \
     [--state-root <absolute-path>] \
@@ -58,6 +59,7 @@ It never starts applications, changes database connection settings, deploys
 the proxy, changes DNS, or enables public traffic.
 
 Defaults:
+  --break-glass <repository-root>/server-infra-break-glass.txt
   --git-user    SUDO_USER when sudo was invoked by an ordinary user
   --jobs        4
   --state-root  /var/lib/server-infra/recovery
@@ -556,7 +558,9 @@ parse_arguments() {
         ;;
     esac
   done
-  [[ -n "$BREAK_GLASS_FILE" ]] || fail "--break-glass is required"
+  if [[ -z "$BREAK_GLASS_FILE" ]]; then
+    BREAK_GLASS_FILE="$DEFAULT_BREAK_GLASS_FILE"
+  fi
 }
 
 main() {

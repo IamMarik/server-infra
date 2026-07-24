@@ -102,9 +102,7 @@ requirements and prepares shared runtime roots. It does not create
 The recommended path from this point is the resumable interactive wizard:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery-wizard \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
-  --git-user ubuntu
+sudo ./recovery/bin/server-infra-recovery-wizard
 ```
 
 It performs the safe parts of steps 3, 5, 6, and 7 below through the same
@@ -115,14 +113,19 @@ project and restores into a proposed isolated target. It does not validate or
 start applications, perform database cutover, deploy Caddy, change DNS, or
 enable traffic.
 
+Before running it, copy the external record to
+`<repository-root>/server-infra-break-glass.txt` and keep mode `0600`. This
+local recovery copy is ignored by Git. The wizard infers the ordinary
+deployment account from `SUDO_USER`; pass `--break-glass` or `--git-user` only
+to override those defaults.
+
 The commands below remain the detailed manual and troubleshooting flow.
 
 Initialize the recovery session. This verifies the break-glass record against
 the checkout without copying its secrets:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery init \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery init
 sudo ./recovery/bin/server-infra-recovery plan
 ```
 
@@ -131,15 +134,13 @@ sudo ./recovery/bin/server-infra-recovery plan
 List only the configuration snapshots belonging to this server:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery config-snapshots \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery config-snapshots
 ```
 
 Choose one explicit snapshot ID. Do not use a moving `latest` selector:
 
 ```bash
 sudo ./recovery/bin/server-infra-recovery restore-config \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --snapshot <config-snapshot-id>
 ```
 
@@ -173,8 +174,7 @@ the traffic path until projects and databases are restored and validated.
 List data snapshots only after configuration recovery has completed:
 
 ```bash
-sudo ./recovery/bin/server-infra-recovery data-snapshots \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo ./recovery/bin/server-infra-recovery data-snapshots
 ```
 
 Select one snapshot tagged `server-infra-data`. The command verifies its host
@@ -182,7 +182,6 @@ and tag, then pins its ID in recovery state:
 
 ```bash
 sudo ./recovery/bin/server-infra-recovery select-data \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --snapshot <data-snapshot-id>
 ```
 
@@ -205,8 +204,7 @@ SERVER_INFRA_ROOT="$(pwd -P)"
 Read the recovered inventory:
 
 ```bash
-sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" projects-plan \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
+sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" projects-plan
 ```
 
 Create the parent of a recorded `PROJECT_ROOT` first if it is absent. Then
@@ -214,9 +212,7 @@ clone each project as the ordinary deployment user:
 
 ```bash
 sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" clone-project \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
-  --name <project-name> \
-  --git-user ubuntu
+  --name <project-name>
 ```
 
 The command reads `PROJECT_ROOT`, `REPOSITORY_URL`, and the full
@@ -229,9 +225,7 @@ Restore only the configured non-database paths for that project:
 ```bash
 sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" \
   restore-project-files \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
-  --name <project-name> \
-  --git-user ubuntu
+  --name <project-name>
 ```
 
 The operation uses the session's pinned snapshot, preserves restored
@@ -249,9 +243,7 @@ PostgreSQL Compose service and wait for it to become ready:
 ```bash
 sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" \
   restore-project-db \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --name <project-name> \
-  --git-user ubuntu \
   --target-db <project>_recovered \
   --jobs 4 \
   --start-service

@@ -198,6 +198,12 @@ The seventh increment implements:
 - no application startup, database promotion, infrastructure deployment, DNS
   change, or traffic activation.
 
+The default interactive entry point uses the Git-ignored
+`<repository-root>/server-infra-break-glass.txt` and infers the non-root
+project account from `SUDO_USER`. Explicit `--break-glass` and `--git-user`
+overrides remain available for automation and non-standard ownership. The
+secret file retains the same strict validation and is never read by Git.
+
 Application validation, deployment, database cutover, and finalization remain
 documented manual operations until their contracts are separately implemented
 and tested.

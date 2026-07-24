@@ -314,13 +314,13 @@ fi
 
 mkdir -p "${PROJECT_ROOT%/*}"
 SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  SERVER_INFRA_BREAK_GLASS_FILE="$BREAK_GLASS_FILE" \
+  SUDO_USER="$TEST_GIT_USER" \
   PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   --state-root "$STATE_ROOT" \
   --config-root "$CONFIG_ROOT" \
   clone-project \
-  --break-glass "$BREAK_GLASS_FILE" \
-  --name test-app \
-  --git-user "$TEST_GIT_USER" >> "$COMMAND_OUTPUT" 2>&1
+  --name test-app >> "$COMMAND_OUTPUT" 2>&1
 [[ -d "$PROJECT_ROOT/.git" ]] || \
   fail_test "Project checkout was not installed"
 assert_contains "$PROJECT_ROOT/.git/fake-origin" \
