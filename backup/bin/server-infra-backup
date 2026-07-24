@@ -3,6 +3,19 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTPUT_LIBRARY="$SCRIPT_DIR/server-infra-output"
+if [[ ! -f "$OUTPUT_LIBRARY" && \
+  -f /usr/local/libexec/server-infra/backup/server-infra-output ]]; then
+  OUTPUT_LIBRARY="/usr/local/libexec/server-infra/backup/server-infra-output"
+fi
+[[ -f "$OUTPUT_LIBRARY" && ! -L "$OUTPUT_LIBRARY" ]] || {
+  printf '%s\n' \
+    "[server-infra][backup][error] Terminal output library not found" >&2
+  exit 1
+}
+# shellcheck source=./server-infra-output
+source "$OUTPUT_LIBRARY"
+
 CONFIG_ROOT="/etc/server-infra"
 OPERATION=""
 BACKUP_MODULE_DIR=""
@@ -73,19 +86,19 @@ USAGE
 }
 
 log() {
-  printf '[server-infra][backup] %s\n' "$*"
+  server_infra_emit "[server-infra][backup]" log 1 "$*"
 }
 
 ok() {
-  printf '[server-infra][backup][ok] %s\n' "$*"
+  server_infra_emit "[server-infra][backup]" ok 1 "$*"
 }
 
 warn() {
-  printf '[server-infra][backup][warn] %s\n' "$*" >&2
+  server_infra_emit "[server-infra][backup]" warn 2 "$*"
 }
 
 fail() {
-  printf '[server-infra][backup][error] %s\n' "$*" >&2
+  server_infra_emit "[server-infra][backup]" error 2 "$*"
   exit 1
 }
 

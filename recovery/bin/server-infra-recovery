@@ -33,15 +33,15 @@ CONFIG_INSTALLED_BY_RUN=0
 PROJECT_FILE_PATHS=()
 
 recovery_log() {
-  printf '[server-infra][recovery] %s\n' "$*"
+  server_infra_emit "[server-infra][recovery]" log 1 "$*"
 }
 
 recovery_ok() {
-  printf '[server-infra][recovery][ok] %s\n' "$*"
+  server_infra_emit "[server-infra][recovery]" ok 1 "$*"
 }
 
 recovery_warn() {
-  printf '[server-infra][recovery][warn] %s\n' "$*" >&2
+  server_infra_emit "[server-infra][recovery]" warn 2 "$*"
 }
 
 usage() {

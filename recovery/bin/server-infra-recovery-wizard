@@ -27,15 +27,15 @@ PROJECT_ROOTS=()
 PROJECT_SELECTED=()
 
 wizard_log() {
-  printf '[server-infra][recovery-wizard] %s\n' "$*"
+  server_infra_emit "[server-infra][recovery-wizard]" log 1 "$*"
 }
 
 wizard_ok() {
-  printf '[server-infra][recovery-wizard][ok] %s\n' "$*"
+  server_infra_emit "[server-infra][recovery-wizard]" ok 1 "$*"
 }
 
 wizard_warn() {
-  printf '[server-infra][recovery-wizard][warn] %s\n' "$*" >&2
+  server_infra_emit "[server-infra][recovery-wizard]" warn 2 "$*"
 }
 
 usage() {

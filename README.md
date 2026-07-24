@@ -86,6 +86,25 @@ Validate that known runtime and secret filenames are not tracked:
 This check is safe to run locally and in CI. It does not read or print runtime
 secret contents.
 
+## Terminal output
+
+Operator commands retain stable `[server-infra]`, `[ok]`, `[warn]`, and
+`[error]` prefixes. In an interactive terminal they also use color and compact
+status symbols. Redirected output, systemd, cron, and CI remain plain by
+default, without ANSI escape sequences or Unicode symbols.
+
+Control the presentation explicitly when needed:
+
+```bash
+SERVER_INFRA_OUTPUT=plain server-infra-backup check
+SERVER_INFRA_OUTPUT=pretty server-infra-backup check
+NO_COLOR=1 server-infra-backup check
+```
+
+`SERVER_INFRA_OUTPUT` accepts `auto` (the default), `pretty`, or `plain`.
+`NO_COLOR` disables ANSI color while retaining a terminal-appropriate symbol.
+Non-UTF-8 terminals use ASCII fallbacks.
+
 Validate an external host configuration without executing it or changing the
 host:
 

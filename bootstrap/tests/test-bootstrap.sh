@@ -21,6 +21,51 @@ fail_test() {
 # shellcheck source=../../scripts/bootstrap.sh
 source "$BOOTSTRAP"
 
+plain_output="$(
+  SERVER_INFRA_OUTPUT=plain ok "plain output"
+)"
+[[ "$plain_output" == "[server-infra][ok] plain output" ]] || \
+  fail_test "Plain terminal output changed the stable log format"
+
+automatic_output="$(
+  SERVER_INFRA_OUTPUT=auto TERM=xterm-256color ok "redirected output"
+)"
+[[ "$automatic_output" == "[server-infra][ok] redirected output" ]] || \
+  fail_test "Redirected automatic output was not plain"
+
+unicode_output="$(
+  SERVER_INFRA_OUTPUT=pretty \
+    NO_COLOR=1 \
+    LC_ALL= \
+    LC_CTYPE= \
+    LANG=server-infra.UTF-8 \
+    ok "unicode output"
+)"
+[[ "$unicode_output" == "[server-infra][ok] ✓ unicode output" ]] || \
+  fail_test "Pretty UTF-8 output did not use the success symbol"
+
+ascii_output="$(
+  SERVER_INFRA_OUTPUT=pretty \
+    NO_COLOR=1 \
+    LC_ALL=C \
+    ok "ASCII output"
+)"
+[[ "$ascii_output" == "[server-infra][ok] OK ASCII output" ]] || \
+  fail_test "Non-UTF-8 output did not use the ASCII fallback"
+
+color_output="$(
+  SERVER_INFRA_OUTPUT=pretty \
+    NO_COLOR= \
+    TERM=xterm-256color \
+    LC_ALL= \
+    LC_CTYPE= \
+    LANG=server-infra.UTF-8 \
+    ok "color output"
+)"
+[[ "$color_output" == \
+  $'[server-infra][ok] \033[32m✓ color output\033[0m' ]] || \
+  fail_test "Pretty terminal output did not use the success color"
+
 OPERATION=""
 parse_arguments --check
 [[ "$OPERATION" == "check" ]] || fail_test "Check operation was not parsed"

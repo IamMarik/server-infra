@@ -18,6 +18,12 @@ All shell scripts must:
 - avoid interactive prompts;
 - be safe to run multiple times.
 
+Operator-facing status output must preserve the stable
+`[server-infra][level]` prefix contract. Color and Unicode symbols are
+terminal-only enhancements: default automatic output must stay plain when
+redirected or run by systemd, cron, or CI. Respect `NO_COLOR`, and provide an
+ASCII fallback for non-UTF-8 locales.
+
 ## Docker Compose
 
 - One `docker-compose.yml` per module.

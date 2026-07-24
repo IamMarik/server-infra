@@ -491,6 +491,7 @@ or monitor:
 ./backup/tests/test-project-wizard.sh
 ./backup/tests/test-setup-wizard.sh
 ./backup/tests/test-break-glass-export.sh
+./backup/tests/test-output.sh
 ```
 
 The generic restore test proves that encrypted configuration files can be

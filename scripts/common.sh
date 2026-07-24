@@ -5,20 +5,118 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+server_infra_output_is_pretty() {
+  local output_fd="$1"
+
+  case "${SERVER_INFRA_OUTPUT:-auto}" in
+    pretty)
+      return 0
+      ;;
+    plain)
+      return 1
+      ;;
+    auto | "")
+      [[ -t "$output_fd" && "${TERM:-}" != "dumb" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+server_infra_output_supports_unicode() {
+  local locale_name="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+
+  case "$locale_name" in
+    *UTF-8* | *utf-8* | *UTF8* | *utf8*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+server_infra_output_uses_color() {
+  local output_fd="$1"
+
+  server_infra_output_is_pretty "$output_fd" || return 1
+  [[ -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]
+}
+
+server_infra_emit() {
+  local prefix="$1"
+  local level="$2"
+  local output_fd="$3"
+  shift 3
+
+  local suffix=""
+  local symbol=""
+  local color=""
+  local reset=$'\033[0m'
+  local message="$*"
+
+  case "$level" in
+    log)
+      symbol="→"
+      color=$'\033[36m'
+      ;;
+    ok)
+      suffix="[ok]"
+      symbol="✓"
+      color=$'\033[32m'
+      ;;
+    warn)
+      suffix="[warn]"
+      symbol="⚠"
+      color=$'\033[33m'
+      ;;
+    error)
+      suffix="[error]"
+      symbol="✗"
+      color=$'\033[31m'
+      ;;
+  esac
+
+  if ! server_infra_output_is_pretty "$output_fd"; then
+    printf '%s%s %s\n' "$prefix" "$suffix" "$message" >&"$output_fd"
+    return
+  fi
+
+  if ! server_infra_output_supports_unicode; then
+    case "$level" in
+      log) symbol="->" ;;
+      ok) symbol="OK" ;;
+      warn) symbol="WARN" ;;
+      error) symbol="ERROR" ;;
+    esac
+  fi
+
+  if server_infra_output_uses_color "$output_fd"; then
+    printf '%s%s %s%s %s%s\n' \
+      "$prefix" "$suffix" "$color" "$symbol" "$message" "$reset" \
+      >&"$output_fd"
+  else
+    printf '%s%s %s %s\n' \
+      "$prefix" "$suffix" "$symbol" "$message" \
+      >&"$output_fd"
+  fi
+}
+
 log() {
-  printf '[server-infra] %s\n' "$*"
+  server_infra_emit "[server-infra]" log 1 "$*"
 }
 
 ok() {
-  printf '[server-infra][ok] %s\n' "$*"
+  server_infra_emit "[server-infra]" ok 1 "$*"
 }
 
 warn() {
-  printf '[server-infra][warn] %s\n' "$*" >&2
+  server_infra_emit "[server-infra]" warn 2 "$*"
 }
 
 fail() {
-  printf '[server-infra][error] %s\n' "$*" >&2
+  server_infra_emit "[server-infra]" error 2 "$*"
   exit 1
 }
 
