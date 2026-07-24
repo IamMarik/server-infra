@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+[[ -n "${FAKE_PROJECT_DIALOG_LOG:-}" ]]
+
+printf '%s ' "$@" >> "$FAKE_PROJECT_DIALOG_LOG"
+printf '\n' >> "$FAKE_PROJECT_DIALOG_LOG"
+
+all_arguments="$*"
+case "$all_arguments" in
+  *"Backup components"*"--checklist"*)
+    printf '%s\n' "${FAKE_PROJECT_DIALOG_COMPONENTS:-files}"
+    ;;
+  *"Project files"*"--checklist"*)
+    printf '%s\n' "${FAKE_PROJECT_DIALOG_PATHS:-}"
+    ;;
+  *"Compose env file"*"--radiolist"*)
+    printf '%s\n' "${FAKE_PROJECT_DIALOG_ENV_SELECTION:-none}"
+    ;;
+  *"--inputbox"*)
+    printf '%s\n' "${FAKE_PROJECT_DIALOG_INPUT:-}"
+    ;;
+  *)
+    exit 1
+    ;;
+esac

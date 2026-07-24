@@ -167,25 +167,22 @@ The wizard creates root-owned active configuration, preserves existing base
 path lists, keeps retention disabled, optionally configures Uptime Kuma, and
 validates the result. Secrets are never accepted as command-line arguments.
 
-Initialize a PostgreSQL Compose backup source from an application repository:
+Initialize a project backup source from an application repository:
 
 ```bash
 server-infra-backup project init
 ```
 
-For files without a database producer:
-
-```bash
-server-infra-backup project init --files-only
-```
-
-The wizard creates a non-secret `.server-infra/backup` manifest in the
-application repository, including a project README and manual restore-check
-script. See `backup/README.md` for validation, server installation, listing,
-removal, dump testing, and restore instructions. The public command is
-installed by applying the `backup` host module. From the application root,
-`project validate` and `project install` find this directory automatically.
-For PostgreSQL sources, the Compose env file selected by the wizard is
+The unified wizard lets the operator select project files, PostgreSQL, or both.
+It detects `.env`, `production.env`, `.env.production`, and `uploads`, then
+offers a separate Compose env-file choice. It creates a non-secret
+`.server-infra/backup` manifest in the application repository, including a
+project README and manual restore-check script. `--files-only` remains
+available for compatible automation. See `backup/README.md` for validation,
+server installation, listing, removal, dump testing, and restore instructions.
+The public command is installed by applying the `backup` host module. From the
+application root, `project validate` and `project install` find this directory
+automatically. For PostgreSQL sources, the selected Compose env file is
 automatically included in the backup paths.
 
 Manually run or inspect an installed PostgreSQL dump producer from its

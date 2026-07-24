@@ -286,13 +286,36 @@ INTERACTIVE_ROOT="$TEST_ROOT/interactive-app"
 INTERACTIVE_MANIFEST="$INTERACTIVE_ROOT/.server-infra/backup"
 mkdir -p "$INTERACTIVE_ROOT/uploads"
 : > "$INTERACTIVE_ROOT/docker-compose.yml"
-printf 'interactive-app\n%s\n\n\n\n\n\n' "$INTERACTIVE_ROOT/uploads" | \
+printf 'APP_ENV=production\n' > "$INTERACTIVE_ROOT/production.env"
+printf 'interactive-app\n\n\n\n\n\n\n\n' | \
   "$CLI" project init \
+    --ui plain \
     --project-root "$INTERACTIVE_ROOT" \
     --staging-root "$STAGING_ROOT"
 assert_contains \
   "$INTERACTIVE_MANIFEST/source.conf" \
   "SOURCE_NAME=interactive-app"
+assert_contains \
+  "$INTERACTIVE_MANIFEST/source.conf" \
+  "COMPOSE_ENV_FILE=$INTERACTIVE_ROOT/production.env"
+assert_contains \
+  "$INTERACTIVE_MANIFEST/paths" \
+  "$INTERACTIVE_ROOT/production.env"
+
+UNIFIED_FILES_ROOT="$TEST_ROOT/unified-files-app"
+UNIFIED_FILES_MANIFEST="$UNIFIED_FILES_ROOT/.server-infra/backup"
+mkdir -p "$UNIFIED_FILES_ROOT/uploads"
+printf 'APP_ENV=production\n' > "$UNIFIED_FILES_ROOT/production.env"
+printf '\n1\n\n' | \
+  "$CLI" project init \
+    --ui plain \
+    --project-root "$UNIFIED_FILES_ROOT"
+assert_contains \
+  "$UNIFIED_FILES_MANIFEST/source.conf" \
+  "SOURCE_TYPE=files-only"
+assert_contains \
+  "$UNIFIED_FILES_MANIFEST/paths" \
+  "$UNIFIED_FILES_ROOT/production.env"
 
 assert_contains "$MANIFEST_DIR/source.conf" "SOURCE_TYPE=postgres-compose"
 assert_contains \

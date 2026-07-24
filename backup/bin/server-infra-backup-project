@@ -40,6 +40,11 @@ CHECK_ONLY=0
 ENABLE_TIMER=1
 NON_INTERACTIVE=0
 FILES_ONLY=0
+FILES_COMPONENT_SELECTED=0
+POSTGRES_COMPONENT_SELECTED=1
+UI_MODE="${SERVER_INFRA_BACKUP_PROJECT_UI:-auto}"
+ACTIVE_UI="plain"
+UI_OPTION_SET=0
 OPERATION_LOCK=""
 INSTALL_JOB_LOCK=""
 DUMP_LOCK=""
@@ -62,6 +67,8 @@ RESTORE_DATABASE_USER=""
 RESTORE_MAINTENANCE_DB="postgres"
 RESTORE_COMPOSE_ARGS=()
 INCLUDE_PATHS=()
+DETECTED_PATHS=()
+DETECTED_ENV_FILES=()
 
 usage() {
   cat <<'USAGE'
@@ -93,6 +100,8 @@ Init options:
   --dump-time <HH:MM>         Daily dump time. Default: 02:45.
   --max-age-seconds <number>  Freshness limit. Default: 14400.
   --files-only                Back up files without PostgreSQL or a dump timer.
+                              Interactive init normally chooses components.
+  --ui <auto|tui|plain>       Interactive presentation. Default: auto.
   --manifest <directory>      Output directory. Default:
                               <project-root>/.server-infra/backup.
   --non-interactive           Fail instead of prompting for missing values.
@@ -499,18 +508,373 @@ prompt_value() {
   local default_value="$3"
   local entered=""
 
-  if [[ -n "$default_value" ]]; then
-    printf '%s [%s]: ' "$label" "$default_value" >&2
+  if [[ "$ACTIVE_UI" == "tui" ]]; then
+    if ! entered="$(
+      dialog \
+        --stdout \
+        --backtitle "server-infra project backup" \
+        --title "$label" \
+        --ok-label "Continue" \
+        --cancel-label "Stop" \
+        --inputbox "$label" \
+        11 90 \
+        "$default_value"
+    )"; then
+      warn "Project backup wizard stopped before creating a manifest"
+      exit 0
+    fi
   else
-    printf '%s: ' "$label" >&2
+    if [[ -n "$default_value" ]]; then
+      printf '%s [%s]: ' "$label" "$default_value" >&2
+    else
+      printf '%s: ' "$label" >&2
+    fi
+    IFS= read -r entered
   fi
-  IFS= read -r entered
   [[ -n "$entered" ]] || entered="$default_value"
   printf -v "$variable_name" '%s' "$entered"
 }
 
-collect_init_values() {
+resolve_init_ui_mode() {
+  if [[ "$NON_INTERACTIVE" == "1" ]]; then
+    ACTIVE_UI="plain"
+    return
+  fi
+
+  case "$UI_MODE" in
+    auto)
+      if [[ -t 0 && -t 1 ]] && command -v dialog >/dev/null 2>&1; then
+        ACTIVE_UI="tui"
+      else
+        ACTIVE_UI="plain"
+      fi
+      ;;
+    tui)
+      [[ -t 0 && -t 1 ]] || \
+        fail "TUI mode requires an interactive terminal"
+      require_command dialog
+      ACTIVE_UI="tui"
+      ;;
+    plain)
+      ACTIVE_UI="plain"
+      ;;
+    *)
+      fail "UI mode must be auto, tui, or plain"
+      ;;
+  esac
+}
+
+select_backup_components_tui() {
+  local selected_components
+  local component
+
+  if ! selected_components="$(
+    dialog \
+      --stdout \
+      --separate-output \
+      --backtitle "server-infra project backup" \
+      --title "Backup components" \
+      --ok-label "Continue" \
+      --cancel-label "Stop" \
+      --checklist \
+      "Space toggles components. Select files, PostgreSQL, or both." \
+      16 90 8 \
+      "files" "Project files and configuration" "on" \
+      "postgres" "PostgreSQL database from Docker Compose" "on"
+  )"; then
+    warn "Project backup wizard stopped before creating a manifest"
+    exit 0
+  fi
+
+  FILES_COMPONENT_SELECTED=0
+  POSTGRES_COMPONENT_SELECTED=0
+  while IFS= read -r component || [[ -n "$component" ]]; do
+    case "$component" in
+      files)
+        FILES_COMPONENT_SELECTED=1
+        ;;
+      postgres)
+        POSTGRES_COMPONENT_SELECTED=1
+        ;;
+    esac
+  done <<< "$selected_components"
+}
+
+select_backup_components_plain() {
+  local answer
+  local token
+
+  printf '%s\n' \
+    "Backup components:" \
+    "  1. Project files and configuration" \
+    "  2. PostgreSQL database from Docker Compose"
+  printf 'Select components, separated by spaces [1 2]: '
+  IFS= read -r answer
+  answer="${answer:-1 2}"
+  FILES_COMPONENT_SELECTED=0
+  POSTGRES_COMPONENT_SELECTED=0
+  for token in $answer; do
+    case "$token" in
+      1 | files)
+        FILES_COMPONENT_SELECTED=1
+        ;;
+      2 | postgres)
+        POSTGRES_COMPONENT_SELECTED=1
+        ;;
+      *)
+        fail "Unknown backup component: $token"
+        ;;
+    esac
+  done
+}
+
+select_backup_components() {
+  if [[ "$FILES_ONLY" == "1" ]]; then
+    FILES_COMPONENT_SELECTED=1
+    POSTGRES_COMPONENT_SELECTED=0
+    return
+  fi
+  if [[ "$NON_INTERACTIVE" == "1" ]]; then
+    POSTGRES_COMPONENT_SELECTED=1
+    if ((${#INCLUDE_PATHS[@]} > 0)); then
+      FILES_COMPONENT_SELECTED=1
+    fi
+    return
+  fi
+
+  case "$ACTIVE_UI" in
+    tui)
+      select_backup_components_tui
+      ;;
+    plain)
+      select_backup_components_plain
+      ;;
+  esac
+  [[ "$FILES_COMPONENT_SELECTED" == "1" || \
+    "$POSTGRES_COMPONENT_SELECTED" == "1" ]] || \
+    fail "Select at least one backup component"
+}
+
+detect_project_file_candidates() {
+  local candidate
+  local candidate_names=(
+    ".env"
+    "production.env"
+    ".env.production"
+    "uploads"
+  )
+
+  DETECTED_PATHS=()
+  for candidate in "${candidate_names[@]}"; do
+    if [[ -e "$PROJECT_ROOT/$candidate" && ! -L "$PROJECT_ROOT/$candidate" ]]; then
+      DETECTED_PATHS+=("$PROJECT_ROOT/$candidate")
+    fi
+  done
+}
+
+collect_project_files_tui() {
+  local selected_paths
+  local selected_path
+  local additional_paths=""
+  local additional_path_values=()
+  local dialog_items=()
+
+  for selected_path in "${DETECTED_PATHS[@]}"; do
+    dialog_items+=("$selected_path" "${selected_path#"$PROJECT_ROOT"/}" "on")
+  done
+  if ((${#dialog_items[@]} > 0)); then
+    if ! selected_paths="$(
+      dialog \
+        --stdout \
+        --separate-output \
+        --backtitle "server-infra project backup" \
+        --title "Project files" \
+        --ok-label "Continue" \
+        --cancel-label "Stop" \
+        --checklist \
+        "Detected project files and directories. Space toggles selection." \
+        20 100 12 \
+        "${dialog_items[@]}"
+    )"; then
+      warn "Project backup wizard stopped before creating a manifest"
+      exit 0
+    fi
+    while IFS= read -r selected_path || [[ -n "$selected_path" ]]; do
+      [[ -n "$selected_path" ]] || continue
+      INCLUDE_PATHS+=("$selected_path")
+    done <<< "$selected_paths"
+  fi
+  prompt_value \
+    additional_paths \
+    "Additional absolute paths (space-separated, optional)" \
+    ""
+  if [[ -n "$additional_paths" ]]; then
+    read -r -a additional_path_values <<< "$additional_paths"
+    INCLUDE_PATHS+=("${additional_path_values[@]}")
+  fi
+}
+
+collect_project_files_plain() {
   local include_line=""
+  local default_paths=""
+  local candidate
+
+  for candidate in "${DETECTED_PATHS[@]}"; do
+    if [[ -n "$default_paths" ]]; then
+      default_paths+=" "
+    fi
+    default_paths+="$candidate"
+  done
+  prompt_value \
+    include_line \
+    "Absolute project paths to back up (space-separated)" \
+    "$default_paths"
+  if [[ -n "$include_line" ]]; then
+    read -r -a INCLUDE_PATHS <<< "$include_line"
+  fi
+}
+
+collect_project_files() {
+  detect_project_file_candidates
+  case "$ACTIVE_UI" in
+    tui)
+      collect_project_files_tui
+      ;;
+    plain)
+      collect_project_files_plain
+      ;;
+  esac
+}
+
+detect_compose_env_candidates() {
+  local candidate
+  local candidate_names=(
+    ".env"
+    "production.env"
+    ".env.production"
+  )
+
+  DETECTED_ENV_FILES=()
+  for candidate in "${candidate_names[@]}"; do
+    if [[ -f "$PROJECT_ROOT/$candidate" && ! -L "$PROJECT_ROOT/$candidate" ]]; then
+      DETECTED_ENV_FILES+=("$PROJECT_ROOT/$candidate")
+    fi
+  done
+}
+
+select_compose_env_file_tui() {
+  local index
+  local selected
+  local status
+  local dialog_items=()
+
+  for ((index = 0; index < ${#DETECTED_ENV_FILES[@]}; index++)); do
+    status="off"
+    ((index != 0)) || status="on"
+    dialog_items+=(
+      "env-$((index + 1))"
+      "${DETECTED_ENV_FILES[$index]#"$PROJECT_ROOT"/}"
+      "$status"
+    )
+  done
+  status="off"
+  ((${#DETECTED_ENV_FILES[@]} != 0)) || status="on"
+  dialog_items+=("none" "Do not pass a Compose env file" "$status")
+  dialog_items+=("custom" "Enter another absolute path" "off")
+
+  if ! selected="$(
+    dialog \
+      --stdout \
+      --backtitle "server-infra project backup" \
+      --title "Compose env file" \
+      --ok-label "Continue" \
+      --cancel-label "Stop" \
+      --radiolist \
+      "Select the env file used for Docker Compose interpolation." \
+      20 90 12 \
+      "${dialog_items[@]}"
+  )"; then
+    warn "Project backup wizard stopped before creating a manifest"
+    exit 0
+  fi
+  case "$selected" in
+    env-*)
+      index="${selected#env-}"
+      COMPOSE_ENV_FILE="${DETECTED_ENV_FILES[$((index - 1))]}"
+      ;;
+    none)
+      COMPOSE_ENV_FILE=""
+      ;;
+    custom)
+      prompt_value \
+        COMPOSE_ENV_FILE \
+        "Absolute Compose env file" \
+        ""
+      ;;
+    *)
+      fail "Unknown Compose env-file selection"
+      ;;
+  esac
+}
+
+select_compose_env_file_plain() {
+  local index
+  local answer
+
+  if ((${#DETECTED_ENV_FILES[@]} == 0)); then
+    prompt_value \
+      COMPOSE_ENV_FILE \
+      "Optional Docker Compose env file" \
+      ""
+    return
+  fi
+
+  printf '%s\n' "Detected Compose env files:"
+  for ((index = 0; index < ${#DETECTED_ENV_FILES[@]}; index++)); do
+    printf '  %d. %s\n' \
+      "$((index + 1))" \
+      "${DETECTED_ENV_FILES[$index]}"
+  done
+  printf '%s\n' \
+    "  0. No Compose env file" \
+    "  c. Enter another absolute path"
+  printf 'Select Compose env file [1]: '
+  IFS= read -r answer
+  answer="${answer:-1}"
+  case "$answer" in
+    0)
+      COMPOSE_ENV_FILE=""
+      ;;
+    c | C)
+      prompt_value \
+        COMPOSE_ENV_FILE \
+        "Absolute Compose env file" \
+        ""
+      ;;
+    *)
+      [[ "$answer" =~ ^[1-9][0-9]*$ ]] || \
+        fail "Invalid Compose env-file selection: $answer"
+      ((answer <= ${#DETECTED_ENV_FILES[@]})) || \
+        fail "Compose env-file selection is out of range: $answer"
+      COMPOSE_ENV_FILE="${DETECTED_ENV_FILES[$((answer - 1))]}"
+      ;;
+  esac
+}
+
+select_compose_env_file() {
+  [[ -z "$COMPOSE_ENV_FILE" ]] || return
+  detect_compose_env_candidates
+  case "$ACTIVE_UI" in
+    tui)
+      select_compose_env_file_tui
+      ;;
+    plain)
+      select_compose_env_file_plain
+      ;;
+  esac
+}
+
+collect_init_values() {
   local default_name
 
   if [[ -z "$PROJECT_ROOT" ]]; then
@@ -519,41 +883,38 @@ collect_init_values() {
   [[ -d "$PROJECT_ROOT" ]] || fail "Project root not found: $PROJECT_ROOT"
   PROJECT_ROOT="$(cd "$PROJECT_ROOT" && pwd -P)"
   default_name="${PROJECT_ROOT##*/}"
+  resolve_init_ui_mode
 
   if [[ "$NON_INTERACTIVE" == "1" ]]; then
     [[ -n "$SOURCE_NAME" ]] || fail "--name is required in non-interactive mode"
   else
     [[ -n "$SOURCE_NAME" ]] || \
       prompt_value SOURCE_NAME "Project backup name" "$default_name"
-    if ((${#INCLUDE_PATHS[@]} == 0)); then
-      if [[ "$FILES_ONLY" == "1" ]]; then
-        prompt_value \
-          include_line \
-          "Absolute paths to back up (space-separated)" \
-          ""
-      else
-        prompt_value \
-          include_line \
-          "Additional absolute paths to back up (space-separated, optional)" \
-          ""
-      fi
-      if [[ -n "$include_line" ]]; then
-        read -r -a INCLUDE_PATHS <<< "$include_line"
-      fi
-    fi
+  fi
+  select_backup_components
+  if ((${#INCLUDE_PATHS[@]} > 0)) && \
+    [[ "$FILES_COMPONENT_SELECTED" != "1" ]]; then
+    fail "--include paths require the project files component"
+  fi
+  if [[ "$FILES_COMPONENT_SELECTED" == "1" && \
+    ${#INCLUDE_PATHS[@]} -eq 0 && "$NON_INTERACTIVE" != "1" ]]; then
+    collect_project_files
   fi
 
   [[ -n "$MANIFEST_DIR" ]] || MANIFEST_DIR="$PROJECT_ROOT/.server-infra/backup"
 
-  if [[ "$FILES_ONLY" == "1" ]]; then
+  if [[ "$POSTGRES_COMPONENT_SELECTED" == "0" ]]; then
     SOURCE_TYPE="files-only"
     ((${#INCLUDE_PATHS[@]} > 0)) || [[ -d "$MANIFEST_DIR" ]] || \
       fail "files-only mode requires at least one --include path"
   else
     SOURCE_TYPE="postgres-compose"
     [[ -n "$COMPOSE_FILE" ]] || COMPOSE_FILE="$PROJECT_ROOT/docker-compose.yml"
-    if [[ -z "$COMPOSE_ENV_FILE" && -f "$PROJECT_ROOT/.env" ]]; then
-      COMPOSE_ENV_FILE="$PROJECT_ROOT/.env"
+    if [[ "$NON_INTERACTIVE" == "1" && -z "$COMPOSE_ENV_FILE" ]]; then
+      detect_compose_env_candidates
+      if ((${#DETECTED_ENV_FILES[@]} > 0)); then
+        COMPOSE_ENV_FILE="${DETECTED_ENV_FILES[0]}"
+      fi
     fi
     if [[ "$NON_INTERACTIVE" != "1" ]]; then
       prompt_value COMPOSE_FILE "Docker Compose file" "$COMPOSE_FILE"
@@ -561,10 +922,7 @@ collect_init_values() {
         COMPOSE_SERVICE \
         "PostgreSQL Compose service" \
         "$COMPOSE_SERVICE"
-      prompt_value \
-        COMPOSE_ENV_FILE \
-        "Optional Docker Compose env file" \
-        "$COMPOSE_ENV_FILE"
+      select_compose_env_file
       prompt_value DUMP_TIME "Daily dump time (HH:MM)" "$DUMP_TIME"
       prompt_value \
         DUMP_MAX_AGE_SECONDS \
@@ -1780,6 +2138,22 @@ parse_arguments() {
         FILES_ONLY=1
         shift
         ;;
+      --ui)
+        (($# >= 2)) || fail "Missing value for --ui"
+        [[ "$UI_OPTION_SET" == "0" ]] || \
+          fail "--ui may be specified only once"
+        UI_MODE="$2"
+        UI_OPTION_SET=1
+        shift 2
+        ;;
+      --ui=*)
+        [[ "$UI_OPTION_SET" == "0" ]] || \
+          fail "--ui may be specified only once"
+        UI_MODE="${1#*=}"
+        [[ -n "$UI_MODE" ]] || fail "Missing value for --ui"
+        UI_OPTION_SET=1
+        shift
+        ;;
       --staging-root)
         (($# >= 2)) || fail "Missing value for --staging-root"
         STAGING_ROOT="$2"
@@ -1872,6 +2246,9 @@ parse_arguments() {
   if [[ "$FILES_ONLY" == "1" && "$OPERATION" != "init" ]]; then
     fail "--files-only is supported only by init"
   fi
+  if [[ "$UI_OPTION_SET" == "1" && "$OPERATION" != "init" ]]; then
+    fail "--ui is supported only by init"
+  fi
 }
 
 use_default_manifest() {
@@ -1943,4 +2320,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -163,10 +163,11 @@ The default schedules use the server timezone:
 
 ## Project Backup Wizard
 
-The project wizard registers either:
+The unified project wizard registers:
 
-- application files only; or
-- application files plus one PostgreSQL database running in Docker Compose.
+- application files only;
+- one PostgreSQL database running in Docker Compose; or
+- project files and PostgreSQL together.
 
 The checked-in project manifest is non-secret:
 
@@ -180,41 +181,48 @@ The checked-in project manifest is non-secret:
 └── README.md
 ```
 
-For a files-only project, run from the application checkout:
-
-```bash
-server-infra-backup project init --files-only
-```
-
-The repository compatibility wrapper provides the same operation:
-
-```bash
-/path/to/server-infra/scripts/backup-project.sh init --files-only
-```
-
-Files-only mode asks for at least one absolute file or directory path. It does
-not ask for Compose settings, create a staging directory, or install a project
-dump timer.
-
-For files plus PostgreSQL, run the interactive wizard without
-`--files-only`. The manifest records absolute host paths:
+Run from the application checkout:
 
 ```bash
 server-infra-backup project init
 ```
 
-The wizard asks for:
+On an interactive terminal, the wizard uses a dialog checklist when available
+and asks which components to protect. Arrow keys move, Space toggles files or
+PostgreSQL, and Enter continues. Force either presentation with:
+
+```bash
+server-infra-backup project init --ui tui
+server-infra-backup project init --ui plain
+```
+
+When project files are selected, the wizard detects existing `.env`,
+`production.env`, `.env.production`, and `uploads` entries. The TUI presents
+them as checkboxes; plain mode offers them as the default path list. Additional
+absolute paths remain supported.
+
+When PostgreSQL is selected, the wizard asks for:
 
 - a stable lowercase project name;
-- optional absolute file or directory paths to include in addition to the
-  generated database dump;
 - the Compose file and PostgreSQL service;
-- an optional Compose env-file path;
+- an optional Compose env-file selected from detected `.env`,
+  `production.env`, and `.env.production` files, or a custom absolute path;
 - daily dump time and maximum permitted dump age.
 
 The selected Compose env file is automatically added to `paths`; it does not
-need to be entered a second time as an application path. If `.env` exists in
-the application root, the wizard offers it as the default.
+need to be entered a second time as an application path.
+
+`--files-only` remains a compatible shortcut for automation and operators who
+want to bypass component selection:
+
+```bash
+server-infra-backup project init --files-only
+/path/to/server-infra/scripts/backup-project.sh init --files-only
+```
+
+Files-only mode requires at least one absolute file or directory path. It does
+not ask for Compose settings, create a staging directory, or install a project
+dump timer.
 
 It creates `.server-infra/backup` inside the application repository. Review
 and commit those files. They contain paths and service metadata but no
@@ -489,6 +497,7 @@ or monitor:
 ```bash
 ./backup/tests/test-runner.sh
 ./backup/tests/test-project-wizard.sh
+./backup/tests/test-project-wizard-tui.sh
 ./backup/tests/test-setup-wizard.sh
 ./backup/tests/test-break-glass-export.sh
 ./backup/tests/test-output.sh
