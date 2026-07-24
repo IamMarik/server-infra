@@ -71,6 +71,14 @@ if [[ "$all_arguments" == *"SERVER_INFRA_DB_USER="* ]]; then
   exit 0
 fi
 if [[ "$all_arguments" == *"SELECT 1 FROM pg_database"* ]]; then
+  if [[ "$all_arguments" == *":'target_db'"* ]]; then
+    printf 'psql variable interpolation is not supported in --command\n' >&2
+    exit 46
+  fi
+  [[ "$all_arguments" == *"datname = 'test_restore'"* || \
+    "$all_arguments" == *"datname = 'started_restore'"* || \
+    "$all_arguments" == *"datname = 'existing_restore'"* || \
+    "$all_arguments" == *"datname = 'failed_restore'"* ]] || exit 47
   if [[ "${FAKE_TARGET_DB_EXISTS:-0}" == "1" ]]; then
     printf '1\n'
   fi

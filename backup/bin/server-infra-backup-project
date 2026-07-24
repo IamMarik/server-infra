@@ -1542,8 +1542,8 @@ run_project_restore_database() {
       --dbname "$RESTORE_MAINTENANCE_DB" \
       --tuples-only \
       --no-align \
-      --set "target_db=$RESTORE_TARGET_DB" \
-      --command "SELECT 1 FROM pg_database WHERE datname = :'target_db';"
+      --command \
+      "SELECT 1 FROM pg_database WHERE datname = '$RESTORE_TARGET_DB';"
   )"
   [[ -z "${database_exists//[[:space:]]/}" ]] || \
     fail "Target database already exists: $RESTORE_TARGET_DB"
