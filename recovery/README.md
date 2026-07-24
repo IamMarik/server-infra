@@ -19,6 +19,8 @@ the manual disaster-recovery runbook.
 
 The current implementation provides:
 
+- `server-infra-recovery-wizard` as an interactive facade over the operations
+  below, including snapshot prompts and checkbox-style project selection;
 - `init` to validate the break-glass record against the current repository;
 - a root-owned, resumable, non-secret recovery session;
 - `plan` to display ordered recovery phases;
@@ -32,10 +34,15 @@ The current implementation provides:
 - `restore-project-files` to restore declared non-database paths from the
   pinned data snapshot without overwriting live paths.
 - `restore-project-db` to invoke the generic PostgreSQL restore primitive with
-  that same pinned snapshot and one explicitly named isolated target database.
+  that same pinned snapshot and one explicitly named isolated target database;
+- optional startup of only the selected project's PostgreSQL Compose service
+  before the isolated database restore.
 
 It does not reinstall project backup sources, validate applications, switch
 their connection settings, deploy infrastructure, or start public traffic.
+The wizard displays recovered infrastructure modules separately as deferred
+work. Monitoring named-volume state is not protected by the current backup
+contract.
 
 ## Security model
 
@@ -133,6 +140,25 @@ sudo ./scripts/bootstrap.sh --apply
 ```
 
 Then initialize the recovery session:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery-wizard \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --git-user ubuntu
+```
+
+This recommended interactive path validates backup access, asks for exact
+configuration and data snapshots, and presents the recovered projects as
+toggleable `[ ]` entries. Re-running it resumes the same pinned session and
+completed project steps.
+
+The wizard creates a missing recorded project parent only after confirmation.
+For PostgreSQL projects it proposes `<project>_recovered`, starts only the
+configured database service, and restores into that isolated database.
+Application startup, validation, connection cutover, infrastructure
+deployment, DNS, and traffic remain explicit later steps.
+
+Use the non-interactive interface for automation or individual retries:
 
 ```bash
 sudo ./recovery/bin/server-infra-recovery init \

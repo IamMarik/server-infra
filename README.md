@@ -182,19 +182,27 @@ sudo server-infra-backup project restore-db \
 For complete VM loss, keep the secret break-glass record outside the server
 and follow [backup/RECOVERY.md](backup/RECOVERY.md). On the replacement host,
 clone the exact server-infra ref, apply the common bootstrap, then initialize
-a non-secret resumable session:
+a non-secret resumable session. The recommended interactive entry point wraps
+the same recovery state machine:
 
 ```bash
 sudo ./scripts/bootstrap.sh --apply
-sudo ./recovery/bin/server-infra-recovery init \
-  --break-glass /home/ubuntu/server-infra-break-glass.txt
-sudo ./recovery/bin/server-infra-recovery plan
-sudo ./recovery/bin/server-infra-recovery status
+sudo ./recovery/bin/server-infra-recovery-wizard \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --git-user ubuntu
 ```
 
-It can then list and restore one explicitly selected configuration snapshot:
+The wizard validates remote backup access, asks for exact configuration and
+data snapshot IDs, displays infrastructure as deferred work, and lets the
+operator select projects with checkbox-style toggles. PostgreSQL is restored
+into a new isolated database after starting only its Compose database service.
+It does not start applications, deploy Caddy, change DNS, or enable traffic.
+
+The non-interactive commands remain available for automation and diagnosis:
 
 ```bash
+sudo ./recovery/bin/server-infra-recovery init \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt
 sudo ./recovery/bin/server-infra-recovery config-snapshots \
   --break-glass /home/ubuntu/server-infra-break-glass.txt
 sudo ./recovery/bin/server-infra-recovery restore-config \
@@ -230,7 +238,8 @@ sudo ./recovery/bin/server-infra-recovery restore-project-db \
   --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --name <project-name> \
   --git-user ubuntu \
-  --target-db <project>_recovered
+  --target-db <project>_recovered \
+  --start-service
 ```
 
 The database command always uses the session's pinned data snapshot and

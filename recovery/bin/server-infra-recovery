@@ -20,6 +20,7 @@ PROJECT_NAME=""
 GIT_USER=""
 TARGET_DATABASE=""
 RESTORE_JOBS=4
+START_DATABASE_SERVICE=0
 TEMP_FILE=""
 LOCK_DIR=""
 RESTORE_TARGET=""
@@ -75,7 +76,7 @@ Usage:
     [--config-root <absolute-path>] \
     restore-project-db --break-glass <absolute-path> \
     --name <source-name> --git-user <ordinary-user> \
-    --target-db <new-database> [--jobs <count>]
+    --target-db <new-database> [--jobs <count>] [--start-service]
 
 Operations:
   init
@@ -105,6 +106,7 @@ Operations:
   restore-project-db
     Restore PostgreSQL from the pinned data snapshot into one new database.
     The configured source database and application connection remain unchanged.
+    With --start-service, start only its PostgreSQL Compose service first.
 
 The implementation does not install project backup sources, deploy
 infrastructure, validate applications, switch databases, or start traffic.
@@ -1813,6 +1815,7 @@ run_restore_project_files() {
 
 run_restore_project_database() {
   local backup_executable="$REPOSITORY_ROOT/backup/bin/server-infra-backup"
+  local restore_command=()
 
   [[ -n "$PROJECT_NAME" ]] || fail "restore-project-db requires --name"
   [[ -n "$GIT_USER" ]] || fail "restore-project-db requires --git-user"
@@ -1868,14 +1871,20 @@ run_restore_project_database() {
 
   recovery_log \
     "Restoring $PROJECT_NAME database from pinned snapshot $RECOVERY_DATA_SNAPSHOT"
-  SERVER_INFRA_BACKUP_EXECUTABLE="$backup_executable" \
-    "$backup_executable" \
-    project restore-db \
-    --config-root "$CONFIG_ROOT" \
-    --name "$PROJECT_NAME" \
-    --snapshot "$RECOVERY_DATA_SNAPSHOT" \
-    --target-db "$TARGET_DATABASE" \
+  restore_command=(
+    "$backup_executable"
+    project restore-db
+    --config-root "$CONFIG_ROOT"
+    --name "$PROJECT_NAME"
+    --snapshot "$RECOVERY_DATA_SNAPSHOT"
+    --target-db "$TARGET_DATABASE"
     --jobs "$RESTORE_JOBS"
+  )
+  if [[ "$START_DATABASE_SERVICE" == "1" ]]; then
+    restore_command+=(--start-service)
+  fi
+  SERVER_INFRA_BACKUP_EXECUTABLE="$backup_executable" \
+    "${restore_command[@]}"
 
   PROJECT_DATABASE_STATUS="complete"
   write_project_state_file
@@ -2090,6 +2099,7 @@ parse_arguments() {
   local git_user_set=0
   local target_database_set=0
   local restore_jobs_set=0
+  local start_database_service_set=0
 
   while (($# > 0)); do
     case "$1" in
@@ -2237,6 +2247,13 @@ parse_arguments() {
         restore_jobs_set=1
         shift
         ;;
+      --start-service)
+        [[ "$start_database_service_set" == "0" ]] || \
+          fail "--start-service may be specified only once"
+        START_DATABASE_SERVICE=1
+        start_database_service_set=1
+        shift
+        ;;
       --help | -h)
         usage
         exit 0
@@ -2265,6 +2282,8 @@ parse_arguments() {
         fail "--name and --git-user are supported only by project recovery operations"
       [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
         fail "--target-db and --jobs are supported only by restore-project-db"
+      [[ "$start_database_service_set" == "0" ]] || \
+        fail "--start-service is supported only by restore-project-db"
       ;;
     restore-config)
       [[ -n "$SNAPSHOT_ID" ]] || fail "restore-config requires --snapshot"
@@ -2272,6 +2291,8 @@ parse_arguments() {
         fail "--name and --git-user are supported only by project recovery operations"
       [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
         fail "--target-db and --jobs are supported only by restore-project-db"
+      [[ "$start_database_service_set" == "0" ]] || \
+        fail "--start-service is supported only by restore-project-db"
       ;;
     data-snapshots)
       [[ -z "$SNAPSHOT_ID" ]] || \
@@ -2282,6 +2303,8 @@ parse_arguments() {
         fail "--name and --git-user are supported only by project recovery operations"
       [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
         fail "--target-db and --jobs are supported only by restore-project-db"
+      [[ "$start_database_service_set" == "0" ]] || \
+        fail "--start-service is supported only by restore-project-db"
       ;;
     select-data)
       [[ -n "$SNAPSHOT_ID" ]] || fail "select-data requires --snapshot"
@@ -2291,6 +2314,8 @@ parse_arguments() {
         fail "--name and --git-user are supported only by project recovery operations"
       [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
         fail "--target-db and --jobs are supported only by restore-project-db"
+      [[ "$start_database_service_set" == "0" ]] || \
+        fail "--start-service is supported only by restore-project-db"
       ;;
     projects-plan)
       [[ -z "$SNAPSHOT_ID" ]] || \
@@ -2301,6 +2326,8 @@ parse_arguments() {
         fail "--name and --git-user are supported only by project recovery operations"
       [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
         fail "--target-db and --jobs are supported only by restore-project-db"
+      [[ "$start_database_service_set" == "0" ]] || \
+        fail "--start-service is supported only by restore-project-db"
       ;;
     clone-project)
       [[ -z "$SNAPSHOT_ID" ]] || \
@@ -2311,6 +2338,8 @@ parse_arguments() {
       [[ -n "$GIT_USER" ]] || fail "clone-project requires --git-user"
       [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
         fail "--target-db and --jobs are supported only by restore-project-db"
+      [[ "$start_database_service_set" == "0" ]] || \
+        fail "--start-service is supported only by restore-project-db"
       ;;
     restore-project-files)
       [[ -z "$SNAPSHOT_ID" ]] || \
@@ -2321,6 +2350,8 @@ parse_arguments() {
         fail "restore-project-files requires --git-user"
       [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
         fail "--target-db and --jobs are supported only by restore-project-db"
+      [[ "$start_database_service_set" == "0" ]] || \
+        fail "--start-service is supported only by restore-project-db"
       ;;
     restore-project-db)
       [[ -z "$SNAPSHOT_ID" ]] || \
@@ -2341,6 +2372,8 @@ parse_arguments() {
         fail "--name and --git-user are supported only by project recovery operations"
       [[ "$target_database_set" == "0" && "$restore_jobs_set" == "0" ]] || \
         fail "--target-db and --jobs are supported only by restore-project-db"
+      [[ "$start_database_service_set" == "0" ]] || \
+        fail "--start-service is supported only by restore-project-db"
       ;;
   esac
   if [[ "$OPERATION" != "plan" && "$OPERATION" != "status" && \

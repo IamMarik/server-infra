@@ -1,0 +1,584 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+WIZARD_BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RECOVERY_ROOT="$(cd "$WIZARD_BIN_DIR/.." && pwd)"
+REPOSITORY_ROOT="$(cd "$RECOVERY_ROOT/.." && pwd)"
+# shellcheck source=../../scripts/common.sh
+source "$REPOSITORY_ROOT/scripts/common.sh"
+
+RECOVERY_EXECUTABLE="${SERVER_INFRA_RECOVERY_EXECUTABLE:-$WIZARD_BIN_DIR/server-infra-recovery}"
+STATE_ROOT="/var/lib/server-infra/recovery"
+CONFIG_ROOT="/etc/server-infra"
+WORK_ROOT="/var/cache/server-infra/recovery"
+BREAK_GLASS_FILE=""
+GIT_USER=""
+RESTORE_JOBS=4
+PROJECT_PLAN_FILE=""
+PROJECT_NAMES=()
+PROJECT_TYPES=()
+PROJECT_CHECKOUT_STATES=()
+PROJECT_FILE_STATES=()
+PROJECT_DATABASE_STATES=()
+PROJECT_DATABASE_TARGETS=()
+PROJECT_ROOTS=()
+PROJECT_SELECTED=()
+
+wizard_log() {
+  printf '[server-infra][recovery-wizard] %s\n' "$*"
+}
+
+wizard_ok() {
+  printf '[server-infra][recovery-wizard][ok] %s\n' "$*"
+}
+
+wizard_warn() {
+  printf '[server-infra][recovery-wizard][warn] %s\n' "$*" >&2
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  server-infra-recovery-wizard \
+    --break-glass <absolute-path> \
+    [--git-user <ordinary-user>] \
+    [--jobs <count>] \
+    [--state-root <absolute-path>] \
+    [--config-root <absolute-path>] \
+    [--work-root <absolute-path>]
+
+The wizard validates the break-glass record, lets the operator select exact
+configuration and data snapshots, displays deferred infrastructure modules,
+and restores selected projects.
+
+For PostgreSQL projects it starts only the configured database Compose
+service, waits for readiness, and restores into a new isolated database.
+It never starts applications, changes database connection settings, deploys
+the proxy, changes DNS, or enables public traffic.
+
+Defaults:
+  --git-user    SUDO_USER when sudo was invoked by an ordinary user
+  --jobs        4
+  --state-root  /var/lib/server-infra/recovery
+  --config-root /etc/server-infra
+  --work-root   /var/cache/server-infra/recovery
+USAGE
+}
+
+cleanup_wizard() {
+  if [[ -n "$PROJECT_PLAN_FILE" && -f "$PROJECT_PLAN_FILE" ]]; then
+    rm -f -- "$PROJECT_PLAN_FILE"
+  fi
+  PROJECT_PLAN_FILE=""
+}
+
+validate_wizard_path() {
+  local path_value="$1"
+  local path_label="$2"
+
+  [[ "$path_value" == /* ]] || fail "$path_label must be an absolute path"
+  [[ "$path_value" != *".."* && "$path_value" != *"//"* ]] || \
+    fail "$path_label contains an unsafe path"
+  [[ "$path_value" != *$'\n'* && "$path_value" != *$'\r'* ]] || \
+    fail "$path_label contains a line break"
+}
+
+validate_no_symlink_components() {
+  local path_value="$1"
+  local path_label="$2"
+  local current_path=""
+  local component
+  local components=()
+
+  IFS='/' read -r -a components <<< "${path_value#/}"
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    current_path="$current_path/$component"
+    [[ ! -L "$current_path" ]] || \
+      fail "$path_label contains a symlinked component: $current_path"
+  done
+}
+
+validate_snapshot_id() {
+  [[ "$1" =~ ^[0-9a-f]{8,64}$ ]] || \
+    fail "Snapshot ID must be 8-64 lowercase hexadecimal characters"
+}
+
+validate_jobs() {
+  [[ "$RESTORE_JOBS" =~ ^[1-9][0-9]*$ ]] || \
+    fail "Restore jobs must be a positive integer"
+  ((RESTORE_JOBS <= 32)) || fail "Restore jobs must not exceed 32"
+}
+
+resolve_git_user() {
+  if [[ -z "$GIT_USER" && -n "${SUDO_USER:-}" && \
+    "${SUDO_USER:-}" != "root" ]]; then
+    GIT_USER="$SUDO_USER"
+  fi
+  [[ -n "$GIT_USER" ]] || \
+    fail "Specify --git-user when the wizard cannot infer SUDO_USER"
+  id "$GIT_USER" >/dev/null 2>&1 || fail "Git user not found: $GIT_USER"
+  [[ "$(id -u "$GIT_USER")" != "0" ]] || \
+    fail "Git operations require an ordinary non-root user"
+}
+
+validate_runtime() {
+  validate_wizard_path "$STATE_ROOT" "State root"
+  validate_wizard_path "$CONFIG_ROOT" "Configuration root"
+  validate_wizard_path "$WORK_ROOT" "Work root"
+  validate_wizard_path "$BREAK_GLASS_FILE" "Break-glass file"
+  validate_jobs
+  resolve_git_user
+  require_command id
+  require_command install
+  require_command mktemp
+  require_command rm
+  [[ -x "$RECOVERY_EXECUTABLE" && ! -L "$RECOVERY_EXECUTABLE" ]] || \
+    fail "Recovery executable is not available: $RECOVERY_EXECUTABLE"
+
+  if [[ "$STATE_ROOT" == "/var/lib/server-infra/recovery" || \
+    "$CONFIG_ROOT" == "/etc/server-infra" || \
+    "$WORK_ROOT" == "/var/cache/server-infra/recovery" ]]; then
+    [[ "$(uname -s)" == "Linux" ]] || \
+      fail "Production recovery paths require Linux"
+    [[ "$EUID" == "0" ]] || \
+      fail "Production recovery paths require root privileges"
+  fi
+}
+
+run_recovery() {
+  "$RECOVERY_EXECUTABLE" \
+    --state-root "$STATE_ROOT" \
+    "$@"
+}
+
+run_config_recovery() {
+  local config_phase
+  local pinned_snapshot
+  local selected_snapshot
+
+  config_phase="$(
+    read_required_env_value \
+      "$STATE_ROOT/session.env" \
+      "RECOVERY_PHASE_CONFIG"
+  )"
+  pinned_snapshot="$(
+    read_required_env_value \
+      "$STATE_ROOT/session.env" \
+      "RECOVERY_CONFIG_SNAPSHOT"
+  )"
+
+  if [[ "$config_phase" == "complete" ]]; then
+    wizard_ok "Configuration is already restored from $pinned_snapshot"
+    return
+  fi
+
+  if [[ "$config_phase" == "in-progress" ]]; then
+    selected_snapshot="$pinned_snapshot"
+    wizard_log "Resuming pinned configuration snapshot: $selected_snapshot"
+  else
+    wizard_log "Available configuration snapshots:"
+    run_recovery \
+      config-snapshots \
+      --break-glass "$BREAK_GLASS_FILE"
+    printf 'Configuration snapshot ID: '
+    IFS= read -r selected_snapshot
+    validate_snapshot_id "$selected_snapshot"
+  fi
+
+  run_recovery \
+    --config-root "$CONFIG_ROOT" \
+    --work-root "$WORK_ROOT" \
+    restore-config \
+    --break-glass "$BREAK_GLASS_FILE" \
+    --snapshot "$selected_snapshot"
+}
+
+run_data_selection() {
+  local data_phase
+  local pinned_snapshot
+  local selected_snapshot
+
+  data_phase="$(
+    read_required_env_value \
+      "$STATE_ROOT/session.env" \
+      "RECOVERY_PHASE_DATA"
+  )"
+  pinned_snapshot="$(
+    read_required_env_value \
+      "$STATE_ROOT/session.env" \
+      "RECOVERY_DATA_SNAPSHOT"
+  )"
+
+  if [[ "$data_phase" == "complete" ]]; then
+    wizard_ok "Data snapshot is already pinned: $pinned_snapshot"
+    return
+  fi
+
+  if [[ "$data_phase" == "in-progress" ]]; then
+    selected_snapshot="$pinned_snapshot"
+    wizard_log "Resuming pinned data snapshot: $selected_snapshot"
+  else
+    wizard_log "Available data snapshots:"
+    run_recovery \
+      --config-root "$CONFIG_ROOT" \
+      data-snapshots \
+      --break-glass "$BREAK_GLASS_FILE"
+    printf 'Data snapshot ID: '
+    IFS= read -r selected_snapshot
+    validate_snapshot_id "$selected_snapshot"
+  fi
+
+  run_recovery \
+    --config-root "$CONFIG_ROOT" \
+    select-data \
+    --break-glass "$BREAK_GLASS_FILE" \
+    --snapshot "$selected_snapshot"
+}
+
+show_infrastructure_plan() {
+  local modules_file="$CONFIG_ROOT/modules.env"
+  local enabled_modules
+  local module_name
+  local module_contract
+  local module_description
+
+  validate_env_file "$modules_file"
+  enabled_modules="$(
+    read_required_env_value "$modules_file" "ENABLED_MODULES"
+  )"
+
+  printf '\nInfrastructure modules (deferred):\n'
+  for module_name in $enabled_modules; do
+    module_contract="$REPOSITORY_ROOT/$module_name/module.env"
+    if [[ -f "$module_contract" ]]; then
+      module_description="$(
+        read_required_env_value "$module_contract" "MODULE_DESCRIPTION"
+      )"
+    else
+      module_description="module contract unavailable in this checkout"
+    fi
+    printf '  [deferred] %s — %s\n' \
+      "$module_name" \
+      "$module_description"
+  done
+  printf '%s\n' \
+    "  These modules are not deployed before project validation and cutover."
+  if [[ " $enabled_modules " == *" monitoring "* ]]; then
+    printf '%s\n' \
+      "  Monitoring named-volume state is not protected by the current backup contract."
+  fi
+}
+
+load_project_plan() {
+  local line_number=0
+  local project_name
+  local project_type
+  local checkout_state
+  local files_state
+  local database_state
+  local database_target
+  local project_root
+  local repository_url
+  local deploy_commit
+  local data_snapshot
+
+  PROJECT_PLAN_FILE="$(mktemp "${TMPDIR:-/tmp}/recovery-projects.XXXXXX")"
+  run_recovery \
+    --config-root "$CONFIG_ROOT" \
+    projects-plan \
+    --break-glass "$BREAK_GLASS_FILE" \
+    > "$PROJECT_PLAN_FILE"
+
+  while IFS=$'\t' read -r \
+    project_name \
+    project_type \
+    checkout_state \
+    files_state \
+    database_state \
+    database_target \
+    project_root \
+    repository_url \
+    deploy_commit \
+    data_snapshot; do
+    line_number=$((line_number + 1))
+    if ((line_number == 1)); then
+      [[ "$project_name" == "NAME" && "$project_type" == "TYPE" ]] || \
+        fail "Unexpected projects-plan header"
+      continue
+    fi
+    [[ -n "$project_name" && -n "$project_root" ]] || \
+      fail "Invalid projects-plan row"
+    PROJECT_NAMES+=("$project_name")
+    PROJECT_TYPES+=("$project_type")
+    PROJECT_CHECKOUT_STATES+=("$checkout_state")
+    PROJECT_FILE_STATES+=("$files_state")
+    PROJECT_DATABASE_STATES+=("$database_state")
+    PROJECT_DATABASE_TARGETS+=("$database_target")
+    PROJECT_ROOTS+=("$project_root")
+    PROJECT_SELECTED+=(0)
+  done < "$PROJECT_PLAN_FILE"
+
+  ((${#PROJECT_NAMES[@]} > 0)) || \
+    fail "No recoverable projects were found in the selected snapshot"
+}
+
+render_project_selection() {
+  local index
+  local mark
+
+  printf '\nProjects available for recovery:\n'
+  for ((index = 0; index < ${#PROJECT_NAMES[@]}; index++)); do
+    mark=" "
+    [[ "${PROJECT_SELECTED[$index]}" == "0" ]] || mark="x"
+    if [[ "${PROJECT_FILE_STATES[$index]}" == "complete" && \
+      ("${PROJECT_DATABASE_STATES[$index]}" == "complete" || \
+      "${PROJECT_DATABASE_STATES[$index]}" == "not-applicable") ]]; then
+      mark="done"
+    fi
+    printf '  [%s] %d. %s (%s; checkout=%s; files=%s; db=%s)\n' \
+      "$mark" \
+      "$((index + 1))" \
+      "${PROJECT_NAMES[$index]}" \
+      "${PROJECT_TYPES[$index]}" \
+      "${PROJECT_CHECKOUT_STATES[$index]}" \
+      "${PROJECT_FILE_STATES[$index]}" \
+      "${PROJECT_DATABASE_STATES[$index]}"
+  done
+}
+
+select_projects() {
+  local answer
+  local token
+  local selected_count
+  local index
+
+  while true; do
+    render_project_selection
+    printf '%s\n' \
+      "Toggle project numbers separated by spaces; a=all, n=none, q=quit."
+    printf 'Selection (Enter continues): '
+    IFS= read -r answer
+    case "$answer" in
+      "")
+        selected_count=0
+        for token in "${PROJECT_SELECTED[@]}"; do
+          [[ "$token" == "0" ]] || \
+            selected_count=$((selected_count + 1))
+        done
+        if ((selected_count > 0)); then
+          return
+        fi
+        wizard_warn "Select at least one project or enter q to stop"
+        ;;
+      a)
+        for ((index = 0; index < ${#PROJECT_SELECTED[@]}; index++)); do
+          PROJECT_SELECTED[$index]=1
+        done
+        ;;
+      n)
+        for ((index = 0; index < ${#PROJECT_SELECTED[@]}; index++)); do
+          PROJECT_SELECTED[$index]=0
+        done
+        ;;
+      q)
+        wizard_warn "Recovery stopped before project changes"
+        exit 0
+        ;;
+      *)
+        for token in $answer; do
+          [[ "$token" =~ ^[1-9][0-9]*$ ]] || \
+            fail "Invalid project selection: $token"
+          ((token <= ${#PROJECT_NAMES[@]})) || \
+            fail "Project selection is out of range: $token"
+          index=$((token - 1))
+          if [[ "${PROJECT_SELECTED[$index]}" == "0" ]]; then
+            PROJECT_SELECTED[$index]=1
+          else
+            PROJECT_SELECTED[$index]=0
+          fi
+        done
+        ;;
+    esac
+  done
+}
+
+ensure_project_parent() {
+  local project_root="$1"
+  local project_parent
+  local answer
+  local target_gid
+
+  project_parent="${project_root%/*}"
+  [[ -n "$project_parent" ]] || project_parent="/"
+  validate_wizard_path "$project_parent" "Project parent"
+  validate_no_symlink_components "$project_parent" "Project parent"
+  if [[ -d "$project_parent" && ! -L "$project_parent" ]]; then
+    return
+  fi
+  [[ ! -e "$project_parent" && ! -L "$project_parent" ]] || \
+    fail "Project parent is not a safe directory: $project_parent"
+
+  printf 'Create project parent %s for %s? [Y/n] ' \
+    "$project_parent" \
+    "$GIT_USER"
+  IFS= read -r answer
+  case "$answer" in
+    "" | y | Y | yes | YES)
+      target_gid="$(id -g "$GIT_USER")"
+      install -d \
+        -o "$GIT_USER" \
+        -g "$target_gid" \
+        -m 0750 \
+        "$project_parent"
+      ;;
+    *)
+      fail "Project parent is required: $project_parent"
+      ;;
+  esac
+}
+
+default_database_target() {
+  local project_name="$1"
+  local database_name="${project_name//-/_}"
+
+  database_name="${database_name:0:53}_recovered"
+  printf '%s' "$database_name"
+}
+
+restore_selected_project() {
+  local index="$1"
+  local project_name="${PROJECT_NAMES[$index]}"
+  local project_type="${PROJECT_TYPES[$index]}"
+  local database_target="${PROJECT_DATABASE_TARGETS[$index]}"
+  local default_target
+  local answer
+
+  wizard_log "Recovering project: $project_name"
+  ensure_project_parent "${PROJECT_ROOTS[$index]}"
+  run_recovery \
+    --config-root "$CONFIG_ROOT" \
+    clone-project \
+    --break-glass "$BREAK_GLASS_FILE" \
+    --name "$project_name" \
+    --git-user "$GIT_USER"
+  run_recovery \
+    --config-root "$CONFIG_ROOT" \
+    --work-root "$WORK_ROOT" \
+    restore-project-files \
+    --break-glass "$BREAK_GLASS_FILE" \
+    --name "$project_name" \
+    --git-user "$GIT_USER"
+
+  if [[ "$project_type" == "files-only" ]]; then
+    wizard_ok "Files-only project recovered: $project_name"
+    return
+  fi
+  [[ "$project_type" == "postgres-compose" ]] || \
+    fail "Unsupported project type in recovery plan: $project_type"
+
+  if [[ "$database_target" != "-" ]]; then
+    default_target="$database_target"
+  else
+    default_target="$(default_database_target "$project_name")"
+  fi
+  printf 'Target database for %s [%s]: ' "$project_name" "$default_target"
+  IFS= read -r answer
+  database_target="${answer:-$default_target}"
+
+  run_recovery \
+    --config-root "$CONFIG_ROOT" \
+    restore-project-db \
+    --break-glass "$BREAK_GLASS_FILE" \
+    --name "$project_name" \
+    --git-user "$GIT_USER" \
+    --target-db "$database_target" \
+    --jobs "$RESTORE_JOBS" \
+    --start-service
+  wizard_ok "Project restored into isolated database: $project_name"
+}
+
+run_project_recovery() {
+  local index
+
+  load_project_plan
+  select_projects
+  for ((index = 0; index < ${#PROJECT_NAMES[@]}; index++)); do
+    [[ "${PROJECT_SELECTED[$index]}" == "1" ]] || continue
+    restore_selected_project "$index"
+  done
+}
+
+parse_arguments() {
+  while (($# > 0)); do
+    case "$1" in
+      --break-glass)
+        (($# >= 2)) || fail "Missing value for --break-glass"
+        [[ -z "$BREAK_GLASS_FILE" ]] || \
+          fail "--break-glass may be specified only once"
+        BREAK_GLASS_FILE="$2"
+        shift 2
+        ;;
+      --git-user)
+        (($# >= 2)) || fail "Missing value for --git-user"
+        [[ -z "$GIT_USER" ]] || \
+          fail "--git-user may be specified only once"
+        GIT_USER="$2"
+        shift 2
+        ;;
+      --jobs)
+        (($# >= 2)) || fail "Missing value for --jobs"
+        RESTORE_JOBS="$2"
+        shift 2
+        ;;
+      --state-root)
+        (($# >= 2)) || fail "Missing value for --state-root"
+        STATE_ROOT="$2"
+        shift 2
+        ;;
+      --config-root)
+        (($# >= 2)) || fail "Missing value for --config-root"
+        CONFIG_ROOT="$2"
+        shift 2
+        ;;
+      --work-root)
+        (($# >= 2)) || fail "Missing value for --work-root"
+        WORK_ROOT="$2"
+        shift 2
+        ;;
+      --help | -h)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "Unknown argument: $1"
+        ;;
+    esac
+  done
+  [[ -n "$BREAK_GLASS_FILE" ]] || fail "--break-glass is required"
+}
+
+main() {
+  parse_arguments "$@"
+  validate_runtime
+  trap cleanup_wizard EXIT
+
+  wizard_log "Validating break-glass record and recovery session"
+  run_recovery \
+    init \
+    --break-glass "$BREAK_GLASS_FILE"
+  run_config_recovery
+  run_data_selection
+  show_infrastructure_plan
+  run_project_recovery
+
+  printf '\n'
+  run_recovery status
+  printf '\n'
+  wizard_ok "Selected projects reached the isolated restore stage"
+  wizard_warn \
+    "Application validation, database cutover, infrastructure deployment, DNS, and traffic remain manual"
+}
+
+main "$@"

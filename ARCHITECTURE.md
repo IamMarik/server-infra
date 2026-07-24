@@ -195,6 +195,12 @@ The restored host configuration and project `recovery.conf` files remain the
 sources of truth; the orchestrator must not duplicate their values in a
 tracked server description.
 
+The interactive recovery wizard is only a facade over the same non-interactive
+operations and state. It may select projects and start a project's PostgreSQL
+service, but infrastructure modules remain a distinct deferred plan. It does
+not deploy Caddy, start applications, promote databases, change DNS, or enable
+traffic.
+
 The approved boundary, bootstrap procedure, and phased state model are defined
 in `rfc/0003-disaster-recovery-orchestrator.md`.
 

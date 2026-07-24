@@ -23,6 +23,7 @@ snapshot_id=""
 target_database=""
 restore_jobs=""
 config_root=""
+start_service=0
 
 while (($# > 0)); do
   case "$1" in
@@ -46,6 +47,10 @@ while (($# > 0)); do
       config_root="$2"
       shift 2
       ;;
+    --start-service)
+      start_service=1
+      shift
+      ;;
     *)
       exit 1
       ;;
@@ -57,6 +62,7 @@ done
 [[ "$target_database" == "${FAKE_EXPECTED_TARGET_DATABASE:-}" ]]
 [[ "$restore_jobs" == "${FAKE_EXPECTED_RESTORE_JOBS:-}" ]]
 [[ "$config_root" == "${FAKE_EXPECTED_CONFIG_ROOT:-}" ]]
+[[ "$start_service" == "${FAKE_EXPECTED_START_SERVICE:-0}" ]]
 
 if [[ "${FAKE_PROJECT_HELPER_FAIL:-0}" == "1" ]]; then
   exit 1

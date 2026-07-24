@@ -461,6 +461,7 @@ PROJECT_HELPER_LINES_AFTER="$(wc -l < "$PROJECT_HELPER_LOG")"
   fail_test "Rejected database target contacted the backup helper"
 
 SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  FAKE_EXPECTED_START_SERVICE=1 \
   PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   --state-root "$STATE_ROOT" \
   --config-root "$CONFIG_ROOT" \
@@ -469,9 +470,10 @@ SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
   --name test-app \
   --git-user "$TEST_GIT_USER" \
   --target-db test_app_recovered \
-  --jobs 3 >> "$COMMAND_OUTPUT" 2>&1
+  --jobs 3 \
+  --start-service >> "$COMMAND_OUTPUT" 2>&1
 assert_contains "$PROJECT_HELPER_LOG" \
-  "restore-db --config-root $CONFIG_ROOT --name test-app --snapshot deadbeef --target-db test_app_recovered --jobs 3"
+  "restore-db --config-root $CONFIG_ROOT --name test-app --snapshot deadbeef --target-db test_app_recovered --jobs 3 --start-service"
 assert_contains "$PROJECT_STATE_FILE" "PROJECT_DATABASE_STATUS=complete"
 assert_contains "$STATE_FILE" "RECOVERY_PHASE_PROJECTS=complete"
 

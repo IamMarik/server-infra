@@ -422,6 +422,11 @@ chmod 0600 \
     --target-db test_restore \
     --snapshot abcdef12 \
     --jobs 3
+  "$CLI" project restore-db \
+    --config-root "$CONFIG_ROOT" \
+    --target-db started_restore \
+    --snapshot abcdef12 \
+    --start-service
 )
 "$CLI" project status \
   --name my-app \
@@ -469,6 +474,12 @@ assert_contains \
 assert_contains \
   "$DOCKER_LOG" \
   "createdb --username test-user --maintenance-db postgres --template template0 test_restore"
+assert_contains \
+  "$DOCKER_LOG" \
+  "up -d --no-deps postgres"
+assert_contains \
+  "$DOCKER_LOG" \
+  "exec -T postgres pg_isready --quiet"
 assert_contains \
   "$DOCKER_LOG" \
   "pg_restore --exit-on-error --no-owner --no-acl --jobs 3 --username test-user --dbname test_restore"

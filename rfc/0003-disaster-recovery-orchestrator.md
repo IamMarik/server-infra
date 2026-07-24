@@ -185,6 +185,19 @@ The sixth increment implements:
 - refusal to change a target on retry and idempotent completed-state handling;
 - no application database promotion, connection change, or service cutover.
 
+The seventh increment implements:
+
+- `server-infra-recovery-wizard` as an interactive facade over the existing
+  non-interactive recovery operations;
+- exact configuration and data snapshot prompts with resumable pinned state;
+- checkbox-style project selection without adding a dialog package;
+- display of recovered infrastructure modules as a separate deferred plan;
+- optional startup of only the configured PostgreSQL Compose service with a
+  bounded readiness check;
+- restoration of selected PostgreSQL projects into proposed isolated targets;
+- no application startup, database promotion, infrastructure deployment, DNS
+  change, or traffic activation.
+
 Application validation, deployment, database cutover, and finalization remain
 documented manual operations until their contracts are separately implemented
 and tested.

@@ -99,6 +99,24 @@ It installs the remaining Git, OpenSSH client, CA, curl, restic, and Docker
 requirements and prepares shared runtime roots. It does not create
 `/etc/server-infra`, change SSH or firewall policy, or start public services.
 
+The recommended path from this point is the resumable interactive wizard:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery-wizard \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --git-user ubuntu
+```
+
+It performs the safe parts of steps 3, 5, 6, and 7 below through the same
+non-interactive recovery commands. It asks for exact snapshot IDs, displays
+infrastructure modules as deferred work, and lets the operator toggle projects
+with `[ ]` selections. It starts only PostgreSQL for a selected database
+project and restores into a proposed isolated target. It does not validate or
+start applications, perform database cutover, deploy Caddy, change DNS, or
+enable traffic.
+
+The commands below remain the detailed manual and troubleshooting flow.
+
 Initialize the recovery session. This verifies the break-glass record against
 the checkout without copying its secrets:
 
@@ -225,7 +243,8 @@ Do not copy a restored data tree blindly over a Git checkout.
 
 ### 7. Restore PostgreSQL projects
 
-Start only the PostgreSQL Compose service first. Keep the application stopped.
+Keep the application stopped. The recovery command can start only the
+PostgreSQL Compose service and wait for it to become ready:
 
 ```bash
 sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" \
@@ -234,7 +253,8 @@ sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" \
   --name <project-name> \
   --git-user ubuntu \
   --target-db <project>_recovered \
-  --jobs 4
+  --jobs 4 \
+  --start-service
 ```
 
 The recovery command supplies the data snapshot already pinned by

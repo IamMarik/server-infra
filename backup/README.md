@@ -334,7 +334,8 @@ sudo server-infra-backup project status
 sudo server-infra-backup project logs
 sudo server-infra-backup project restore-db \
   --target-db my_app_restore \
-  --jobs 4
+  --jobs 4 \
+  --start-service
 ```
 
 These commands resolve the source name from
@@ -352,14 +353,20 @@ Compose service user, creates a new empty database from `template0`, and runs
 `pg_restore` from that regular archive file. Other project files in the data
 snapshot are not downloaded.
 
+By default the PostgreSQL Compose service must already be running. With
+`--start-service`, the helper runs `docker compose up -d --no-deps` for only
+the configured PostgreSQL service and waits up to 60 seconds for
+`pg_isready`. It never starts the application or Compose dependencies.
+
 During complete-server recovery, use
 `server-infra-recovery restore-project-db` instead of calling this primitive
 directly. The orchestrator supplies the one snapshot already pinned for the
 session and records the isolated target database for safe retries.
 
-The PostgreSQL Compose service must be running and its standard `postgres`
-maintenance database must be available. The configured source database itself
-does not need to accept connections or still exist.
+The PostgreSQL Compose service must be running, either before the command or
+through `--start-service`, and its standard `postgres` maintenance database
+must be available. The configured source database itself does not need to
+accept connections or still exist.
 
 The target database:
 

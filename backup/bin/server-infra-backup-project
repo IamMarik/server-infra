@@ -39,6 +39,7 @@ RECOVERY_DEPLOY_COMMIT=""
 RESTORE_SNAPSHOT="latest"
 RESTORE_TARGET_DB=""
 RESTORE_JOBS=4
+RESTORE_START_SERVICE=0
 RESTORE_WORK=""
 RESTORE_CONTAINER_DUMP=""
 RESTORE_DB_CREATED=0
@@ -62,7 +63,8 @@ Usage:
   server-infra-backup project logs [--name <name> | --manifest <directory>]
   server-infra-backup project restore-db \
     [--name <name> | --manifest <directory>] \
-    --target-db <new-database> [--snapshot <latest|id>] [--jobs <count>]
+    --target-db <new-database> [--snapshot <latest|id>] [--jobs <count>] \
+    [--start-service]
 
 Internal:
   server-infra-backup-project dump --source-config <source.conf>
@@ -107,6 +109,8 @@ Restore-db options:
   --snapshot <latest|id>      Data snapshot to restore. Default: latest.
   --jobs <count>              Parallel pg_restore jobs, from 1 to 32.
                               Default: 4.
+  --start-service             Start only the configured PostgreSQL Compose
+                              service and wait for readiness before restoring.
 
 The PostgreSQL helper never sources the Compose env file and stores no
 database password. It executes pg_dump and pg_restore inside the configured
@@ -1398,6 +1402,27 @@ build_restore_compose_args() {
   RESTORE_COMPOSE_ARGS+=(-f "$COMPOSE_FILE")
 }
 
+start_restore_postgres_service() {
+  local attempt
+
+  require_command sleep
+  log "Starting only PostgreSQL Compose service: $COMPOSE_SERVICE"
+  docker "${RESTORE_COMPOSE_ARGS[@]}" \
+    up -d --no-deps "$COMPOSE_SERVICE"
+
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    if docker "${RESTORE_COMPOSE_ARGS[@]}" \
+      exec -T "$COMPOSE_SERVICE" \
+      pg_isready --quiet >/dev/null 2>&1; then
+      ok "PostgreSQL Compose service is ready: $COMPOSE_SERVICE"
+      return
+    fi
+    sleep 2
+  done
+
+  fail "PostgreSQL Compose service did not become ready within 60 seconds"
+}
+
 cleanup_restore_database() {
   local cleanup_target=""
 
@@ -1466,6 +1491,9 @@ run_project_restore_database() {
   fi
 
   build_restore_compose_args
+  if [[ "$RESTORE_START_SERVICE" == "1" ]]; then
+    start_restore_postgres_service
+  fi
   source_identity="$(
     docker "${RESTORE_COMPOSE_ARGS[@]}" \
       exec -T "$COMPOSE_SERVICE" \
@@ -1793,6 +1821,12 @@ parse_arguments() {
         (($# >= 2)) || fail "Missing value for --jobs"
         RESTORE_JOBS="$2"
         shift 2
+        ;;
+      --start-service)
+        [[ "$OPERATION" == "restore-db" ]] || \
+          fail "--start-service is supported only by restore-db"
+        RESTORE_START_SERVICE=1
+        shift
         ;;
       --check)
         CHECK_ONLY=1
