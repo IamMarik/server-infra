@@ -30,11 +30,21 @@ case "${1:-}" in
     ;;
   restore)
     target=""
+    tag=""
+    includes=()
     shift
     while (($# > 0)); do
       case "$1" in
         --target)
           target="$2"
+          shift 2
+          ;;
+        --tag)
+          tag="$2"
+          shift 2
+          ;;
+        --include)
+          includes+=("$2")
           shift 2
           ;;
         *)
@@ -43,6 +53,31 @@ case "${1:-}" in
       esac
     done
     [[ -n "$target" ]]
+
+    if [[ "$tag" == "server-infra-data" ]]; then
+      ((${#includes[@]} > 0))
+      for include_path in "${includes[@]}"; do
+        restored_path="$target$include_path"
+        case "$include_path" in
+          */.env)
+            mkdir -p "${restored_path%/*}"
+            printf '%s\n' "APP_SETTING=recovered" > "$restored_path"
+            chmod 0600 "$restored_path"
+            ;;
+          */uploads)
+            mkdir -p "$restored_path"
+            printf '%s\n' "restored upload" > "$restored_path/example.txt"
+            chmod 0750 "$restored_path"
+            chmod 0640 "$restored_path/example.txt"
+            ;;
+          *)
+            exit 1
+            ;;
+        esac
+      done
+      exit 0
+    fi
+    [[ "$tag" == "server-infra-config" ]]
 
     restored_root="$target$FAKE_CONFIG_ROOT"
     project_source_root="$restored_root/backup/sources.d/test-app"
@@ -75,13 +110,24 @@ case "${1:-}" in
     printf '%s\n' \
       "SOURCE_VERSION=1" \
       "SOURCE_NAME=test-app" \
-      "SOURCE_TYPE=files-only" \
+      "SOURCE_TYPE=postgres-compose" \
       "PROJECT_ROOT=$FAKE_PROJECT_ROOT" \
+      "COMPOSE_FILE=$FAKE_PROJECT_ROOT/docker-compose.yml" \
+      "COMPOSE_SERVICE=postgres" \
+      "COMPOSE_ENV_FILE=$FAKE_PROJECT_ROOT/.env" \
+      "DUMP_TIME=02:45" \
+      "DUMP_MAX_AGE_SECONDS=14400" \
+      "STAGING_DIR=$FAKE_PROJECT_STAGING_DIR" \
       > "$project_source_root/source.conf"
-    printf '%s\n' "$FAKE_PROJECT_ROOT/.env" \
+    printf '%s\n' \
+      "$FAKE_PROJECT_ROOT/.env" \
+      "$FAKE_PROJECT_ROOT/uploads" \
+      "$FAKE_PROJECT_STAGING_DIR" \
       > "$project_source_root/paths"
     : > "$project_source_root/excludes"
-    : > "$project_source_root/freshness"
+    printf '%s\n' \
+      "14400 $FAKE_PROJECT_STAGING_DIR/postgres.complete" \
+      > "$project_source_root/freshness"
     printf '%s\n' \
       "RECOVERY_VERSION=1" \
       "REPOSITORY_URL=$FAKE_PROJECT_REPOSITORY_URL" \

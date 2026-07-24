@@ -160,13 +160,17 @@ metadata needed before `/etc/server-infra` can be restored. Recovery session
 state belongs outside Git under:
 
 ```text
-/var/lib/server-infra/recovery/session.env
+/var/lib/server-infra/recovery/
+├── session.env
+└── projects/
+    └── <project>.env
 ```
 
-The state contains no provider credentials, restic password, Git private key,
-or application secret. The restored host configuration and project
-`recovery.conf` files remain the sources of truth; the orchestrator must not
-duplicate their values in a tracked server description.
+The session and project state contain no provider credentials, restic
+password, Git private key, restored application value, or application secret.
+The restored host configuration and project `recovery.conf` files remain the
+sources of truth; the orchestrator must not duplicate their values in a
+tracked server description.
 
 The approved boundary, bootstrap procedure, and phased state model are defined
 in `rfc/0003-disaster-recovery-orchestrator.md`.

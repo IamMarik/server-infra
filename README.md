@@ -205,10 +205,14 @@ sudo ./recovery/bin/server-infra-recovery clone-project \
   --break-glass /home/ubuntu/server-infra-break-glass.txt \
   --name <project-name> \
   --git-user ubuntu
+sudo ./recovery/bin/server-infra-recovery restore-project-files \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --name <project-name> \
+  --git-user ubuntu
 ```
 
-Project file and database restoration, service validation, and traffic
-cutover remain operator-guided. See `recovery/README.md`.
+Database restoration, service validation, and traffic cutover remain
+operator-guided. See `recovery/README.md`.
 
 ## Documentation
 

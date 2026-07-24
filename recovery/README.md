@@ -29,9 +29,11 @@ The current implementation provides:
 - `select-data` to validate and pin one data snapshot for all projects.
 - `projects-plan` to validate and print the recovered Git inventory;
 - `clone-project` to recreate one checkout at its recorded exact commit.
+- `restore-project-files` to restore declared non-database paths from the
+  pinned data snapshot without overwriting live paths.
 
-It does not yet restore project files or databases, reinstall project backup
-sources, deploy infrastructure, or start public traffic.
+It does not yet restore databases, reinstall project backup sources, deploy
+infrastructure, or start public traffic.
 
 ## Security model
 
@@ -56,13 +58,22 @@ rejects symlinks and special files in restored configuration, verifies that
 the restored credentials and server identity match the break-glass record,
 and refuses to overwrite an existing active configuration.
 
+Project file restoration revalidates the exact checkout, reads only the
+selected source's `paths`, and excludes its PostgreSQL `STAGING_DIR`. Restic
+extracts into root-only temporary storage. Symlinks and special files are
+rejected. Every declared path is installed only when its destination is
+absent; a pre-existing destination must exactly match the selected snapshot.
+Ownership and modes from the snapshot are preserved.
+
 ## Session state
 
 Default state:
 
 ```text
 /var/lib/server-infra/recovery/
-└── session.env
+├── session.env
+└── projects/
+    └── <project>.env
 ```
 
 The directory is mode `0700`; `session.env` is mode `0600`. State contains
@@ -73,6 +84,9 @@ only:
 - server-infra repository URL and exact commit;
 - the pinned configuration snapshot and, later, data snapshot;
 - phase statuses.
+
+Each project state stores only its name, the same pinned data snapshot ID, and
+file/database phase statuses. It contains no restored application values.
 
 `init` never overwrites an existing session. Re-running it with the same
 break-glass record validates and reuses that session. A mismatch fails.
@@ -156,6 +170,21 @@ example `sudo --preserve-env=SSH_AUTH_SOCK ...`.
 copy `.env` or uploads, restore PostgreSQL, install the recovered project
 source, or start Compose services.
 
+Restore the declared `.env`, uploads, and other non-database paths:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery restore-project-files \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --name <project-name> \
+  --git-user ubuntu
+```
+
+The command uses the data snapshot already recorded by `select-data`; it has
+no snapshot option. It never restores `STAGING_DIR`, because `project
+restore-db` extracts only `postgres.dump` directly during the separate
+database phase. Parent directories of external declared paths must already
+exist.
+
 The restore uses `/var/cache/server-infra/recovery` for a root-only restic
 cache and temporary extraction. Plaintext extraction is removed on success or
 handled failure. The cache can remain because restic stores repository cache
@@ -213,5 +242,10 @@ Run without contacting GitHub, Backblaze, or a real restic repository:
   `PROJECT_ROOT` must be created before cloning.
 - `existing project ... differs` protects a non-empty or mismatched checkout
   from being overwritten.
+- `existing project file differs` means a declared path exists but does not
+  match the pinned snapshot; it is never overwritten automatically.
+- A file restore left `in-progress` can be rerun. Already installed matching
+  paths are accepted, and plaintext extraction is removed after each handled
+  invocation.
 - An existing session is never silently replaced. Session reset will be a
   separate, explicitly destructive operation if it is introduced later.

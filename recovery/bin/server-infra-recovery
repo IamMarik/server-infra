@@ -23,7 +23,10 @@ LOCK_DIR=""
 RESTORE_TARGET=""
 INSTALL_TEMP=""
 PROJECT_CLONE_TEMP=""
+PROJECT_RESTORE_TARGET=""
+PROJECT_INSTALL_TEMP=""
 CONFIG_INSTALLED_BY_RUN=0
+PROJECT_FILE_PATHS=()
 
 recovery_log() {
   printf '[server-infra][recovery] %s\n' "$*"
@@ -62,6 +65,10 @@ Usage:
     [--config-root <absolute-path>] \
     clone-project --break-glass <absolute-path> \
     --name <source-name> --git-user <ordinary-user>
+  server-infra-recovery [--state-root <absolute-path>] \
+    [--config-root <absolute-path>] [--work-root <absolute-path>] \
+    restore-project-files --break-glass <absolute-path> \
+    --name <source-name> --git-user <ordinary-user>
 
 Operations:
   init
@@ -85,10 +92,13 @@ Operations:
     Validate and print the recovered project Git inventory.
   clone-project
     Clone one project as an ordinary user and detach it at the recorded commit.
+  restore-project-files
+    Restore declared application files from the pinned data snapshot without
+    restoring the PostgreSQL staging directory or overwriting existing paths.
 
-The implementation does not yet restore project files or databases, install
-project backup sources, deploy infrastructure, or start traffic. Follow
-backup/RECOVERY.md for those phases.
+The implementation does not yet restore databases, install project backup
+sources, deploy infrastructure, or start traffic. Follow backup/RECOVERY.md
+for those phases.
 
 Defaults to:
   --state-root /var/lib/server-infra/recovery
@@ -662,9 +672,28 @@ acquire_recovery_lock() {
 cleanup() {
   local cleanup_status=0
 
+  if [[ -n "$PROJECT_INSTALL_TEMP" && -d "$PROJECT_INSTALL_TEMP" && \
+    -n "${RECOVERY_SESSION_ID:-}" && \
+    "$PROJECT_INSTALL_TEMP" == \
+      */.*.files-recovery-"$RECOVERY_SESSION_ID".* && \
+    ! -L "$PROJECT_INSTALL_TEMP" ]]; then
+    rm -rf -- "$PROJECT_INSTALL_TEMP"
+  fi
+  PROJECT_INSTALL_TEMP=""
+
+  if [[ -n "$PROJECT_RESTORE_TARGET" && \
+    -d "$PROJECT_RESTORE_TARGET" && \
+    -n "${RECOVERY_SESSION_ID:-}" && \
+    "$PROJECT_RESTORE_TARGET" == \
+      "$WORK_ROOT/project-files-"*-"$RECOVERY_SESSION_ID" && \
+    ! -L "$PROJECT_RESTORE_TARGET" ]]; then
+    rm -rf -- "$PROJECT_RESTORE_TARGET"
+  fi
+  PROJECT_RESTORE_TARGET=""
+
   if [[ -n "$PROJECT_CLONE_TEMP" && -d "$PROJECT_CLONE_TEMP" && \
     -n "${RECOVERY_SESSION_ID:-}" && \
-    "$PROJECT_CLONE_TEMP" == */.*.recovery-"$RECOVERY_SESSION_ID" && \
+    "$PROJECT_CLONE_TEMP" == */.*.recovery-"$RECOVERY_SESSION_ID".* && \
     ! -L "$PROJECT_CLONE_TEMP" ]]; then
     rm -rf -- "$PROJECT_CLONE_TEMP"
   fi
@@ -1329,11 +1358,426 @@ validate_project_checkout() {
   )" ]] || fail "Existing project has modified tracked files"
 }
 
+validate_project_state_storage() {
+  local project_state_root="$STATE_ROOT/projects"
+
+  [[ -d "$project_state_root" && ! -L "$project_state_root" ]] || \
+    fail "Project recovery state root is not a regular directory"
+  [[ "$(file_mode "$project_state_root")" == "700" ]] || \
+    fail "Project recovery state root must have mode 0700"
+  [[ "$(file_owner_id "$project_state_root")" == "$(id -u)" && \
+    "$(file_group_id "$project_state_root")" == "$(id -g)" ]] || \
+    fail "Project recovery state root has unexpected ownership"
+}
+
+validate_project_state_file() {
+  local allowed_keys=$'\nPROJECT_RECOVERY_STATE_VERSION\nPROJECT_NAME\nPROJECT_DATA_SNAPSHOT\nPROJECT_FILES_STATUS\nPROJECT_DATABASE_STATUS\n'
+  local seen_keys=$'\n'
+  local line=""
+  local line_number=0
+
+  [[ -f "$PROJECT_STATE_FILE" && ! -L "$PROJECT_STATE_FILE" ]] || \
+    fail "Project recovery state is not a regular file"
+  [[ "$(file_mode "$PROJECT_STATE_FILE")" == "600" ]] || \
+    fail "Project recovery state must have mode 0600"
+  [[ "$(file_owner_id "$PROJECT_STATE_FILE")" == "$(id -u)" && \
+    "$(file_group_id "$PROJECT_STATE_FILE")" == "$(id -g)" ]] || \
+    fail "Project recovery state has unexpected ownership"
+  validate_env_file "$PROJECT_STATE_FILE"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    parse_env_line "$line" "$PROJECT_STATE_FILE" "$line_number"
+    [[ "$PARSED_ENV_KIND" == "assignment" ]] || continue
+    [[ "$allowed_keys" == *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Unknown key $PARSED_ENV_KEY in project recovery state"
+    [[ "$seen_keys" != *$'\n'"$PARSED_ENV_KEY"$'\n'* ]] || \
+      fail "Duplicate key $PARSED_ENV_KEY in project recovery state"
+    seen_keys+="$PARSED_ENV_KEY"$'\n'
+  done < "$PROJECT_STATE_FILE"
+
+  PROJECT_RECOVERY_STATE_VERSION="$(
+    read_required_env_value \
+      "$PROJECT_STATE_FILE" \
+      "PROJECT_RECOVERY_STATE_VERSION"
+  )"
+  PROJECT_STATE_NAME="$(
+    read_required_env_value "$PROJECT_STATE_FILE" "PROJECT_NAME"
+  )"
+  PROJECT_STATE_DATA_SNAPSHOT="$(
+    read_required_env_value "$PROJECT_STATE_FILE" "PROJECT_DATA_SNAPSHOT"
+  )"
+  PROJECT_FILES_STATUS="$(
+    read_required_env_value "$PROJECT_STATE_FILE" "PROJECT_FILES_STATUS"
+  )"
+  PROJECT_DATABASE_STATUS="$(
+    read_required_env_value "$PROJECT_STATE_FILE" "PROJECT_DATABASE_STATUS"
+  )"
+
+  [[ "$PROJECT_RECOVERY_STATE_VERSION" == "1" ]] || \
+    fail "Unsupported project recovery state version"
+  [[ "$PROJECT_STATE_NAME" == "$SELECTED_PROJECT_NAME" ]] || \
+    fail "Project recovery state belongs to another project"
+  [[ "$PROJECT_STATE_DATA_SNAPSHOT" == "$RECOVERY_DATA_SNAPSHOT" ]] || \
+    fail "Project recovery state uses another data snapshot"
+  case "$PROJECT_FILES_STATUS" in
+    pending | in-progress | complete)
+      ;;
+    *)
+      fail "Invalid project files recovery status"
+      ;;
+  esac
+  case "$PROJECT_DATABASE_STATUS" in
+    not-applicable | pending | in-progress | complete)
+      ;;
+    *)
+      fail "Invalid project database recovery status"
+      ;;
+  esac
+  if [[ "$SELECTED_PROJECT_TYPE" == "files-only" ]]; then
+    [[ "$PROJECT_DATABASE_STATUS" == "not-applicable" ]] || \
+      fail "Files-only project must not have database recovery state"
+  else
+    [[ "$PROJECT_DATABASE_STATUS" != "not-applicable" ]] || \
+      fail "PostgreSQL project is missing database recovery state"
+  fi
+}
+
+write_project_state_file() {
+  local active_project_state_file="$PROJECT_STATE_FILE"
+
+  [[ -f "$active_project_state_file" && \
+    ! -L "$active_project_state_file" ]] || \
+    fail "Project recovery state file is not a regular file"
+  umask 077
+  TEMP_FILE="$(
+    mktemp "$STATE_ROOT/projects/.${SELECTED_PROJECT_NAME}.env.XXXXXX"
+  )"
+  {
+    printf '%s\n' \
+      "PROJECT_RECOVERY_STATE_VERSION=$PROJECT_RECOVERY_STATE_VERSION"
+    printf '%s\n' "PROJECT_NAME=$PROJECT_STATE_NAME"
+    printf '%s\n' "PROJECT_DATA_SNAPSHOT=$PROJECT_STATE_DATA_SNAPSHOT"
+    printf '%s\n' "PROJECT_FILES_STATUS=$PROJECT_FILES_STATUS"
+    printf '%s\n' "PROJECT_DATABASE_STATUS=$PROJECT_DATABASE_STATUS"
+  } > "$TEMP_FILE"
+  chmod 0600 "$TEMP_FILE"
+
+  PROJECT_STATE_FILE="$TEMP_FILE"
+  validate_project_state_file
+  PROJECT_STATE_FILE="$active_project_state_file"
+  mv -f -- "$TEMP_FILE" "$PROJECT_STATE_FILE"
+  TEMP_FILE=""
+}
+
+ensure_project_state() {
+  local project_state_root="$STATE_ROOT/projects"
+  local initial_database_status
+
+  if [[ -e "$project_state_root" || -L "$project_state_root" ]]; then
+    validate_project_state_storage
+  else
+    mkdir -m 0700 "$project_state_root"
+  fi
+  validate_project_state_storage
+  PROJECT_STATE_FILE="$project_state_root/$SELECTED_PROJECT_NAME.env"
+
+  if [[ -e "$PROJECT_STATE_FILE" || -L "$PROJECT_STATE_FILE" ]]; then
+    validate_project_state_file
+    return
+  fi
+
+  initial_database_status="not-applicable"
+  if [[ "$SELECTED_PROJECT_TYPE" == "postgres-compose" ]]; then
+    initial_database_status="pending"
+  fi
+  umask 077
+  TEMP_FILE="$(
+    mktemp "$project_state_root/.${SELECTED_PROJECT_NAME}.env.XXXXXX"
+  )"
+  {
+    printf '%s\n' "PROJECT_RECOVERY_STATE_VERSION=1"
+    printf '%s\n' "PROJECT_NAME=$SELECTED_PROJECT_NAME"
+    printf '%s\n' "PROJECT_DATA_SNAPSHOT=$RECOVERY_DATA_SNAPSHOT"
+    printf '%s\n' "PROJECT_FILES_STATUS=pending"
+    printf '%s\n' "PROJECT_DATABASE_STATUS=$initial_database_status"
+  } > "$TEMP_FILE"
+  chmod 0600 "$TEMP_FILE"
+  if ! ln "$TEMP_FILE" "$PROJECT_STATE_FILE"; then
+    fail "Unable to create project recovery state without overwriting data"
+  fi
+  rm -f -- "$TEMP_FILE"
+  TEMP_FILE=""
+  validate_project_state_file
+}
+
+refresh_projects_phase() {
+  local sources_root="$CONFIG_ROOT/backup/sources.d"
+  local source_dirs=()
+  local source_dir
+  local all_projects_complete=1
+
+  shopt -s nullglob
+  source_dirs=("$sources_root"/*)
+  shopt -u nullglob
+  ((${#source_dirs[@]} > 0)) || \
+    fail "Recovered project inventory is empty"
+
+  for source_dir in "${source_dirs[@]}"; do
+    load_project_record "$source_dir"
+    PROJECT_STATE_FILE="$STATE_ROOT/projects/$SELECTED_PROJECT_NAME.env"
+    if [[ ! -f "$PROJECT_STATE_FILE" || -L "$PROJECT_STATE_FILE" ]]; then
+      all_projects_complete=0
+      continue
+    fi
+    validate_project_state_storage
+    validate_project_state_file
+    if [[ "$PROJECT_FILES_STATUS" != "complete" || \
+      ("$PROJECT_DATABASE_STATUS" != "complete" && \
+      "$PROJECT_DATABASE_STATUS" != "not-applicable") ]]; then
+      all_projects_complete=0
+    fi
+  done
+
+  if [[ "$all_projects_complete" == "1" && \
+    "$RECOVERY_PHASE_PROJECTS" != "complete" ]]; then
+    RECOVERY_PHASE_PROJECTS="complete"
+    write_state_file
+  fi
+}
+
+load_project_file_paths() {
+  local paths_file="$CONFIG_ROOT/backup/sources.d/$PROJECT_NAME/paths"
+  local source_file="$CONFIG_ROOT/backup/sources.d/$PROJECT_NAME/source.conf"
+  local line=""
+  local line_number=0
+  local normalized_path
+  local staging_dir=""
+  local seen_paths=$'\n'
+
+  PROJECT_FILE_PATHS=()
+  if [[ "$SELECTED_PROJECT_TYPE" == "postgres-compose" ]]; then
+    staging_dir="$(read_required_env_value "$source_file" "STAGING_DIR")"
+    staging_dir="${staging_dir%/}"
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*$ || \
+      "$line" =~ ^[[:space:]]*# ]] && continue
+    validate_absolute_path \
+      "$line" \
+      "Project file path in $paths_file at line $line_number"
+    normalized_path="${line%/}"
+    case "$normalized_path" in
+      "" | / | /etc | /opt | /srv | /home | /root | /usr | /var | \
+      /tmp | /run)
+        fail "Refusing broad project file path: $line"
+        ;;
+    esac
+    ! paths_overlap "$normalized_path" "$CONFIG_ROOT" || \
+      fail "Project file path must not overlap active configuration"
+    ! paths_overlap "$normalized_path" "$STATE_ROOT" || \
+      fail "Project file path must not overlap recovery state"
+    ! paths_overlap "$normalized_path" "$WORK_ROOT" || \
+      fail "Project file path must not overlap recovery work data"
+    ! paths_overlap "$normalized_path" "$REPOSITORY_ROOT" || \
+      fail "Project file path must not overlap the server-infra repository"
+    [[ "$SELECTED_PROJECT_ROOT" != "$normalized_path" && \
+      "$SELECTED_PROJECT_ROOT" != "$normalized_path"/* ]] || \
+      fail "Project file path must not contain the Git checkout root"
+
+    if [[ -n "$staging_dir" && \
+      ("$normalized_path" == "$staging_dir" || \
+      "$normalized_path" == "$staging_dir"/*) ]]; then
+      continue
+    fi
+    [[ "$seen_paths" != *$'\n'"$normalized_path"$'\n'* ]] || \
+      fail "Duplicate project file path: $normalized_path"
+    seen_paths+="$normalized_path"$'\n'
+    PROJECT_FILE_PATHS+=("$normalized_path")
+  done < "$paths_file"
+}
+
+validate_restored_file_tree() {
+  local tree_root="$1"
+  local tree_label="$2"
+  local unsafe_entry
+
+  [[ (-f "$tree_root" || -d "$tree_root") && ! -L "$tree_root" ]] || \
+    fail "$tree_label is missing or has an unsafe type"
+  unsafe_entry="$(find "$tree_root" ! -type d ! -type f -print -quit)"
+  [[ -z "$unsafe_entry" ]] || \
+    fail "$tree_label contains a symlink or special file"
+}
+
+validate_installed_project_path() {
+  local target_path="$1"
+  local staged_path="${2:-}"
+
+  validate_restored_file_tree "$target_path" "Installed project path"
+  [[ -n "$staged_path" ]] || return 0
+  if [[ -f "$staged_path" && -f "$target_path" ]]; then
+    cmp -s -- "$staged_path" "$target_path" || \
+      fail "Existing project file differs from the selected snapshot"
+  elif [[ -d "$staged_path" && -d "$target_path" ]]; then
+    diff -qr -- "$staged_path" "$target_path" >/dev/null || \
+      fail "Existing project directory differs from the selected snapshot"
+  else
+    fail "Existing project path type differs from the selected snapshot"
+  fi
+}
+
+install_project_file_path() {
+  local staged_path="$1"
+  local target_path="$2"
+  local target_parent="${target_path%/*}"
+  local target_basename="${target_path##*/}"
+  local install_payload
+
+  [[ -n "$target_parent" ]] || target_parent="/"
+  validate_restored_file_tree "$staged_path" "Restored project path"
+  if [[ -e "$target_path" || -L "$target_path" ]]; then
+    validate_installed_project_path "$target_path" "$staged_path"
+    return
+  fi
+
+  [[ -d "$target_parent" && ! -L "$target_parent" ]] || \
+    fail "Project file parent directory not found: $target_parent"
+  validate_no_symlink_components "$target_parent" "Project file parent"
+  PROJECT_INSTALL_TEMP="$(
+    mktemp -d \
+      "$target_parent/.${target_basename}.files-recovery-$RECOVERY_SESSION_ID.XXXXXX"
+  )"
+  chmod 0700 "$PROJECT_INSTALL_TEMP"
+  install_payload="$PROJECT_INSTALL_TEMP/payload"
+
+  cp -a -- "$staged_path" "$install_payload"
+  validate_installed_project_path "$install_payload" "$staged_path"
+
+  [[ ! -e "$target_path" && ! -L "$target_path" ]] || \
+    fail "Project file path appeared during restore; refusing to overwrite it"
+  mv -n -- "$install_payload" "$target_path"
+  [[ (-f "$target_path" || -d "$target_path") && \
+    ! -e "$install_payload" ]] || \
+    fail "Unable to install project path without overwriting existing data"
+  rmdir "$PROJECT_INSTALL_TEMP" || \
+    fail "Unable to remove empty project file staging directory"
+  PROJECT_INSTALL_TEMP=""
+  validate_installed_project_path "$target_path" "$staged_path"
+}
+
+run_restore_project_files() {
+  local restore_args=()
+  local project_path
+  local restored_path
+  local restic_cache
+
+  [[ -n "$PROJECT_NAME" ]] || fail "restore-project-files requires --name"
+  [[ -n "$GIT_USER" ]] || fail "restore-project-files requires --git-user"
+  validate_git_user "$GIT_USER"
+  load_recovery_context
+  validate_projects_phase_ready
+  discover_project_inventory
+  select_project_record
+  validate_project_checkout "$SELECTED_PROJECT_ROOT"
+  load_project_file_paths
+  validate_work_root
+  require_command cmp
+  require_command cp
+  require_command diff
+  require_command find
+  require_command mktemp
+  require_command mv
+  require_command restic
+  require_command rmdir
+
+  acquire_recovery_lock
+  trap cleanup EXIT
+  validate_state_file
+  ensure_project_state
+
+  if [[ "$RECOVERY_PHASE_PROJECTS" == "pending" ]]; then
+    RECOVERY_PHASE_PROJECTS="in-progress"
+    write_state_file
+  else
+    [[ "$RECOVERY_PHASE_PROJECTS" == "in-progress" || \
+      "$RECOVERY_PHASE_PROJECTS" == "complete" ]] || \
+      fail "Project recovery phase is in an unsupported state"
+  fi
+
+  if [[ "$PROJECT_FILES_STATUS" == "complete" ]]; then
+    for project_path in "${PROJECT_FILE_PATHS[@]}"; do
+      validate_installed_project_path "$project_path"
+    done
+    refresh_projects_phase
+    recovery_ok "project files are already restored: $PROJECT_NAME"
+    return
+  fi
+  if [[ "$PROJECT_FILES_STATUS" == "pending" ]]; then
+    PROJECT_FILES_STATUS="in-progress"
+    write_project_state_file
+  else
+    [[ "$PROJECT_FILES_STATUS" == "in-progress" ]] || \
+      fail "Project files restore is in an unsupported state"
+  fi
+
+  if ((${#PROJECT_FILE_PATHS[@]} == 0)); then
+    PROJECT_FILES_STATUS="complete"
+    write_project_state_file
+    refresh_projects_phase
+    recovery_ok "project has no non-database file paths to restore: $PROJECT_NAME"
+    return
+  fi
+
+  ensure_work_root
+  PROJECT_RESTORE_TARGET="$WORK_ROOT/project-files-$PROJECT_NAME-$RECOVERY_SESSION_ID"
+  if [[ -e "$PROJECT_RESTORE_TARGET" || -L "$PROJECT_RESTORE_TARGET" ]]; then
+    [[ -d "$PROJECT_RESTORE_TARGET" && \
+      ! -L "$PROJECT_RESTORE_TARGET" ]] || \
+      fail "Managed project restore target is not a regular directory"
+    rm -rf -- "$PROJECT_RESTORE_TARGET"
+  fi
+  mkdir -m 0700 "$PROJECT_RESTORE_TARGET"
+  restic_cache="$WORK_ROOT/restic-cache"
+  mkdir -p "$restic_cache"
+  chmod 0700 "$restic_cache"
+  ACTIVE_RESTIC_CACHE="$restic_cache"
+
+  restore_args=(
+    restore
+    "$RECOVERY_DATA_SNAPSHOT"
+    --host "$RECOVERY_INSTANCE"
+    --tag server-infra-data
+    --target "$PROJECT_RESTORE_TARGET"
+  )
+  for project_path in "${PROJECT_FILE_PATHS[@]}"; do
+    restore_args+=(--include "$project_path")
+  done
+  recovery_log \
+    "Restoring declared files for $PROJECT_NAME from $RECOVERY_DATA_SNAPSHOT"
+  run_break_glass_restic "${restore_args[@]}"
+
+  for project_path in "${PROJECT_FILE_PATHS[@]}"; do
+    restored_path="$PROJECT_RESTORE_TARGET$project_path"
+    install_project_file_path "$restored_path" "$project_path"
+  done
+
+  PROJECT_FILES_STATUS="complete"
+  write_project_state_file
+  refresh_projects_phase
+  recovery_ok "project files restored from pinned data snapshot: $PROJECT_NAME"
+  recovery_warn "PostgreSQL and application services remain untouched"
+}
+
 run_projects_plan() {
   local sources_root
   local source_dirs=()
   local source_dir
   local checkout_state
+  local files_state
+  local database_state
 
   load_recovery_context
   validate_projects_phase_ready
@@ -1343,17 +1787,31 @@ run_projects_plan() {
   source_dirs=("$sources_root"/*)
   shopt -u nullglob
 
-  printf 'NAME\tTYPE\tCHECKOUT\tPROJECT_ROOT\tREPOSITORY_URL\tDEPLOY_COMMIT\tDATA_SNAPSHOT\n'
+  printf 'NAME\tTYPE\tCHECKOUT\tFILES\tDATABASE\tPROJECT_ROOT\tREPOSITORY_URL\tDEPLOY_COMMIT\tDATA_SNAPSHOT\n'
   for source_dir in "${source_dirs[@]}"; do
     load_project_record "$source_dir"
     checkout_state="absent"
+    files_state="not-started"
+    database_state="not-started"
+    if [[ "$SELECTED_PROJECT_TYPE" == "files-only" ]]; then
+      database_state="not-applicable"
+    fi
     if [[ -e "$SELECTED_PROJECT_ROOT" || -L "$SELECTED_PROJECT_ROOT" ]]; then
       checkout_state="present"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    PROJECT_STATE_FILE="$STATE_ROOT/projects/$SELECTED_PROJECT_NAME.env"
+    if [[ -e "$PROJECT_STATE_FILE" || -L "$PROJECT_STATE_FILE" ]]; then
+      validate_project_state_storage
+      validate_project_state_file
+      files_state="$PROJECT_FILES_STATUS"
+      database_state="$PROJECT_DATABASE_STATUS"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$SELECTED_PROJECT_NAME" \
       "$SELECTED_PROJECT_TYPE" \
       "$checkout_state" \
+      "$files_state" \
+      "$database_state" \
       "$SELECTED_PROJECT_ROOT" \
       "$SELECTED_PROJECT_REPOSITORY_URL" \
       "$SELECTED_PROJECT_DEPLOY_COMMIT" \
@@ -1375,6 +1833,7 @@ run_clone_project() {
   discover_project_inventory
   select_project_record
   require_command git
+  require_command mktemp
   require_command mv
 
   acquire_recovery_lock
@@ -1385,8 +1844,9 @@ run_clone_project() {
     RECOVERY_PHASE_PROJECTS="in-progress"
     write_state_file
   else
-    [[ "$RECOVERY_PHASE_PROJECTS" == "in-progress" ]] || \
-      fail "Project cloning is not allowed after project recovery is complete"
+    [[ "$RECOVERY_PHASE_PROJECTS" == "in-progress" || \
+      "$RECOVERY_PHASE_PROJECTS" == "complete" ]] || \
+      fail "Project recovery phase is in an unsupported state"
   fi
 
   if [[ -e "$SELECTED_PROJECT_ROOT" || -L "$SELECTED_PROJECT_ROOT" ]]; then
@@ -1395,6 +1855,8 @@ run_clone_project() {
       "project checkout already matches recovered inventory: $PROJECT_NAME"
     return
   fi
+  [[ "$RECOVERY_PHASE_PROJECTS" != "complete" ]] || \
+    fail "Completed project recovery is missing a recorded checkout"
 
   project_parent="${SELECTED_PROJECT_ROOT%/*}"
   project_basename="${SELECTED_PROJECT_ROOT##*/}"
@@ -1403,10 +1865,11 @@ run_clone_project() {
     fail "Project parent directory not found: $project_parent"
   validate_no_symlink_components "$project_parent" "Project parent"
 
-  PROJECT_CLONE_TEMP="$project_parent/.${project_basename}.recovery-$RECOVERY_SESSION_ID"
-  [[ ! -e "$PROJECT_CLONE_TEMP" && ! -L "$PROJECT_CLONE_TEMP" ]] || \
-    fail "Managed project clone staging path already exists: $PROJECT_CLONE_TEMP"
-  mkdir -m 0700 "$PROJECT_CLONE_TEMP"
+  PROJECT_CLONE_TEMP="$(
+    mktemp -d \
+      "$project_parent/.${project_basename}.recovery-$RECOVERY_SESSION_ID.XXXXXX"
+  )"
+  chmod 0700 "$PROJECT_CLONE_TEMP"
   target_uid="$(id -u "$GIT_USER")"
   target_gid="$(id -g "$GIT_USER")"
   if [[ "$(id -u)" != "$target_uid" ]]; then
@@ -1625,7 +2088,8 @@ parse_arguments() {
         exit 0
         ;;
       init | plan | status | config-snapshots | restore-config | \
-      data-snapshots | select-data | projects-plan | clone-project)
+      data-snapshots | select-data | projects-plan | clone-project | \
+      restore-project-files)
         [[ -z "$OPERATION" ]] || fail "Specify exactly one operation"
         OPERATION="$1"
         shift
@@ -1642,53 +2106,61 @@ parse_arguments() {
       [[ -z "$SNAPSHOT_ID" ]] || \
         fail "--snapshot is supported only by restore-config"
       [[ "$config_root_set" == "0" && "$work_root_set" == "0" ]] || \
-        fail "--config-root and --work-root are supported only by restore-config"
+        fail "--config-root and --work-root are not supported by $OPERATION"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
-        fail "--name and --git-user are supported only by clone-project"
+        fail "--name and --git-user are supported only by project recovery operations"
       ;;
     restore-config)
       [[ -n "$SNAPSHOT_ID" ]] || fail "restore-config requires --snapshot"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
-        fail "--name and --git-user are supported only by clone-project"
+        fail "--name and --git-user are supported only by project recovery operations"
       ;;
     data-snapshots)
       [[ -z "$SNAPSHOT_ID" ]] || \
         fail "--snapshot is supported only by restore-config and select-data"
       [[ "$work_root_set" == "0" ]] || \
-        fail "--work-root is supported only by restore-config"
+        fail "--work-root is not supported by data-snapshots"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
-        fail "--name and --git-user are supported only by clone-project"
+        fail "--name and --git-user are supported only by project recovery operations"
       ;;
     select-data)
       [[ -n "$SNAPSHOT_ID" ]] || fail "select-data requires --snapshot"
       [[ "$work_root_set" == "0" ]] || \
-        fail "--work-root is supported only by restore-config"
+        fail "--work-root is not supported by select-data"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
-        fail "--name and --git-user are supported only by clone-project"
+        fail "--name and --git-user are supported only by project recovery operations"
       ;;
     projects-plan)
       [[ -z "$SNAPSHOT_ID" ]] || \
         fail "--snapshot is not supported by projects-plan"
       [[ "$work_root_set" == "0" ]] || \
-        fail "--work-root is supported only by restore-config"
+        fail "--work-root is not supported by projects-plan"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
-        fail "--name and --git-user are supported only by clone-project"
+        fail "--name and --git-user are supported only by project recovery operations"
       ;;
     clone-project)
       [[ -z "$SNAPSHOT_ID" ]] || \
         fail "--snapshot is not supported by clone-project"
       [[ "$work_root_set" == "0" ]] || \
-        fail "--work-root is supported only by restore-config"
+        fail "--work-root is not supported by clone-project"
       [[ -n "$PROJECT_NAME" ]] || fail "clone-project requires --name"
       [[ -n "$GIT_USER" ]] || fail "clone-project requires --git-user"
+      ;;
+    restore-project-files)
+      [[ -z "$SNAPSHOT_ID" ]] || \
+        fail "--snapshot is not supported by restore-project-files"
+      [[ -n "$PROJECT_NAME" ]] || \
+        fail "restore-project-files requires --name"
+      [[ -n "$GIT_USER" ]] || \
+        fail "restore-project-files requires --git-user"
       ;;
     plan | status)
       [[ -z "$BREAK_GLASS_FILE" && -z "$SNAPSHOT_ID" ]] || \
         fail "Break-glass and snapshot options are not supported by $OPERATION"
       [[ "$config_root_set" == "0" && "$work_root_set" == "0" ]] || \
-        fail "--config-root and --work-root are supported only by restore-config"
+        fail "--config-root and --work-root are not supported by $OPERATION"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
-        fail "--name and --git-user are supported only by clone-project"
+        fail "--name and --git-user are supported only by project recovery operations"
       ;;
   esac
   if [[ "$OPERATION" != "plan" && "$OPERATION" != "status" && \
@@ -1728,6 +2200,9 @@ main() {
       ;;
     clone-project)
       run_clone_project
+      ;;
+    restore-project-files)
+      run_restore_project_files
       ;;
   esac
 }

@@ -161,9 +161,19 @@ The fourth increment implements:
 - atomic installation only into an absent recorded `PROJECT_ROOT`;
 - exact origin and commit verification with idempotent retry behavior.
 
-Project file and PostgreSQL restoration, application validation, deployment,
-and finalization remain documented manual operations until their contracts are
-separately implemented and tested.
+The fifth increment implements:
+
+- per-project non-secret phase state under the recovery state root;
+- `restore-project-files --break-glass --name --git-user`;
+- selective extraction of declared non-database paths from the pinned data
+  snapshot;
+- explicit exclusion of PostgreSQL staging data;
+- refusal to overwrite a different existing path;
+- preservation of snapshot ownership and modes with resumable retry behavior.
+
+PostgreSQL restoration, application validation, deployment, and finalization
+remain documented manual operations until their contracts are separately
+implemented and tested.
 
 ## Consequences
 

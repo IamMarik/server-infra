@@ -29,6 +29,7 @@ PROJECTS_PLAN_OUTPUT="$TEST_ROOT/projects-plan.log"
 RESTIC_LOG="$TEST_ROOT/restic.log"
 GIT_LOG="$TEST_ROOT/git.log"
 PROJECT_ROOT="$TEST_ROOT/projects/test-app"
+PROJECT_STAGING_DIR="$TEST_ROOT/backup-staging/test-app"
 RECOVERY="$REPOSITORY_ROOT/recovery/bin/server-infra-recovery"
 TEST_REPOSITORY_URL="git@github.com:example/server-infra.git"
 TEST_REPOSITORY_REF="0123456789abcdef0123456789abcdef01234567"
@@ -103,6 +104,7 @@ export FAKE_INFRA_ROOT="$REPOSITORY_ROOT"
 export FAKE_INFRA_REPOSITORY_URL="$TEST_REPOSITORY_URL"
 export FAKE_INFRA_DEPLOY_COMMIT="$TEST_REPOSITORY_REF"
 export FAKE_PROJECT_ROOT="$PROJECT_ROOT"
+export FAKE_PROJECT_STAGING_DIR="$PROJECT_STAGING_DIR"
 export FAKE_PROJECT_REPOSITORY_URL="$TEST_PROJECT_REPOSITORY_URL"
 export FAKE_PROJECT_DEPLOY_COMMIT="$TEST_PROJECT_DEPLOY_COMMIT"
 
@@ -272,7 +274,7 @@ SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
   projects-plan \
   --break-glass "$BREAK_GLASS_FILE" > "$PROJECTS_PLAN_OUTPUT"
 assert_contains "$PROJECTS_PLAN_OUTPUT" \
-  $'test-app\tfiles-only\tabsent'
+  $'test-app\tpostgres-compose\tabsent'
 assert_contains "$PROJECTS_PLAN_OUTPUT" "$TEST_PROJECT_REPOSITORY_URL"
 assert_contains "$PROJECTS_PLAN_OUTPUT" "$TEST_PROJECT_DEPLOY_COMMIT"
 assert_contains "$PROJECTS_PLAN_OUTPUT" $'\tdeadbeef'
@@ -325,7 +327,7 @@ SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
   projects-plan \
   --break-glass "$BREAK_GLASS_FILE" > "$PROJECTS_PLAN_OUTPUT"
 assert_contains "$PROJECTS_PLAN_OUTPUT" \
-  $'test-app\tfiles-only\tpresent'
+  $'test-app\tpostgres-compose\tpresent'
 
 CLONE_LINES_BEFORE="$(grep -c '^clone ' "$GIT_LOG")"
 SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
@@ -339,6 +341,76 @@ SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
 CLONE_LINES_AFTER="$(grep -c '^clone ' "$GIT_LOG")"
 [[ "$CLONE_LINES_BEFORE" == "$CLONE_LINES_AFTER" ]] || \
   fail_test "Repeated clone-project cloned the repository again"
+
+printf '%s\n' "APP_SETTING=conflict" > "$PROJECT_ROOT/.env"
+if SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  --work-root "$WORK_ROOT" \
+  restore-project-files \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user "$TEST_GIT_USER" >/dev/null 2>&1; then
+  fail_test "Project file restore overwrote an existing different file"
+fi
+assert_contains "$PROJECT_ROOT/.env" "APP_SETTING=conflict"
+rm -f -- "$PROJECT_ROOT/.env"
+
+SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  --work-root "$WORK_ROOT" \
+  restore-project-files \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user "$TEST_GIT_USER" >> "$COMMAND_OUTPUT" 2>&1
+assert_contains "$PROJECT_ROOT/.env" "APP_SETTING=recovered"
+assert_contains "$PROJECT_ROOT/uploads/example.txt" "restored upload"
+PROJECT_STATE_FILE="$STATE_ROOT/projects/test-app.env"
+[[ "$(file_mode "$STATE_ROOT/projects")" == "700" ]] || \
+  fail_test "Project recovery state root mode is not 0700"
+[[ "$(file_mode "$PROJECT_STATE_FILE")" == "600" ]] || \
+  fail_test "Project recovery state file mode is not 0600"
+assert_contains "$PROJECT_STATE_FILE" "PROJECT_DATA_SNAPSHOT=deadbeef"
+assert_contains "$PROJECT_STATE_FILE" "PROJECT_FILES_STATUS=complete"
+assert_contains "$PROJECT_STATE_FILE" \
+  "PROJECT_DATABASE_STATUS=pending"
+assert_contains "$RESTIC_LOG" \
+  "--tag server-infra-data"
+assert_contains "$RESTIC_LOG" \
+  "--include $PROJECT_ROOT/.env --include $PROJECT_ROOT/uploads"
+if grep -F -- "--include $PROJECT_STAGING_DIR" "$RESTIC_LOG" >/dev/null; then
+  fail_test "Project file restore downloaded the PostgreSQL staging directory"
+fi
+if find "$WORK_ROOT" -maxdepth 1 -type d -name 'project-files-*' \
+  -print -quit | grep -q .; then
+  fail_test "Project file restore left plaintext staging data"
+fi
+
+RESTIC_LINES_BEFORE="$(wc -l < "$RESTIC_LOG")"
+SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  --work-root "$WORK_ROOT" \
+  restore-project-files \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --name test-app \
+  --git-user "$TEST_GIT_USER" >> "$COMMAND_OUTPUT" 2>&1
+RESTIC_LINES_AFTER="$(wc -l < "$RESTIC_LOG")"
+[[ "$RESTIC_LINES_BEFORE" == "$RESTIC_LINES_AFTER" ]] || \
+  fail_test "Repeated project file restore contacted restic again"
+
+SSH_AUTH_SOCK= FAKE_CONFIG_ROOT="$CONFIG_ROOT" \
+  PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  projects-plan \
+  --break-glass "$BREAK_GLASS_FILE" > "$PROJECTS_PLAN_OUTPUT"
+assert_contains "$PROJECTS_PLAN_OUTPUT" \
+  $'test-app\tpostgres-compose\tpresent\tcomplete\tpending'
 
 PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   --state-root "$STATE_ROOT" plan > "$PLAN_OUTPUT"
@@ -385,6 +457,7 @@ for secret_value in \
   "test-secret-key"; do
   if grep -F "$secret_value" \
     "$STATE_FILE" \
+    "$PROJECT_STATE_FILE" \
     "$RESUME_STATE_ROOT/session.env" \
     "$COMMAND_OUTPUT" \
     "$PLAN_OUTPUT" \
@@ -429,4 +502,4 @@ if PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   fail_test "Recovery accepted a symlinked break-glass record"
 fi
 
-printf '[recovery-test][ok] config, data, and exact project checkout recovery passed\n'
+printf '[recovery-test][ok] config, data, checkout, and project files recovery passed\n'

@@ -158,14 +158,9 @@ sudo ./recovery/bin/server-infra-recovery select-data \
 Use that same ID for every project. The recovery session rejects changing it.
 Do not use a moving `latest` selector during a long recovery.
 
-Restore the data snapshot into a separate temporary directory:
-
-```bash
-sudo ./scripts/restore.sh \
-  --kind data \
-  --snapshot <data-snapshot-id> \
-  --target /var/tmp/server-infra-data-restore
-```
+Do not extract the whole data snapshot. The following project file and
+database commands select only paths needed by one project and remove their
+root-only temporary extraction.
 
 ### 6. Recreate application checkouts
 
@@ -198,13 +193,20 @@ The command reads `PROJECT_ROOT`, `REPOSITORY_URL`, and the full
 as root or overwrite an existing mismatched path. Repeating it validates and
 accepts an already matching checkout.
 
-For each cloned project:
+Restore only the configured non-database paths for that project:
 
-1. Restore only the declared `.env`, uploads, and other application paths from
-   the temporary data tree.
-2. Run `"$SERVER_INFRA_ROOT/backup/bin/server-infra-backup" project validate`.
-3. Run `sudo "$SERVER_INFRA_ROOT/backup/bin/server-infra-backup" project
-   install`.
+```bash
+sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" \
+  restore-project-files \
+  --break-glass /home/ubuntu/server-infra-break-glass.txt \
+  --name <project-name> \
+  --git-user ubuntu
+```
+
+The operation uses the session's pinned snapshot, preserves restored
+ownership and modes, rejects symlinks and special files, and never overwrites
+a different existing path. It excludes the PostgreSQL staging directory,
+which is consumed separately by `restore-db`.
 
 Do not copy a restored data tree blindly over a Git checkout.
 
@@ -224,6 +226,12 @@ the application connection settings, recreate affected containers, and start
 the application. The helper does not perform this cutover.
 
 Repeat for every project in dependency order.
+
+After that project's files and database are validated:
+
+1. Run `"$SERVER_INFRA_ROOT/backup/bin/server-infra-backup" project validate`.
+2. Run `sudo "$SERVER_INFRA_ROOT/backup/bin/server-infra-backup" project
+   install`.
 
 ### 8. Deploy infrastructure, restore traffic, and establish a new backup point
 
