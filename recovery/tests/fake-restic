@@ -18,6 +18,16 @@ fi
 
 case "${1:-}" in
   snapshots)
+    if [[ " $* " == *" --json "* ]]; then
+      if [[ " $* " == *" --tag server-infra-data "* ]]; then
+        printf '%s\n' \
+          '[{"id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef","short_id":"deadbeef","time":"2026-07-24T00:05:00Z","hostname":"acceptance","tags":["server-infra-data"],"paths":["/srv/test-data"]}]'
+      else
+        printf '%s\n' \
+          '[{"id":"abcdef12abcdef12abcdef12abcdef12abcdef12abcdef12abcdef12abcdef12","short_id":"abcdef12","time":"2026-07-24T00:00:00Z","hostname":"acceptance","tags":["server-infra-config"],"paths":["/etc/server-infra"]}]'
+      fi
+      exit 0
+    fi
     if [[ " $* " == *" --tag server-infra-data "* ]]; then
       printf '%s\n' \
         "ID        Time                 Host        Tags" \

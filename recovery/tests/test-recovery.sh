@@ -24,7 +24,9 @@ COMMAND_OUTPUT="$TEST_ROOT/command.log"
 PLAN_OUTPUT="$TEST_ROOT/plan.log"
 STATUS_OUTPUT="$TEST_ROOT/status.log"
 SNAPSHOTS_OUTPUT="$TEST_ROOT/snapshots.log"
+SNAPSHOTS_JSON_OUTPUT="$TEST_ROOT/snapshots.json"
 DATA_SNAPSHOTS_OUTPUT="$TEST_ROOT/data-snapshots.log"
+DATA_SNAPSHOTS_JSON_OUTPUT="$TEST_ROOT/data-snapshots.json"
 PROJECTS_PLAN_OUTPUT="$TEST_ROOT/projects-plan.log"
 PROJECT_HELPER_LOG="$TEST_ROOT/project-helper.log"
 RESTIC_LOG="$TEST_ROOT/restic.log"
@@ -184,6 +186,14 @@ assert_contains "$SNAPSHOTS_OUTPUT" \
   "abcdef12  2026-07-24 00:00:00  acceptance  server-infra-config"
 assert_contains "$RESTIC_LOG" \
   "--no-cache snapshots --host acceptance --tag server-infra-config"
+PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  config-snapshots \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --json > "$SNAPSHOTS_JSON_OUTPUT"
+assert_contains "$SNAPSHOTS_JSON_OUTPUT" '"short_id":"abcdef12"'
+assert_contains "$RESTIC_LOG" \
+  "--no-cache snapshots --json --host acceptance --tag server-infra-config"
 
 mkdir -p "${CONFIG_ROOT%/*}"
 FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
@@ -244,6 +254,15 @@ assert_contains "$DATA_SNAPSHOTS_OUTPUT" \
   "deadbeef  2026-07-24 00:05:00  acceptance  server-infra-data"
 assert_contains "$RESTIC_LOG" \
   "--no-cache snapshots --host acceptance --tag server-infra-data"
+FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
+  --state-root "$STATE_ROOT" \
+  --config-root "$CONFIG_ROOT" \
+  data-snapshots \
+  --break-glass "$BREAK_GLASS_FILE" \
+  --json > "$DATA_SNAPSHOTS_JSON_OUTPUT"
+assert_contains "$DATA_SNAPSHOTS_JSON_OUTPUT" '"short_id":"deadbeef"'
+assert_contains "$RESTIC_LOG" \
+  "--no-cache snapshots --json --host acceptance --tag server-infra-data"
 
 FAKE_CONFIG_ROOT="$CONFIG_ROOT" PATH="$TEST_BIN:$PATH" "$RECOVERY" \
   --state-root "$STATE_ROOT" \

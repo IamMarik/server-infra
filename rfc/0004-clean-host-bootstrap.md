@@ -30,6 +30,7 @@ Apply is non-interactive and idempotent. It provides:
 
 - Git and the OpenSSH client;
 - CA certificates and curl;
+- jq and dialog for the recovery snapshot inventory and optional terminal UI;
 - restic;
 - Docker Engine, Buildx, and Docker Compose;
 - `/run/server-infra`;
@@ -38,6 +39,11 @@ Apply is non-interactive and idempotent. It provides:
 
 Bootstrap is not a module and does not depend on active host configuration.
 It runs before `/etc/server-infra` exists.
+
+`dialog` does not become a recovery authority or state store. The recovery
+wizard falls back to plain terminal interaction, and all underlying recovery
+operations remain non-interactive. `jq` is limited to parsing restic's JSON
+snapshot inventory.
 
 The volatile runtime root is declared with
 `/etc/tmpfiles.d/server-infra.conf` so scheduled native services retain their

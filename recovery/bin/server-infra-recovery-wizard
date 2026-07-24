@@ -16,7 +16,15 @@ WORK_ROOT="/var/cache/server-infra/recovery"
 BREAK_GLASS_FILE=""
 GIT_USER=""
 RESTORE_JOBS=4
+UI_MODE="${SERVER_INFRA_RECOVERY_UI:-auto}"
+ACTIVE_UI=""
 PROJECT_PLAN_FILE=""
+SNAPSHOT_JSON_FILE=""
+SNAPSHOT_LIST_FILE=""
+SNAPSHOT_IDS=()
+SNAPSHOT_TIMES=()
+SNAPSHOT_PATHS=()
+SELECTED_SNAPSHOT=""
 PROJECT_NAMES=()
 PROJECT_TYPES=()
 PROJECT_CHECKOUT_STATES=()
@@ -25,6 +33,7 @@ PROJECT_DATABASE_STATES=()
 PROJECT_DATABASE_TARGETS=()
 PROJECT_ROOTS=()
 PROJECT_SELECTED=()
+PROJECT_SELECTABLE=()
 
 wizard_log() {
   server_infra_emit "[server-infra][recovery-wizard]" log 1 "$*"
@@ -45,6 +54,7 @@ Usage:
     [--break-glass <absolute-path>] \
     [--git-user <ordinary-user>] \
     [--jobs <count>] \
+    [--ui <auto|tui|plain>] \
     [--state-root <absolute-path>] \
     [--config-root <absolute-path>] \
     [--work-root <absolute-path>]
@@ -62,6 +72,7 @@ Defaults:
   --break-glass <repository-root>/server-infra-break-glass.txt
   --git-user    SUDO_USER
   --jobs        4
+  --ui          auto
   --state-root  /var/lib/server-infra/recovery
   --config-root /etc/server-infra
   --work-root   /var/cache/server-infra/recovery
@@ -73,6 +84,14 @@ cleanup_wizard() {
     rm -f -- "$PROJECT_PLAN_FILE"
   fi
   PROJECT_PLAN_FILE=""
+  if [[ -n "$SNAPSHOT_JSON_FILE" && -f "$SNAPSHOT_JSON_FILE" ]]; then
+    rm -f -- "$SNAPSHOT_JSON_FILE"
+  fi
+  SNAPSHOT_JSON_FILE=""
+  if [[ -n "$SNAPSHOT_LIST_FILE" && -f "$SNAPSHOT_LIST_FILE" ]]; then
+    rm -f -- "$SNAPSHOT_LIST_FILE"
+  fi
+  SNAPSHOT_LIST_FILE=""
 }
 
 validate_wizard_path() {
@@ -113,6 +132,30 @@ validate_jobs() {
   ((RESTORE_JOBS <= 32)) || fail "Restore jobs must not exceed 32"
 }
 
+resolve_ui_mode() {
+  case "$UI_MODE" in
+    auto)
+      if [[ -t 0 && -t 1 ]] && command -v dialog >/dev/null 2>&1; then
+        ACTIVE_UI="tui"
+      else
+        ACTIVE_UI="plain"
+      fi
+      ;;
+    tui)
+      [[ -t 0 && -t 1 ]] || \
+        fail "TUI mode requires an interactive terminal"
+      require_command dialog
+      ACTIVE_UI="tui"
+      ;;
+    plain)
+      ACTIVE_UI="plain"
+      ;;
+    *)
+      fail "UI mode must be auto, tui, or plain"
+      ;;
+  esac
+}
+
 resolve_git_user() {
   local actual_uid
 
@@ -134,8 +177,10 @@ validate_runtime() {
   validate_wizard_path "$WORK_ROOT" "Work root"
   validate_wizard_path "$BREAK_GLASS_FILE" "Break-glass file"
   validate_jobs
+  resolve_ui_mode
   require_command id
   require_command install
+  require_command jq
   require_command mktemp
   require_command rm
   [[ -x "$RECOVERY_EXECUTABLE" && ! -L "$RECOVERY_EXECUTABLE" ]] || \
@@ -155,6 +200,193 @@ run_recovery() {
   "$RECOVERY_EXECUTABLE" \
     --state-root "$STATE_ROOT" \
     "$@"
+}
+
+load_snapshot_inventory() {
+  local snapshot_kind="$1"
+  local snapshot_id
+  local snapshot_time
+  local snapshot_paths
+  local recovery_args=()
+
+  SNAPSHOT_IDS=()
+  SNAPSHOT_TIMES=()
+  SNAPSHOT_PATHS=()
+  SNAPSHOT_JSON_FILE="$(
+    mktemp "${TMPDIR:-/tmp}/recovery-snapshots.XXXXXX.json"
+  )"
+  SNAPSHOT_LIST_FILE="$(
+    mktemp "${TMPDIR:-/tmp}/recovery-snapshots.XXXXXX.tsv"
+  )"
+
+  case "$snapshot_kind" in
+    configuration)
+      recovery_args=(
+        config-snapshots
+        --break-glass "$BREAK_GLASS_FILE"
+        --json
+      )
+      ;;
+    data)
+      recovery_args=(
+        --config-root "$CONFIG_ROOT"
+        data-snapshots
+        --break-glass "$BREAK_GLASS_FILE"
+        --json
+      )
+      ;;
+    *)
+      fail "Unsupported snapshot inventory kind: $snapshot_kind"
+      ;;
+  esac
+
+  run_recovery "${recovery_args[@]}" > "$SNAPSHOT_JSON_FILE"
+  jq -e '
+    type == "array" and
+    all(.[];
+      (.id | type == "string") and
+      (.id | test("^[0-9a-f]{8,64}$")) and
+      (.time | type == "string") and
+      ((.paths // []) | type == "array")
+    )
+  ' "$SNAPSHOT_JSON_FILE" >/dev/null || \
+    fail "Snapshot inventory is not valid restic JSON"
+  jq -r '
+    sort_by(.time)
+    | reverse
+    | .[]
+    | [
+        (.short_id // (.id[0:8])),
+        (.time | sub("T"; " ") | .[0:19]),
+        ((.paths // []) | join(", "))
+      ]
+    | @tsv
+  ' "$SNAPSHOT_JSON_FILE" > "$SNAPSHOT_LIST_FILE"
+
+  while IFS=$'\t' read -r \
+    snapshot_id snapshot_time snapshot_paths; do
+    [[ "$snapshot_id" =~ ^[0-9a-f]{8,64}$ ]] || \
+      fail "Snapshot inventory contains an invalid ID"
+    [[ -n "$snapshot_time" ]] || \
+      fail "Snapshot inventory contains an empty timestamp"
+    SNAPSHOT_IDS+=("$snapshot_id")
+    SNAPSHOT_TIMES+=("$snapshot_time")
+    SNAPSHOT_PATHS+=("${snapshot_paths:--}")
+  done < "$SNAPSHOT_LIST_FILE"
+
+  rm -f -- "$SNAPSHOT_JSON_FILE" "$SNAPSHOT_LIST_FILE"
+  SNAPSHOT_JSON_FILE=""
+  SNAPSHOT_LIST_FILE=""
+  ((${#SNAPSHOT_IDS[@]} > 0)) || \
+    fail "No $snapshot_kind snapshots were found"
+}
+
+snapshot_label() {
+  local index="$1"
+  local latest_label=""
+  local paths="${SNAPSHOT_PATHS[$index]}"
+
+  ((index != 0)) || latest_label=" [latest]"
+  if ((${#paths} > 60)); then
+    paths="${paths:0:57}..."
+  fi
+  printf '%s  %s%s  %s' \
+    "${SNAPSHOT_TIMES[$index]}" \
+    "${SNAPSHOT_IDS[$index]}" \
+    "$latest_label" \
+    "$paths"
+}
+
+choose_snapshot_plain() {
+  local snapshot_kind="$1"
+  local index
+  local answer
+
+  printf '\nAvailable %s snapshots (newest first):\n' "$snapshot_kind"
+  for ((index = 0; index < ${#SNAPSHOT_IDS[@]}; index++)); do
+    printf '  %d. %s\n' "$((index + 1))" "$(snapshot_label "$index")"
+  done
+  printf 'Select snapshot [1]: '
+  IFS= read -r answer
+  answer="${answer:-1}"
+
+  if [[ "$answer" =~ ^[1-9][0-9]*$ ]]; then
+    ((answer <= ${#SNAPSHOT_IDS[@]})) || \
+      fail "Snapshot selection is out of range: $answer"
+    SELECTED_SNAPSHOT="${SNAPSHOT_IDS[$((answer - 1))]}"
+    return
+  fi
+  validate_snapshot_id "$answer"
+  for ((index = 0; index < ${#SNAPSHOT_IDS[@]}; index++)); do
+    if [[ "${SNAPSHOT_IDS[$index]}" == "$answer" ]]; then
+      SELECTED_SNAPSHOT="$answer"
+      return
+    fi
+  done
+  fail "Snapshot is not present in the displayed inventory: $answer"
+}
+
+choose_snapshot_tui() {
+  local snapshot_kind="$1"
+  local dialog_title
+  local index
+  local selected
+  local status
+  local dialog_items=()
+
+  case "$snapshot_kind" in
+    configuration)
+      dialog_title="Configuration snapshot"
+      ;;
+    data)
+      dialog_title="Data snapshot"
+      ;;
+    *)
+      fail "Unsupported snapshot selection kind: $snapshot_kind"
+      ;;
+  esac
+  for ((index = 0; index < ${#SNAPSHOT_IDS[@]}; index++)); do
+    status="off"
+    ((index != 0)) || status="on"
+    dialog_items+=(
+      "${SNAPSHOT_IDS[$index]}"
+      "$(snapshot_label "$index")"
+      "$status"
+    )
+  done
+  if ! selected="$(
+    dialog \
+      --stdout \
+      --backtitle "server-infra disaster recovery" \
+      --title "$dialog_title" \
+      --ok-label "Select" \
+      --cancel-label "Stop" \
+      --radiolist \
+      "Snapshots are ordered newest first. The latest is selected by default." \
+      22 110 14 \
+      "${dialog_items[@]}"
+  )"; then
+    wizard_warn "Recovery stopped during $snapshot_kind snapshot selection"
+    exit 0
+  fi
+  validate_snapshot_id "$selected"
+  SELECTED_SNAPSHOT="$selected"
+}
+
+choose_snapshot() {
+  local snapshot_kind="$1"
+
+  SELECTED_SNAPSHOT=""
+  case "$ACTIVE_UI" in
+    tui)
+      choose_snapshot_tui "$snapshot_kind"
+      ;;
+    plain)
+      choose_snapshot_plain "$snapshot_kind"
+      ;;
+  esac
+  [[ -n "$SELECTED_SNAPSHOT" ]] || \
+    fail "Snapshot selection returned an empty ID"
 }
 
 run_config_recovery() {
@@ -182,13 +414,9 @@ run_config_recovery() {
     selected_snapshot="$pinned_snapshot"
     wizard_log "Resuming pinned configuration snapshot: $selected_snapshot"
   else
-    wizard_log "Available configuration snapshots:"
-    run_recovery \
-      config-snapshots \
-      --break-glass "$BREAK_GLASS_FILE"
-    printf 'Configuration snapshot ID: '
-    IFS= read -r selected_snapshot
-    validate_snapshot_id "$selected_snapshot"
+    load_snapshot_inventory configuration
+    choose_snapshot configuration
+    selected_snapshot="$SELECTED_SNAPSHOT"
   fi
 
   run_recovery \
@@ -224,14 +452,9 @@ run_data_selection() {
     selected_snapshot="$pinned_snapshot"
     wizard_log "Resuming pinned data snapshot: $selected_snapshot"
   else
-    wizard_log "Available data snapshots:"
-    run_recovery \
-      --config-root "$CONFIG_ROOT" \
-      data-snapshots \
-      --break-glass "$BREAK_GLASS_FILE"
-    printf 'Data snapshot ID: '
-    IFS= read -r selected_snapshot
-    validate_snapshot_id "$selected_snapshot"
+    load_snapshot_inventory data
+    choose_snapshot data
+    selected_snapshot="$SELECTED_SNAPSHOT"
   fi
 
   run_recovery \
@@ -321,7 +544,15 @@ load_project_plan() {
     PROJECT_DATABASE_STATES+=("$database_state")
     PROJECT_DATABASE_TARGETS+=("$database_target")
     PROJECT_ROOTS+=("$project_root")
-    PROJECT_SELECTED+=(0)
+    if [[ "$files_state" == "complete" && \
+      ("$database_state" == "complete" || \
+      "$database_state" == "not-applicable") ]]; then
+      PROJECT_SELECTED+=(0)
+      PROJECT_SELECTABLE+=(0)
+    else
+      PROJECT_SELECTED+=(1)
+      PROJECT_SELECTABLE+=(1)
+    fi
   done < "$PROJECT_PLAN_FILE"
 
   ((${#PROJECT_NAMES[@]} > 0)) || \
@@ -336,9 +567,7 @@ render_project_selection() {
   for ((index = 0; index < ${#PROJECT_NAMES[@]}; index++)); do
     mark=" "
     [[ "${PROJECT_SELECTED[$index]}" == "0" ]] || mark="x"
-    if [[ "${PROJECT_FILE_STATES[$index]}" == "complete" && \
-      ("${PROJECT_DATABASE_STATES[$index]}" == "complete" || \
-      "${PROJECT_DATABASE_STATES[$index]}" == "not-applicable") ]]; then
+    if [[ "${PROJECT_SELECTABLE[$index]}" == "0" ]]; then
       mark="done"
     fi
     printf '  [%s] %d. %s (%s; checkout=%s; files=%s; db=%s)\n' \
@@ -352,7 +581,7 @@ render_project_selection() {
   done
 }
 
-select_projects() {
+select_projects_plain() {
   local answer
   local token
   local selected_count
@@ -378,7 +607,9 @@ select_projects() {
         ;;
       a)
         for ((index = 0; index < ${#PROJECT_SELECTED[@]}; index++)); do
-          PROJECT_SELECTED[$index]=1
+          if [[ "${PROJECT_SELECTABLE[$index]}" == "1" ]]; then
+            PROJECT_SELECTED[$index]=1
+          fi
         done
         ;;
       n)
@@ -397,6 +628,11 @@ select_projects() {
           ((token <= ${#PROJECT_NAMES[@]})) || \
             fail "Project selection is out of range: $token"
           index=$((token - 1))
+          if [[ "${PROJECT_SELECTABLE[$index]}" == "0" ]]; then
+            wizard_warn \
+              "Project is already complete and cannot be selected again: ${PROJECT_NAMES[$index]}"
+            continue
+          fi
           if [[ "${PROJECT_SELECTED[$index]}" == "0" ]]; then
             PROJECT_SELECTED[$index]=1
           else
@@ -406,6 +642,173 @@ select_projects() {
         ;;
     esac
   done
+}
+
+select_projects_tui() {
+  local index
+  local selected_projects
+  local selected_name
+  local completed_summary=""
+  local status
+  local dialog_items=()
+
+  for ((index = 0; index < ${#PROJECT_NAMES[@]}; index++)); do
+    if [[ "${PROJECT_SELECTABLE[$index]}" == "0" ]]; then
+      completed_summary+="\n  [done] ${PROJECT_NAMES[$index]}"
+      continue
+    fi
+    status="off"
+    [[ "${PROJECT_SELECTED[$index]}" == "0" ]] || status="on"
+    dialog_items+=(
+      "${PROJECT_NAMES[$index]}"
+      "${PROJECT_TYPES[$index]}; files=${PROJECT_FILE_STATES[$index]}; db=${PROJECT_DATABASE_STATES[$index]}"
+      "$status"
+    )
+  done
+
+  if ((${#dialog_items[@]} == 0)); then
+    return
+  fi
+  if ! selected_projects="$(
+    dialog \
+      --stdout \
+      --separate-output \
+      --backtitle "server-infra disaster recovery" \
+      --title "Projects to recover" \
+      --ok-label "Continue" \
+      --cancel-label "Stop" \
+      --checklist \
+      "Space toggles projects. Completed projects are not offered again.${completed_summary}" \
+      24 110 15 \
+      "${dialog_items[@]}"
+  )"; then
+    wizard_warn "Recovery stopped before project changes"
+    exit 0
+  fi
+
+  for ((index = 0; index < ${#PROJECT_SELECTED[@]}; index++)); do
+    PROJECT_SELECTED[$index]=0
+  done
+  while IFS= read -r selected_name || [[ -n "$selected_name" ]]; do
+    [[ -n "$selected_name" ]] || continue
+    for ((index = 0; index < ${#PROJECT_NAMES[@]}; index++)); do
+      if [[ "${PROJECT_NAMES[$index]}" == "$selected_name" && \
+        "${PROJECT_SELECTABLE[$index]}" == "1" ]]; then
+        PROJECT_SELECTED[$index]=1
+        break
+      fi
+    done
+  done <<< "$selected_projects"
+}
+
+selected_project_count() {
+  local index
+  local selected_count=0
+
+  for ((index = 0; index < ${#PROJECT_SELECTED[@]}; index++)); do
+    if [[ "${PROJECT_SELECTED[$index]}" == "1" ]]; then
+      selected_count=$((selected_count + 1))
+    fi
+  done
+  printf '%s' "$selected_count"
+}
+
+select_projects() {
+  local selectable_count=0
+  local index
+
+  for ((index = 0; index < ${#PROJECT_SELECTABLE[@]}; index++)); do
+    if [[ "${PROJECT_SELECTABLE[$index]}" == "1" ]]; then
+      selectable_count=$((selectable_count + 1))
+    fi
+  done
+  if ((selectable_count == 0)); then
+    render_project_selection
+    wizard_ok "All recoverable projects are already complete"
+    return
+  fi
+
+  case "$ACTIVE_UI" in
+    tui)
+      select_projects_tui
+      ;;
+    plain)
+      select_projects_plain
+      ;;
+  esac
+}
+
+confirm_project_recovery_plain() {
+  local config_snapshot
+  local data_snapshot
+  local index
+  local answer
+
+  config_snapshot="$(
+    read_required_env_value "$STATE_ROOT/session.env" "RECOVERY_CONFIG_SNAPSHOT"
+  )"
+  data_snapshot="$(
+    read_required_env_value "$STATE_ROOT/session.env" "RECOVERY_DATA_SNAPSHOT"
+  )"
+  printf '\nRecovery confirmation:\n'
+  printf '  Configuration snapshot: %s\n' "$config_snapshot"
+  printf '  Data snapshot:          %s\n' "$data_snapshot"
+  printf '  Projects:\n'
+  for ((index = 0; index < ${#PROJECT_NAMES[@]}; index++)); do
+    [[ "${PROJECT_SELECTED[$index]}" == "1" ]] || continue
+    printf '    - %s (%s)\n' \
+      "${PROJECT_NAMES[$index]}" \
+      "${PROJECT_TYPES[$index]}"
+  done
+  printf 'Continue with project recovery? [y/N] '
+  IFS= read -r answer
+  case "$answer" in
+    y | Y | yes | YES)
+      return
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+confirm_project_recovery_tui() {
+  local config_snapshot
+  local data_snapshot
+  local index
+  local confirmation_text
+
+  config_snapshot="$(
+    read_required_env_value "$STATE_ROOT/session.env" "RECOVERY_CONFIG_SNAPSHOT"
+  )"
+  data_snapshot="$(
+    read_required_env_value "$STATE_ROOT/session.env" "RECOVERY_DATA_SNAPSHOT"
+  )"
+  confirmation_text="Configuration: $config_snapshot\nData: $data_snapshot\n\nProjects:"
+  for ((index = 0; index < ${#PROJECT_NAMES[@]}; index++)); do
+    [[ "${PROJECT_SELECTED[$index]}" == "1" ]] || continue
+    confirmation_text+="\n  - ${PROJECT_NAMES[$index]} (${PROJECT_TYPES[$index]})"
+  done
+  dialog \
+    --stdout \
+    --backtitle "server-infra disaster recovery" \
+    --title "Confirm project recovery" \
+    --yes-label "Recover" \
+    --no-label "Back" \
+    --defaultno \
+    --yesno "$confirmation_text" \
+    18 90
+}
+
+confirm_project_recovery() {
+  case "$ACTIVE_UI" in
+    tui)
+      confirm_project_recovery_tui
+      ;;
+    plain)
+      confirm_project_recovery_plain
+      ;;
+  esac
 }
 
 ensure_project_parent() {
@@ -487,8 +890,26 @@ restore_selected_project() {
   else
     default_target="$(default_database_target "$project_name")"
   fi
-  printf 'Target database for %s [%s]: ' "$project_name" "$default_target"
-  IFS= read -r answer
+  if [[ "$ACTIVE_UI" == "tui" ]]; then
+    if ! answer="$(
+      dialog \
+        --stdout \
+        --backtitle "server-infra disaster recovery" \
+        --title "PostgreSQL restore target" \
+        --ok-label "Restore" \
+        --cancel-label "Stop" \
+        --inputbox \
+        "Target database for $project_name. The configured source database is never overwritten." \
+        12 90 \
+        "$default_target"
+    )"; then
+      wizard_warn "Recovery stopped before restoring $project_name database"
+      exit 0
+    fi
+  else
+    printf 'Target database for %s [%s]: ' "$project_name" "$default_target"
+    IFS= read -r answer
+  fi
   database_target="${answer:-$default_target}"
 
   run_recovery \
@@ -508,6 +929,14 @@ run_project_recovery() {
 
   load_project_plan
   select_projects
+  if [[ "$(selected_project_count)" == "0" ]]; then
+    wizard_ok "No incomplete projects were selected"
+    return 1
+  fi
+  if ! confirm_project_recovery; then
+    wizard_warn "Recovery stopped before project changes"
+    return 1
+  fi
   for ((index = 0; index < ${#PROJECT_NAMES[@]}; index++)); do
     [[ "${PROJECT_SELECTED[$index]}" == "1" ]] || continue
     restore_selected_project "$index"
@@ -515,6 +944,8 @@ run_project_recovery() {
 }
 
 parse_arguments() {
+  local ui_mode_set=0
+
   while (($# > 0)); do
     case "$1" in
       --break-glass)
@@ -535,6 +966,22 @@ parse_arguments() {
         (($# >= 2)) || fail "Missing value for --jobs"
         RESTORE_JOBS="$2"
         shift 2
+        ;;
+      --ui)
+        (($# >= 2)) || fail "Missing value for --ui"
+        [[ "$ui_mode_set" == "0" ]] || \
+          fail "--ui may be specified only once"
+        UI_MODE="$2"
+        ui_mode_set=1
+        shift 2
+        ;;
+      --ui=*)
+        [[ "$ui_mode_set" == "0" ]] || \
+          fail "--ui may be specified only once"
+        UI_MODE="${1#*=}"
+        [[ -n "$UI_MODE" ]] || fail "Missing value for --ui"
+        ui_mode_set=1
+        shift
         ;;
       --state-root)
         (($# >= 2)) || fail "Missing value for --state-root"
@@ -578,7 +1025,11 @@ main() {
   run_data_selection
   show_infrastructure_plan
   resolve_git_user
-  run_project_recovery
+  if ! run_project_recovery; then
+    printf '\n'
+    run_recovery status
+    exit 0
+  fi
 
   printf '\n'
   run_recovery status
@@ -588,4 +1039,6 @@ main() {
     "Application validation, database cutover, infrastructure deployment, DNS, and traffic remain manual"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

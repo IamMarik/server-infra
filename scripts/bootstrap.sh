@@ -37,6 +37,7 @@ Apply provides:
   Git
   OpenSSH client
   CA certificates and curl
+  jq and dialog for the interactive recovery UI
   restic
   Docker Engine, Buildx, and Docker Compose
   /run/server-infra
@@ -176,6 +177,18 @@ show_tool_status() {
     warn "restic is not installed"
   fi
 
+  if command -v jq >/dev/null 2>&1; then
+    ok "jq: $(jq --version)"
+  else
+    warn "jq is not installed"
+  fi
+
+  if command -v dialog >/dev/null 2>&1; then
+    ok "dialog: available"
+  else
+    warn "dialog is not installed; recovery wizard will use plain mode"
+  fi
+
   if command -v docker >/dev/null 2>&1; then
     ok "docker: $(docker --version)"
     if docker compose version >/dev/null 2>&1; then
@@ -220,6 +233,8 @@ install_repository_tools_if_missing() {
   command -v git >/dev/null 2>&1 || missing_packages+=("git")
   command -v ssh >/dev/null 2>&1 || missing_packages+=("openssh-client")
   command -v cmp >/dev/null 2>&1 || missing_packages+=("diffutils")
+  command -v jq >/dev/null 2>&1 || missing_packages+=("jq")
+  command -v dialog >/dev/null 2>&1 || missing_packages+=("dialog")
   if ((${#missing_packages[@]} == 0)); then
     ok "Repository and bootstrap tools are already installed; no package change needed"
     return
@@ -235,6 +250,8 @@ install_repository_tools_if_missing() {
   require_command git
   require_command ssh
   require_command cmp
+  require_command jq
+  require_command dialog
 }
 
 docker_is_complete() {
@@ -442,6 +459,8 @@ run_apply() {
   require_command git
   require_command ssh
   require_command restic
+  require_command jq
+  require_command dialog
 
   show_tool_status
   ok "clean host bootstrap complete"

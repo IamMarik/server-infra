@@ -151,10 +151,11 @@ Scripts must be idempotent and deterministic. Running the same script multiple t
 ### Clean host bootstrap
 
 Bootstrap prepares the operating-system foundation before active host
-configuration exists. It installs common tooling and creates shared runtime,
-state, and cache roots. It does not create or manage operator accounts,
-`/etc/server-infra`, application state, SSH authorization, or public routes.
-Project checkout ownership remains an operator-level concern.
+configuration exists. It installs common tooling, the lightweight recovery UI
+dependencies, and creates shared runtime, state, and cache roots. It does not
+create or manage operator accounts, `/etc/server-infra`, application state,
+SSH authorization, or public routes. Project checkout ownership remains an
+operator-level concern.
 
 The same bootstrap contract precedes both a new-host setup and disaster
 recovery:
@@ -201,6 +202,11 @@ operations and state. It may select projects and start a project's PostgreSQL
 service, but infrastructure modules remain a distinct deferred plan. It does
 not deploy Caddy, start applications, promote databases, change DNS, or enable
 traffic.
+
+The wizard may use `dialog` and restic JSON processed with `jq` to provide a
+terminal-native snapshot radiolist and project checklist. Plain terminal mode
+remains a complete fallback over the same operations. UI state is never a
+second recovery state store.
 
 The approved boundary, bootstrap procedure, and phased state model are defined
 in `rfc/0003-disaster-recovery-orchestrator.md`.

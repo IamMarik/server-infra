@@ -198,6 +198,19 @@ The seventh increment implements:
 - no application startup, database promotion, infrastructure deployment, DNS
   change, or traffic activation.
 
+The eighth increment replaces the line-only presentation as the default on
+capable terminals:
+
+- snapshot inventory is consumed as restic JSON and sorted newest-first;
+- `dialog` provides one-choice snapshot radiolists and multi-project
+  checklists, with terminal mouse input when supported;
+- `--ui auto`, `--ui tui`, and `--ui plain` keep presentation explicit;
+- completed projects are not selectable on resume, while pending and
+  interrupted projects are preselected;
+- a final summary requires confirmation before project mutations;
+- the plain interface and every non-interactive state-machine operation remain
+  available without TUI state or behavior changes.
+
 The default interactive entry point uses the Git-ignored
 `<repository-root>/server-infra-break-glass.txt` and uses the invoking
 non-root SSH operator from `SUDO_USER` for Git checkout ownership. Explicit

@@ -20,7 +20,7 @@ the manual disaster-recovery runbook.
 The current implementation provides:
 
 - `server-infra-recovery-wizard` as an interactive facade over the operations
-  below, including snapshot prompts and checkbox-style project selection;
+  below, including newest-first snapshot radiolists and project checklists;
 - `init` to validate the break-glass record against the current repository;
 - a root-owned, resumable, non-secret recovery session;
 - `plan` to display ordered recovery phases;
@@ -145,10 +145,31 @@ Then initialize the recovery session:
 sudo ./recovery/bin/server-infra-recovery-wizard
 ```
 
-This recommended interactive path validates backup access, asks for exact
-configuration and data snapshots, and presents the recovered projects as
-toggleable `[ ]` entries. Re-running it resumes the same pinned session and
-completed project steps.
+This recommended interactive path validates backup access, shows configuration
+and data snapshots newest-first, and presents recovered projects as a terminal
+checklist. The newest snapshot is selected by default. Re-running it resumes
+the same pinned session, marks completed projects as unavailable, and
+preselects pending or interrupted projects.
+
+The default `--ui auto` mode opens a dialog-based TUI when stdin and stdout are
+interactive and `dialog` is available. Use the keyboard or compatible
+terminal mouse events:
+
+- Up/Down changes the highlighted entry;
+- Space toggles a project checkbox;
+- Enter accepts the selection.
+
+Force either presentation without changing recovery behavior:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery-wizard --ui tui
+sudo ./recovery/bin/server-infra-recovery-wizard --ui plain
+```
+
+Plain mode accepts a snapshot number, an exact displayed snapshot ID, or Enter
+for the newest snapshot. Project numbers toggle selections. Both modes show a
+final configuration snapshot, data snapshot, and project summary before
+project checkout, file, or database changes.
 
 The wizard creates a missing recorded project parent only after confirmation.
 For PostgreSQL projects it proposes `<project>_recovered`, starts only the
@@ -187,6 +208,14 @@ sudo ./recovery/bin/server-infra-recovery config-snapshots
 
 sudo ./recovery/bin/server-infra-recovery restore-config \
   --snapshot <config-snapshot-id>
+```
+
+Snapshot listing operations also expose unmodified restic JSON for the wizard
+and other trusted operator tooling:
+
+```bash
+sudo ./recovery/bin/server-infra-recovery config-snapshots --json
+sudo ./recovery/bin/server-infra-recovery data-snapshots --json
 ```
 
 List and pin one data snapshot:
@@ -287,6 +316,8 @@ Run without contacting GitHub, Backblaze, or a real restic repository:
 
 ```bash
 ./recovery/tests/test-recovery.sh
+./recovery/tests/test-recovery-wizard.sh
+./recovery/tests/test-recovery-wizard-tui.sh
 ```
 
 ## Troubleshooting

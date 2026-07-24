@@ -70,10 +70,11 @@ this repository, prepare the common host foundation:
 sudo ./scripts/bootstrap.sh --apply
 ```
 
-Bootstrap installs Git, the OpenSSH client, CA certificates, curl, restic,
-Docker Engine, and Docker Compose and prepares the shared runtime roots. It
-never creates `/etc/server-infra`, creates operator accounts, changes SSH or
-firewall policy, or starts public infrastructure. See `bootstrap/README.md`.
+Bootstrap installs Git, the OpenSSH client, CA certificates, curl, jq,
+dialog, restic, Docker Engine, and Docker Compose and prepares the shared
+runtime roots. It never creates `/etc/server-infra`, creates operator
+accounts, changes SSH or firewall policy, or starts public infrastructure.
+See `bootstrap/README.md`.
 
 ## Repository check
 
@@ -209,9 +210,9 @@ sudo ./scripts/bootstrap.sh --apply
 sudo ./recovery/bin/server-infra-recovery-wizard
 ```
 
-The wizard validates remote backup access, asks for exact configuration and
-data snapshot IDs, displays infrastructure as deferred work, and lets the
-operator select projects with checkbox-style toggles. PostgreSQL is restored
+The wizard validates remote backup access, presents configuration and data
+snapshots newest-first, displays infrastructure as deferred work, and lets the
+operator select projects through a terminal checklist. PostgreSQL is restored
 into a new isolated database after starting only its Compose database service.
 It does not start applications, deploy Caddy, change DNS, or enable traffic.
 The default secret input is `server-infra-break-glass.txt` in the repository
@@ -219,6 +220,13 @@ root; that filename is ignored by Git and must have mode `0600`. New
 project checkouts are owned by the SSH operator inferred from `SUDO_USER`,
 while root remains responsible for host configuration and recovery state.
 The Git user has an explicit CLI override for automation.
+
+Interactive terminals use the dialog-based TUI automatically. Arrow keys,
+Space, Enter, and compatible terminal mouse events control snapshot and
+project selection. Use `--ui plain` for a serial console or minimal terminal;
+`--ui tui` requires an interactive terminal. Re-running the wizard keeps the
+pinned snapshots, excludes completed projects, and preselects pending or
+interrupted projects.
 
 The non-interactive commands remain available for automation and diagnosis:
 

@@ -22,6 +22,7 @@ GIT_USER=""
 TARGET_DATABASE=""
 RESTORE_JOBS=4
 START_DATABASE_SERVICE=0
+SNAPSHOT_OUTPUT_JSON=0
 TEMP_FILE=""
 LOCK_DIR=""
 RESTORE_TARGET=""
@@ -52,13 +53,13 @@ Usage:
   server-infra-recovery [--state-root <absolute-path>] plan
   server-infra-recovery [--state-root <absolute-path>] status
   server-infra-recovery [--state-root <absolute-path>] \
-    config-snapshots [--break-glass <absolute-path>]
+    config-snapshots [--break-glass <absolute-path>] [--json]
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] [--work-root <absolute-path>] \
     restore-config [--break-glass <absolute-path>] --snapshot <exact-id>
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] \
-    data-snapshots [--break-glass <absolute-path>]
+    data-snapshots [--break-glass <absolute-path>] [--json]
   server-infra-recovery [--state-root <absolute-path>] \
     [--config-root <absolute-path>] \
     select-data [--break-glass <absolute-path>] --snapshot <exact-id>
@@ -89,12 +90,13 @@ Operations:
     Show recovery session metadata and phase state.
   config-snapshots
     List configuration snapshots for the recorded server without changing
-    recovery state.
+    recovery state. Use --json for a machine-readable restic inventory.
   restore-config
     Restore one exact configuration snapshot, validate it, and install it only
     when the active configuration root is absent.
   data-snapshots
-    List data snapshots after configuration recovery is complete.
+    List data snapshots after configuration recovery is complete. Use --json
+    for a machine-readable restic inventory.
   select-data
     Verify and pin one data snapshot for every project in this recovery.
   projects-plan
@@ -1025,6 +1027,16 @@ run_config_snapshots() {
   load_recovery_context
   require_command restic
 
+  if [[ "$SNAPSHOT_OUTPUT_JSON" == "1" ]]; then
+    run_break_glass_restic \
+      --no-cache \
+      snapshots \
+      --json \
+      --host "$RECOVERY_INSTANCE" \
+      --tag server-infra-config
+    return
+  fi
+
   recovery_log "Configuration snapshots for $RECOVERY_INSTANCE"
   run_break_glass_restic \
     --no-cache \
@@ -1144,6 +1156,16 @@ run_data_snapshots() {
   load_recovery_context
   validate_configuration_phase_complete
   require_command restic
+
+  if [[ "$SNAPSHOT_OUTPUT_JSON" == "1" ]]; then
+    run_break_glass_restic \
+      --no-cache \
+      snapshots \
+      --json \
+      --host "$RECOVERY_INSTANCE" \
+      --tag server-infra-data
+    return
+  fi
 
   recovery_log "Data snapshots for $RECOVERY_INSTANCE"
   run_break_glass_restic \
@@ -2112,6 +2134,7 @@ parse_arguments() {
   local target_database_set=0
   local restore_jobs_set=0
   local start_database_service_set=0
+  local snapshot_output_json_set=0
 
   while (($# > 0)); do
     case "$1" in
@@ -2266,6 +2289,13 @@ parse_arguments() {
         start_database_service_set=1
         shift
         ;;
+      --json)
+        [[ "$snapshot_output_json_set" == "0" ]] || \
+          fail "--json may be specified only once"
+        SNAPSHOT_OUTPUT_JSON=1
+        snapshot_output_json_set=1
+        shift
+        ;;
       --help | -h)
         usage
         exit 0
@@ -2305,8 +2335,13 @@ parse_arguments() {
         fail "--target-db and --jobs are supported only by restore-project-db"
       [[ "$start_database_service_set" == "0" ]] || \
         fail "--start-service is supported only by restore-project-db"
+      if [[ "$OPERATION" == "init" && "$snapshot_output_json_set" != "0" ]]; then
+        fail "--json is supported only by snapshot listing operations"
+      fi
       ;;
     restore-config)
+      [[ "$snapshot_output_json_set" == "0" ]] || \
+        fail "--json is supported only by snapshot listing operations"
       [[ -n "$SNAPSHOT_ID" ]] || fail "restore-config requires --snapshot"
       [[ "$project_name_set" == "0" && "$git_user_set" == "0" ]] || \
         fail "--name and --git-user are supported only by project recovery operations"
@@ -2328,6 +2363,8 @@ parse_arguments() {
         fail "--start-service is supported only by restore-project-db"
       ;;
     select-data)
+      [[ "$snapshot_output_json_set" == "0" ]] || \
+        fail "--json is supported only by snapshot listing operations"
       [[ -n "$SNAPSHOT_ID" ]] || fail "select-data requires --snapshot"
       [[ "$work_root_set" == "0" ]] || \
         fail "--work-root is not supported by select-data"
@@ -2339,6 +2376,8 @@ parse_arguments() {
         fail "--start-service is supported only by restore-project-db"
       ;;
     projects-plan)
+      [[ "$snapshot_output_json_set" == "0" ]] || \
+        fail "--json is supported only by snapshot listing operations"
       [[ -z "$SNAPSHOT_ID" ]] || \
         fail "--snapshot is not supported by projects-plan"
       [[ "$work_root_set" == "0" ]] || \
@@ -2351,6 +2390,8 @@ parse_arguments() {
         fail "--start-service is supported only by restore-project-db"
       ;;
     clone-project)
+      [[ "$snapshot_output_json_set" == "0" ]] || \
+        fail "--json is supported only by snapshot listing operations"
       [[ -z "$SNAPSHOT_ID" ]] || \
         fail "--snapshot is not supported by clone-project"
       [[ "$work_root_set" == "0" ]] || \
@@ -2363,6 +2404,8 @@ parse_arguments() {
         fail "--start-service is supported only by restore-project-db"
       ;;
     restore-project-files)
+      [[ "$snapshot_output_json_set" == "0" ]] || \
+        fail "--json is supported only by snapshot listing operations"
       [[ -z "$SNAPSHOT_ID" ]] || \
         fail "--snapshot is not supported by restore-project-files"
       [[ -n "$PROJECT_NAME" ]] || \
@@ -2375,6 +2418,8 @@ parse_arguments() {
         fail "--start-service is supported only by restore-project-db"
       ;;
     restore-project-db)
+      [[ "$snapshot_output_json_set" == "0" ]] || \
+        fail "--json is supported only by snapshot listing operations"
       [[ -z "$SNAPSHOT_ID" ]] || \
         fail "--snapshot is not supported by restore-project-db"
       [[ "$work_root_set" == "0" ]] || \
@@ -2385,6 +2430,8 @@ parse_arguments() {
         fail "restore-project-db requires --target-db"
       ;;
     plan | status)
+      [[ "$snapshot_output_json_set" == "0" ]] || \
+        fail "--json is supported only by snapshot listing operations"
       [[ -z "$BREAK_GLASS_FILE" && -z "$SNAPSHOT_ID" ]] || \
         fail "Break-glass and snapshot options are not supported by $OPERATION"
       [[ "$config_root_set" == "0" && "$work_root_set" == "0" ]] || \

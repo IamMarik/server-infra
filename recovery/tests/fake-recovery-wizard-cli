@@ -14,6 +14,7 @@ snapshot_id=""
 target_database=""
 operation=""
 start_service=0
+json_output=0
 
 while (($# > 0)); do
   case "$1" in
@@ -27,6 +28,10 @@ while (($# > 0)); do
       ;;
     --work-root | --break-glass | --name | --git-user | --jobs)
       shift 2
+      ;;
+    --json)
+      json_output=1
+      shift
       ;;
     --snapshot)
       snapshot_id="$2"
@@ -90,7 +95,9 @@ case "$operation" in
     printf '[fake-recovery][ok] session initialized\n'
     ;;
   config-snapshots)
-    printf 'abcdef12\t2026-07-24T01:00:00Z\tconfig\n'
+    [[ "$json_output" == "1" ]]
+    printf '%s\n' \
+      '[{"id":"1111111111111111111111111111111111111111111111111111111111111111","short_id":"11111111","time":"2026-07-24T01:00:00Z","paths":["/etc/server-infra"]},{"id":"abcdef12abcdef12abcdef12abcdef12abcdef12abcdef12abcdef12abcdef12","short_id":"abcdef12","time":"2026-07-24T03:00:00Z","paths":["/etc/server-infra"]}]'
     ;;
   restore-config)
     [[ "$snapshot_id" == "abcdef12" ]]
@@ -112,7 +119,9 @@ case "$operation" in
     printf '[fake-recovery][ok] configuration restored\n'
     ;;
   data-snapshots)
-    printf 'deadbeef\t2026-07-24T02:00:00Z\tdata\n'
+    [[ "$json_output" == "1" ]]
+    printf '%s\n' \
+      '[{"id":"2222222222222222222222222222222222222222222222222222222222222222","short_id":"22222222","time":"2026-07-24T02:00:00Z","paths":["/srv/old"]},{"id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef","short_id":"deadbeef","time":"2026-07-24T04:00:00Z","paths":["/srv/current"]}]'
     ;;
   select-data)
     [[ "$snapshot_id" == "deadbeef" ]]
@@ -125,13 +134,24 @@ case "$operation" in
   projects-plan)
     printf '%s\n' \
       $'NAME\tTYPE\tCHECKOUT\tFILES\tDATABASE\tDATABASE_TARGET\tPROJECT_ROOT\tREPOSITORY_URL\tDEPLOY_COMMIT\tDATA_SNAPSHOT'
+    if [[ "${FAKE_RECOVERY_RESUME:-0}" == "1" ]]; then
+      acceptance_checkout="present"
+      acceptance_files="complete"
+      acceptance_database="complete"
+      acceptance_target="acceptance_app_recovered"
+    else
+      acceptance_checkout="absent"
+      acceptance_files="not-started"
+      acceptance_database="not-started"
+      acceptance_target="-"
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "acceptance-app" \
       "postgres-compose" \
-      "absent" \
-      "not-started" \
-      "not-started" \
-      "-" \
+      "$acceptance_checkout" \
+      "$acceptance_files" \
+      "$acceptance_database" \
+      "$acceptance_target" \
       "$FAKE_RECOVERY_PROJECT_ROOT" \
       "git@github.com:example/acceptance-app.git" \
       "0123456789abcdef0123456789abcdef01234567" \

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+[[ -n "${FAKE_DIALOG_LOG:-}" ]]
+
+printf '%s ' "$@" >> "$FAKE_DIALOG_LOG"
+printf '\n' >> "$FAKE_DIALOG_LOG"
+
+all_arguments="$*"
+case "$all_arguments" in
+  *"--radiolist"*)
+    printf '%s\n' "${FAKE_DIALOG_SNAPSHOT:-abcdef12}"
+    ;;
+  *"--checklist"*)
+    printf '%s\n' "${FAKE_DIALOG_PROJECTS:-static-site}"
+    ;;
+  *"--inputbox"*)
+    printf '%s\n' "${FAKE_DIALOG_INPUT:-test_recovered}"
+    ;;
+  *"--yesno"*)
+    exit "${FAKE_DIALOG_CONFIRM_EXIT:-0}"
+    ;;
+  *)
+    exit 1
+    ;;
+esac

@@ -22,6 +22,7 @@ The implementation is `scripts/bootstrap.sh`. It provides:
 
 - Git and the OpenSSH client;
 - system CA certificates and curl;
+- jq and dialog for snapshot inventory and the optional terminal recovery UI;
 - restic from the Debian or Ubuntu repository;
 - Docker Engine, Buildx, and Docker Compose;
 - shared roots under `/run`, `/var/lib`, and `/var/cache`.
@@ -74,6 +75,11 @@ Apply is idempotent. Installed tools are not upgraded merely because the
 command is repeated. Managed Docker repository files must either match the
 bootstrap contract or be absent; a different existing file is never
 overwritten.
+
+`dialog` is presentation-only. If a terminal cannot render it, the recovery
+wizard remains available through `--ui plain`. `jq` parses restic's
+machine-readable snapshot inventory; it does not process secret configuration
+files.
 
 Bootstrap never deletes operating-system accounts. A `deploy` account created
 by an earlier repository version is no longer used by this contract, but its
