@@ -115,7 +115,7 @@ Follow backup/RECOVERY.md for those phases.
 
 Defaults to:
   --break-glass <repository-root>/server-infra-break-glass.txt
-  --git-user SUDO_USER for project operations invoked through sudo
+  --git-user SUDO_USER
   --state-root /var/lib/server-infra/recovery
   --config-root /etc/server-infra
   --work-root /var/cache/server-infra/recovery
@@ -285,6 +285,15 @@ validate_git_user() {
     fail "Git user does not exist: $git_user"
   [[ "$git_uid" != "0" ]] || \
     fail "Project Git operations must not run as root"
+}
+
+resolve_default_git_user() {
+  if [[ -n "$GIT_USER" ]]; then
+    return
+  fi
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then
+    GIT_USER="$SUDO_USER"
+  fi
 }
 
 validate_state_root() {
@@ -2281,10 +2290,7 @@ parse_arguments() {
   fi
   case "$OPERATION" in
     clone-project | restore-project-files | restore-project-db)
-      if [[ -z "$GIT_USER" && -n "${SUDO_USER:-}" && \
-        "${SUDO_USER:-}" != "root" ]]; then
-        GIT_USER="$SUDO_USER"
-      fi
+      resolve_default_git_user
       ;;
   esac
   case "$OPERATION" in

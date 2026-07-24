@@ -71,9 +71,9 @@ sudo ./scripts/bootstrap.sh --apply
 ```
 
 Bootstrap installs Git, the OpenSSH client, CA certificates, curl, restic,
-Docker Engine, and Docker Compose, then prepares the shared runtime roots. It
-never creates `/etc/server-infra`, changes SSH or firewall policy, or starts
-public infrastructure. See `bootstrap/README.md`.
+Docker Engine, and Docker Compose and prepares the shared runtime roots. It
+never creates `/etc/server-infra`, creates operator accounts, changes SSH or
+firewall policy, or starts public infrastructure. See `bootstrap/README.md`.
 
 ## Repository check
 
@@ -196,10 +196,10 @@ operator select projects with checkbox-style toggles. PostgreSQL is restored
 into a new isolated database after starting only its Compose database service.
 It does not start applications, deploy Caddy, change DNS, or enable traffic.
 The default secret input is `server-infra-break-glass.txt` in the repository
-root; that filename is ignored by Git and must have mode `0600`. Git operations
-use the ordinary account from `SUDO_USER`, while root remains responsible only
-for host configuration and recovery state. Both defaults have explicit CLI
-overrides for non-standard layouts and automation.
+root; that filename is ignored by Git and must have mode `0600`. New
+project checkouts are owned by the SSH operator inferred from `SUDO_USER`,
+while root remains responsible for host configuration and recovery state.
+The Git user has an explicit CLI override for automation.
 
 The non-interactive commands remain available for automation and diagnosis:
 

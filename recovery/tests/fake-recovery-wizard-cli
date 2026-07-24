@@ -103,6 +103,12 @@ case "$operation" in
     printf '%s\n' \
       'ENABLED_MODULES="backup proxy monitoring"' \
       > "$config_root/modules.env"
+    printf '%s\n' \
+      "SERVER_INFRA_CONFIG_VERSION=1" \
+      "SERVER_INFRA_INSTANCE=acceptance" \
+      "SERVER_INFRA_ENVIRONMENT=acceptance" \
+      "SERVER_INFRA_TIMEZONE=Etc/UTC" \
+      > "$config_root/server.env"
     printf '[fake-recovery][ok] configuration restored\n'
     ;;
   data-snapshots)

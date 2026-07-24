@@ -47,8 +47,8 @@ Docker is installed from Docker's official apt repository only when the
 docker command is absent. An existing functional Docker and Compose
 installation is accepted and is not replaced or upgraded.
 
-Bootstrap never creates or changes /etc/server-infra, users, SSH, firewall,
-application projects, Caddy configuration, DNS, or public traffic.
+Bootstrap never creates or changes /etc/server-infra, SSH authorization,
+firewall, application projects, Caddy configuration, DNS, or public traffic.
 
 Apply requires Linux, root, systemd, apt-get, and an official Debian or Ubuntu
 distribution.

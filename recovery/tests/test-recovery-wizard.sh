@@ -46,7 +46,6 @@ export SERVER_INFRA_RECOVERY_EXECUTABLE="$FAKE_RECOVERY"
 export SERVER_INFRA_BREAK_GLASS_FILE="$BREAK_GLASS_FILE"
 export FAKE_RECOVERY_LOG="$RECOVERY_LOG"
 export FAKE_RECOVERY_PROJECT_ROOT="$PROJECT_ROOT"
-export SUDO_USER="$TEST_GIT_USER"
 
 printf '%s\n' \
   "abcdef12" \
@@ -54,7 +53,7 @@ printf '%s\n' \
   "1" \
   "" \
   "" \
-  | "$WIZARD" \
+  | SUDO_USER="$TEST_GIT_USER" "$WIZARD" \
     --state-root "$STATE_ROOT" \
     --config-root "$CONFIG_ROOT" \
     --work-root "$WORK_ROOT" \

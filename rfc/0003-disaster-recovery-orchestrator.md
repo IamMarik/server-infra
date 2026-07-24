@@ -199,10 +199,11 @@ The seventh increment implements:
   change, or traffic activation.
 
 The default interactive entry point uses the Git-ignored
-`<repository-root>/server-infra-break-glass.txt` and infers the non-root
-project account from `SUDO_USER`. Explicit `--break-glass` and `--git-user`
-overrides remain available for automation and non-standard ownership. The
-secret file retains the same strict validation and is never read by Git.
+`<repository-root>/server-infra-break-glass.txt` and uses the invoking
+non-root SSH operator from `SUDO_USER` for Git checkout ownership. Explicit
+`--break-glass` and `--git-user` overrides remain available for automation and
+non-standard ownership. The secret file retains the same strict validation
+and is never read by Git.
 
 Application validation, deployment, database cutover, and finalization remain
 documented manual operations until their contracts are separately implemented

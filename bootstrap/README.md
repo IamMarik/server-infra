@@ -43,7 +43,7 @@ operator review. It does not remove or replace an existing container runtime.
 Bootstrap never creates or changes:
 
 - `/etc/server-infra`;
-- users, SSH keys, or SSH daemon configuration;
+- SSH keys, SSH authorization, or SSH daemon configuration;
 - firewall rules;
 - Docker group membership;
 - application checkouts or databases;
@@ -52,6 +52,9 @@ Bootstrap never creates or changes:
 Docker group membership is intentionally excluded because it grants
 root-equivalent host access. Firewall changes remain separate because Docker
 published ports require an explicitly reviewed firewall policy.
+Bootstrap also does not create, modify, or validate operator accounts. The
+administrator establishes the SSH operator and decides whether that account
+may use sudo or Docker before running this script.
 
 ## Operations
 
@@ -72,11 +75,17 @@ command is repeated. Managed Docker repository files must either match the
 bootstrap contract or be absent; a different existing file is never
 overwritten.
 
+Bootstrap never deletes operating-system accounts. A `deploy` account created
+by an earlier repository version is no longer used by this contract, but its
+removal remains a separate operator decision after checking file ownership and
+running processes.
+
 After bootstrap:
 
 - a new server creates its own `/etc/server-infra` with the host setup flow;
 - disaster recovery restores `/etc/server-infra` from one selected snapshot;
-- both flows then use the existing install and deploy contracts.
+- both flows then use the existing install and deploy contracts;
+- project Git checkouts remain owned by the operator who performs deployment.
 
 ## Testing
 
@@ -87,8 +96,8 @@ Run the isolated contract test without package installation or network access:
 ```
 
 The test covers supported distribution detection, repeatable Docker repository
-configuration, conflict refusal, runtime roots, and the guarantee that
-bootstrap does not create `/etc/server-infra`.
+configuration, runtime roots, and the guarantee that bootstrap does not create
+`/etc/server-infra` or operator accounts.
 
 ## Troubleshooting
 

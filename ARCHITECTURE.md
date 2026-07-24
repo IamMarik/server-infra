@@ -152,8 +152,9 @@ Scripts must be idempotent and deterministic. Running the same script multiple t
 
 Bootstrap prepares the operating-system foundation before active host
 configuration exists. It installs common tooling and creates shared runtime,
-state, and cache roots, but it never creates `/etc/server-infra`, application
-state, or public routes.
+state, and cache roots. It does not create or manage operator accounts,
+`/etc/server-infra`, application state, SSH authorization, or public routes.
+Project checkout ownership remains an operator-level concern.
 
 The same bootstrap contract precedes both a new-host setup and disaster
 recovery:

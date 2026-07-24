@@ -68,7 +68,8 @@ Bootstrap does not own:
 
 - VM provisioning;
 - initial SSH access or the first trusted repository transfer;
-- users, SSH hardening, or Docker group membership;
+- operator users, SSH authorization, SSH hardening, or Docker group
+  membership;
 - firewall rules;
 - `/etc/server-infra`;
 - application source or databases;
@@ -76,6 +77,9 @@ Bootstrap does not own:
 
 Those operations can lock out the operator, grant root-equivalent access, or
 expose services, so they require separate explicit contracts.
+Project checkout ownership is intentionally left with the existing SSH
+operator. Recovery performs Git operations as `SUDO_USER` while retaining root
+only for host configuration, restic, database, and recovery-state operations.
 
 ## Flow composition
 
@@ -104,6 +108,7 @@ host is the failed server.
 - Active host configuration remains absent until its owning flow creates or
   restores it.
 - Existing Docker installations are not silently replaced.
+- Recreated project checkouts remain manageable by the recovery operator.
 
 ### Costs
 
@@ -112,5 +117,5 @@ host is the failed server.
 - Only Debian and Ubuntu are supported initially.
 - Docker's official apt repository becomes an external bootstrap dependency
   on hosts where Docker is absent.
-- User creation, SSH hardening, firewall policy, and planned project migration
-  still need separately approved workflows.
+- Git authorization, SSH hardening, firewall policy, and planned project
+  migration still need separately approved workflows.

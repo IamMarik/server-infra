@@ -161,10 +161,14 @@ The zero-option command expects
 Git, but the file remains a `0600` secret and should be removed from the
 replacement host after recovery. `--break-glass` overrides the path.
 
-The wizard requires root for `/etc` and recovery state. It infers the ordinary
-project owner from `SUDO_USER` so Git does not run as root and the recreated
-checkout can use that account's SSH access. Use `--git-user` only from a root
-shell, in automation, or when another deployment account owns the projects.
+The wizard requires root for `/etc`, restic, database operations, and recovery
+state. Git checkout operations run as the ordinary SSH operator inferred from
+`SUDO_USER`, so recovered repositories keep the same practical owner used for
+normal deployment. Use `--git-user` when `SUDO_USER` is unavailable or another
+existing ordinary account must own the checkout.
+
+Legacy `SERVER_INFRA_PROJECT_*` entries in a restored `server.env` are ignored
+and may be removed during the next reviewed configuration edit.
 
 Use the non-interactive interface for automation or individual retries:
 
@@ -205,9 +209,9 @@ sudo ./recovery/bin/server-infra-recovery clone-project \
 ```
 
 The parent of the recorded `PROJECT_ROOT` must already exist. For SSH remotes,
-the selected Git user must have temporary repository access through its own
-SSH key. With agent forwarding, preserve the socket when entering `sudo`, for
-example `sudo --preserve-env=SSH_AUTH_SOCK ...`.
+the operator must have repository access through its SSH key. With agent
+forwarding, preserve the socket when entering `sudo`, for example
+`sudo --preserve-env=SSH_AUTH_SOCK ...`.
 
 `clone-project` deliberately stops after the exact Git checkout. It does not
 copy `.env` or uploads, restore PostgreSQL, install the recovered project

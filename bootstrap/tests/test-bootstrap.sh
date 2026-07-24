@@ -28,6 +28,10 @@ parse_arguments --check
 if (OPERATION=""; parse_arguments --check --apply) >/dev/null 2>&1; then
   fail_test "Bootstrap accepted conflicting operations"
 fi
+if (OPERATION=""; parse_arguments --check --project-user deploy) \
+  >/dev/null 2>&1; then
+  fail_test "Bootstrap accepted the removed project-account option"
+fi
 
 OS_RELEASE_FILE="$TEST_ROOT/os-release"
 printf '%s\n' \

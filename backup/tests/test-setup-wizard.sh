@@ -75,6 +75,9 @@ assert_contains "$CONFIG_ROOT/server.env" \
   "SERVER_INFRA_INSTANCE=litevi-acceptance"
 assert_contains "$CONFIG_ROOT/server.env" \
   "SERVER_INFRA_ENVIRONMENT=acceptance"
+if grep -F "SERVER_INFRA_PROJECT_" "$CONFIG_ROOT/server.env" >/dev/null; then
+  fail_test "Backup setup wrote the removed project-account contract"
+fi
 assert_contains "$CONFIG_ROOT/modules.env" 'ENABLED_MODULES="backup"'
 assert_contains "$CONFIG_ROOT/backup/runtime.env" \
   "RESTIC_REPOSITORY=s3:https://s3.us-west-004.backblazeb2.com/litevi-backups/litevi-acceptance"

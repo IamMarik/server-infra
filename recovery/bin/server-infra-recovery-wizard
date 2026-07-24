@@ -60,7 +60,7 @@ the proxy, changes DNS, or enables public traffic.
 
 Defaults:
   --break-glass <repository-root>/server-infra-break-glass.txt
-  --git-user    SUDO_USER when sudo was invoked by an ordinary user
+  --git-user    SUDO_USER
   --jobs        4
   --state-root  /var/lib/server-infra/recovery
   --config-root /etc/server-infra
@@ -114,6 +114,8 @@ validate_jobs() {
 }
 
 resolve_git_user() {
+  local actual_uid
+
   if [[ -z "$GIT_USER" && -n "${SUDO_USER:-}" && \
     "${SUDO_USER:-}" != "root" ]]; then
     GIT_USER="$SUDO_USER"
@@ -121,7 +123,8 @@ resolve_git_user() {
   [[ -n "$GIT_USER" ]] || \
     fail "Specify --git-user when the wizard cannot infer SUDO_USER"
   id "$GIT_USER" >/dev/null 2>&1 || fail "Git user not found: $GIT_USER"
-  [[ "$(id -u "$GIT_USER")" != "0" ]] || \
+  actual_uid="$(id -u "$GIT_USER")"
+  [[ "$actual_uid" != "0" ]] || \
     fail "Git operations require an ordinary non-root user"
 }
 
@@ -131,7 +134,6 @@ validate_runtime() {
   validate_wizard_path "$WORK_ROOT" "Work root"
   validate_wizard_path "$BREAK_GLASS_FILE" "Break-glass file"
   validate_jobs
-  resolve_git_user
   require_command id
   require_command install
   require_command mktemp
@@ -575,6 +577,7 @@ main() {
   run_config_recovery
   run_data_selection
   show_infrastructure_plan
+  resolve_git_user
   run_project_recovery
 
   printf '\n'

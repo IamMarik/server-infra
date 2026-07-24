@@ -97,7 +97,8 @@ sudo ./scripts/bootstrap.sh --apply
 
 It installs the remaining Git, OpenSSH client, CA, curl, restic, and Docker
 requirements and prepares shared runtime roots. It does not create
-`/etc/server-infra`, change SSH or firewall policy, or start public services.
+`/etc/server-infra`, manage operator accounts, change SSH policy, or start
+public services.
 
 The recommended path from this point is the resumable interactive wizard:
 
@@ -115,9 +116,11 @@ enable traffic.
 
 Before running it, copy the external record to
 `<repository-root>/server-infra-break-glass.txt` and keep mode `0600`. This
-local recovery copy is ignored by Git. The wizard infers the ordinary
-deployment account from `SUDO_USER`; pass `--break-glass` or `--git-user` only
-to override those defaults.
+local recovery copy is ignored by Git. The wizard uses the SSH operator from
+`SUDO_USER` as the owner of recovered project checkouts. Pass `--break-glass`
+or `--git-user` only to override those defaults. Ensure that operator can read
+the required Git repositories before checkout recovery; bootstrap does not
+create, copy, or restore private SSH keys.
 
 The commands below remain the detailed manual and troubleshooting flow.
 
@@ -208,7 +211,7 @@ sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" projects-plan
 ```
 
 Create the parent of a recorded `PROJECT_ROOT` first if it is absent. Then
-clone each project as the ordinary deployment user:
+clone each project as the ordinary SSH operator:
 
 ```bash
 sudo "$SERVER_INFRA_ROOT/recovery/bin/server-infra-recovery" clone-project \
