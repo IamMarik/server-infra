@@ -2,6 +2,8 @@
 	email {$CADDY_EMAIL}
 }
 
+import /etc/caddy/conf.d/*.caddy
+
 {$STATUS_DOMAIN} {
 	reverse_proxy uptime-kuma:3001
 }
