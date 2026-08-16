@@ -54,6 +54,7 @@ Usage:
     validate [--allow-missing-project-paths]
   server-infra-backup [--config-root <absolute-path>] init
   server-infra-backup [--config-root <absolute-path>] run
+  server-infra-backup [--config-root <absolute-path>] status
   server-infra-backup [--config-root <absolute-path>] retention
   server-infra-backup [--config-root <absolute-path>] check
   server-infra-backup [--config-root <absolute-path>] restore \
@@ -71,6 +72,7 @@ Operations:
              Compose file, and Docker availability checks during VM recovery.
   init       Explicitly initialize the configured restic repository.
   run        Create configuration and data snapshots, then optionally retain.
+  status     Display the latest remote configuration and data snapshots.
   retention  Apply the configured retention policy explicitly.
   check      Check repository metadata integrity.
   restore    Restore one tagged snapshot into an absent or empty directory.
@@ -934,6 +936,25 @@ run_backup() {
   ok "backup job completed"
 }
 
+run_status() {
+  CURRENT_OPERATION="status"
+  load_configuration
+  require_command restic
+
+  log "Inspecting the latest remote snapshots"
+  printf '%s\n' 'Configuration snapshot (latest):'
+  run_restic snapshots \
+    --host "$SERVER_INFRA_INSTANCE" \
+    --tag "$CONFIG_TAG" \
+    --latest 1
+  printf '%s\n' 'Data snapshot (latest):'
+  run_restic snapshots \
+    --host "$SERVER_INFRA_INSTANCE" \
+    --tag "$DATA_TAG" \
+    --latest 1
+  ok "remote snapshots inspected"
+}
+
 run_retention() {
   CURRENT_OPERATION="retention"
   load_configuration
@@ -1319,6 +1340,9 @@ main() {
       ;;
     run)
       run_backup
+      ;;
+    status)
+      run_status
       ;;
     retention)
       run_retention

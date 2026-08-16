@@ -158,6 +158,13 @@ RUNNER="$REPOSITORY_ROOT/backup/bin/server-infra-backup"
 "$REPOSITORY_ROOT/scripts/deploy.sh" --config-root "$CONFIG_ROOT" --check
 "$RUNNER" --config-root "$CONFIG_ROOT" validate
 : > "$CURL_LOG"
+"$RUNNER" --config-root "$CONFIG_ROOT" status
+assert_contains \
+  "$RESTIC_LOG" \
+  "snapshots --host test-server --tag server-infra-config --latest 1"
+assert_contains \
+  "$RESTIC_LOG" \
+  "snapshots --host test-server --tag server-infra-data --latest 1"
 "$RUNNER" --config-root "$CONFIG_ROOT" check
 assert_contains "$RESTIC_LOG" "check "
 if [[ -s "$CURL_LOG" ]]; then

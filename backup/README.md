@@ -430,6 +430,14 @@ Run a backup manually:
 sudo ./scripts/backup.sh run
 ```
 
+Inspect the latest configuration and data snapshots stored in the remote
+repository. This is a read-only connectivity and visibility check; it does
+not create, delete, or restore data:
+
+```bash
+sudo server-infra-backup status
+```
+
 Apply retention explicitly after provider-policy validation:
 
 ```bash
