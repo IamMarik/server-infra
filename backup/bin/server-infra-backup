@@ -42,10 +42,12 @@ RESTORE_KIND=""
 RESTORE_INCLUDE=""
 RESTORE_TEST_TARGET=""
 ALLOW_MISSING_PROJECT_PATHS=0
+SOURCE_FILTER=""
 DATA_PATHS=()
 PATHS_FILES=()
 EXCLUDES_FILES=()
 FRESHNESS_FILES=()
+PROJECT_SOURCE_NAMES=()
 
 usage() {
   cat <<'USAGE'
@@ -53,8 +55,8 @@ Usage:
   server-infra-backup [--config-root <absolute-path>] \
     validate [--allow-missing-project-paths]
   server-infra-backup [--config-root <absolute-path>] init
-  server-infra-backup [--config-root <absolute-path>] run
-  server-infra-backup [--config-root <absolute-path>] status
+  server-infra-backup [--config-root <absolute-path>] [--source <name>] run
+  server-infra-backup [--config-root <absolute-path>] [--source <name>] status
   server-infra-backup [--config-root <absolute-path>] retention
   server-infra-backup [--config-root <absolute-path>] check
   server-infra-backup [--config-root <absolute-path>] restore \
@@ -72,7 +74,10 @@ Operations:
              Compose file, and Docker availability checks during VM recovery.
   init       Explicitly initialize the configured restic repository.
   run        Create configuration and data snapshots, then optionally retain.
+             --source limits the data snapshot and freshness validation to one
+             installed project source.
   status     Display the latest remote configuration and data snapshots.
+             --source displays the latest snapshot for one project source.
   retention  Apply the configured retention policy explicitly.
   check      Check repository metadata integrity.
   restore    Restore one tagged snapshot into an absent or empty directory.
@@ -406,6 +411,7 @@ discover_source_configuration() {
   PATHS_FILES=("$PATHS_FILE")
   EXCLUDES_FILES=("$EXCLUDES_FILE")
   FRESHNESS_FILES=("$FRESHNESS_FILE")
+  PROJECT_SOURCE_NAMES=()
 
   [[ -e "$SOURCES_ROOT" ]] || return 0
   [[ -d "$SOURCES_ROOT" && ! -L "$SOURCES_ROOT" ]] || \
@@ -418,9 +424,15 @@ discover_source_configuration() {
       fail "Backup sources root must be owned by root:root"
   fi
 
-  shopt -s nullglob
-  source_dirs=("$SOURCES_ROOT"/*)
-  shopt -u nullglob
+  if [[ -n "$SOURCE_FILTER" ]]; then
+    [[ "$SOURCE_FILTER" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || \
+      fail "Invalid backup source name: $SOURCE_FILTER"
+    source_dirs=("$SOURCES_ROOT/$SOURCE_FILTER")
+  else
+    shopt -s nullglob
+    source_dirs=("$SOURCES_ROOT"/*)
+    shopt -u nullglob
+  fi
 
   for source_dir in "${source_dirs[@]}"; do
     source_name="${source_dir##*/}"
@@ -453,7 +465,12 @@ discover_source_configuration() {
     PATHS_FILES+=("$source_dir/paths")
     EXCLUDES_FILES+=("$source_dir/excludes")
     FRESHNESS_FILES+=("$source_dir/freshness")
+    PROJECT_SOURCE_NAMES+=("$source_name")
   done
+
+  if [[ -n "$SOURCE_FILTER" && ${#PROJECT_SOURCE_NAMES[@]} -eq 0 ]]; then
+    fail "Backup source is not installed: $SOURCE_FILTER"
+  fi
 }
 
 file_mode() {
@@ -853,14 +870,27 @@ run_restic() {
   restic "$@"
 }
 
+data_tag() {
+  if [[ -n "$SOURCE_FILTER" ]]; then
+    printf 'server-infra-project-%s\n' "$SOURCE_FILTER"
+  else
+    printf '%s\n' "$DATA_TAG"
+  fi
+}
+
 apply_retention() {
   local tag_name
   local retention_args=()
+  local retention_tags=("$CONFIG_TAG" "$DATA_TAG")
+  local source_name
 
   [[ "$BACKUP_RETENTION_ENABLED" == "true" ]] || \
     fail "Retention is disabled by BACKUP_RETENTION_ENABLED"
 
-  for tag_name in "$CONFIG_TAG" "$DATA_TAG"; do
+  for source_name in "${PROJECT_SOURCE_NAMES[@]}"; do
+    retention_tags+=("server-infra-project-$source_name")
+  done
+  for tag_name in "${retention_tags[@]}"; do
     retention_args=(
       forget
       --host "$SERVER_INFRA_INSTANCE"
@@ -892,6 +922,7 @@ run_init() {
 run_backup() {
   local excludes_args=()
   local excludes_file
+  local active_data_tag
 
   CURRENT_OPERATION="run"
   load_configuration
@@ -918,9 +949,10 @@ run_backup() {
   for excludes_file in "${EXCLUDES_FILES[@]}"; do
     excludes_args+=(--exclude-file "$excludes_file")
   done
+  active_data_tag="$(data_tag)"
   run_restic backup \
     --host "$SERVER_INFRA_INSTANCE" \
-    --tag "$DATA_TAG" \
+    --tag "$active_data_tag" \
     "${excludes_args[@]}" \
     "${DATA_PATHS[@]}"
 
@@ -937,6 +969,8 @@ run_backup() {
 }
 
 run_status() {
+  local active_data_tag
+
   CURRENT_OPERATION="status"
   load_configuration
   require_command restic
@@ -948,9 +982,10 @@ run_status() {
     --tag "$CONFIG_TAG" \
     --latest 1
   printf '%s\n' 'Data snapshot (latest):'
+  active_data_tag="$(data_tag)"
   run_restic snapshots \
     --host "$SERVER_INFRA_INSTANCE" \
-    --tag "$DATA_TAG" \
+    --tag "$active_data_tag" \
     --latest 1
   ok "remote snapshots inspected"
 }
@@ -1046,7 +1081,7 @@ restore_snapshot() {
       tag_name="$CONFIG_TAG"
       ;;
     data)
-      tag_name="$DATA_TAG"
+      tag_name="$(data_tag)"
       ;;
     *)
       fail "Restore kind must be config or data"
@@ -1178,6 +1213,7 @@ parse_arguments() {
   local restore_kind_set=0
   local restore_include_set=0
   local allow_missing_project_paths_set=0
+  local source_filter_set=0
 
   while (($# > 0)); do
     case "$1" in
@@ -1195,6 +1231,23 @@ parse_arguments() {
         CONFIG_ROOT="${1#*=}"
         [[ -n "$CONFIG_ROOT" ]] || fail "Missing value for --config-root"
         config_root_set=1
+        shift
+        ;;
+      --source)
+        (($# >= 2)) || fail "Missing value for --source"
+        [[ "$source_filter_set" == "0" ]] || \
+          fail "--source may be specified only once"
+        SOURCE_FILTER="$2"
+        [[ -n "$SOURCE_FILTER" ]] || fail "Missing value for --source"
+        source_filter_set=1
+        shift 2
+        ;;
+      --source=*)
+        [[ "$source_filter_set" == "0" ]] || \
+          fail "--source may be specified only once"
+        SOURCE_FILTER="${1#*=}"
+        [[ -n "$SOURCE_FILTER" ]] || fail "Missing value for --source"
+        source_filter_set=1
         shift
         ;;
       --target)
@@ -1327,6 +1380,14 @@ main() {
   if [[ "$OPERATION" != "validate" && \
     "$ALLOW_MISSING_PROJECT_PATHS" == "1" ]]; then
     fail "--allow-missing-project-paths is supported only by validate"
+  fi
+  if [[ -n "$SOURCE_FILTER" && "$OPERATION" != "run" && \
+    "$OPERATION" != "status" && "$OPERATION" != "restore" ]]; then
+    fail "--source is supported only by run, status, and restore"
+  fi
+  if [[ -n "$SOURCE_FILTER" && "$OPERATION" == "restore" && \
+    "$RESTORE_KIND" != "data" ]]; then
+    fail "--source is supported only by data restore"
   fi
 
   case "$OPERATION" in

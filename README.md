@@ -190,6 +190,7 @@ application checkout:
 
 ```bash
 sudo server-infra-backup project dump
+sudo server-infra-backup project snapshot
 sudo server-infra-backup project status
 sudo server-infra-backup project logs
 sudo server-infra-backup project restore-db \

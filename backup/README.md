@@ -338,6 +338,7 @@ Run the producer manually:
 ```bash
 cd /opt/my-app
 sudo server-infra-backup project dump
+sudo server-infra-backup project snapshot
 sudo server-infra-backup project status
 sudo server-infra-backup project logs
 sudo server-infra-backup project restore-db \
@@ -352,6 +353,14 @@ installed source explicitly with `--name my-app`. `status` reports both the
 generated service and timer; `logs` prints the latest 100 service journal
 entries. The full systemd unit names remain available for low-level
 troubleshooting.
+
+`project snapshot` is the deploy-safe operation for a PostgreSQL source. It
+creates that source's fresh dump and writes an off-site snapshot tagged
+`server-infra-project-<project>`. It validates only that source's freshness
+marker, so a deployment is not blocked by an unrelated project whose scheduled
+dump is stale. The daily `server-infra-backup run` remains a whole-host backup:
+it checks every installed project's marker and writes the shared
+`server-infra-data` snapshot.
 
 `restore-db` selects the latest data snapshot by default. Use
 `--snapshot <id>` for a specific snapshot. It extracts only this project's

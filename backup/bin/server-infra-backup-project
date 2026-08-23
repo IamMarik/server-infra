@@ -80,6 +80,7 @@ Usage:
   server-infra-backup project recovery-list [--config-root <absolute-path>]
   server-infra-backup project remove --name <name> [--check]
   server-infra-backup project dump [--name <name> | --manifest <directory>]
+  server-infra-backup project snapshot [--name <name> | --manifest <directory>]
   server-infra-backup project status [--name <name> | --manifest <directory>]
   server-infra-backup project logs [--name <name> | --manifest <directory>]
   server-infra-backup project restore-db \
@@ -120,7 +121,7 @@ Remove options:
   --config-root <path>        Default: /etc/server-infra.
   --check                     Print the removal plan without changes.
 
-Dump, status, logs, and restore-db options:
+Dump, snapshot, status, logs, and restore-db options:
   --name <kebab-case>         Installed source name. When omitted, read it from
                               $PWD/.server-infra/backup/source.conf.
   --manifest <directory>      Project manifest used to resolve the source name.
@@ -1019,11 +1020,15 @@ write_project_readme() {
     mode_description="Files plus a PostgreSQL custom-format dump from Docker Compose."
     producer_commands=(
       'sudo server-infra-backup project dump'
+      'sudo server-infra-backup project snapshot'
       'sudo server-infra-backup project status'
       'sudo server-infra-backup project logs'
       'sudo server-infra-backup project restore-db --target-db <new-database>'
     )
     producer_notes=(
+      ''
+      '`snapshot` creates a fresh dump and off-site snapshot for this project'
+      'without requiring other project sources to have fresh dumps.'
       ''
       '`restore-db` restores into a new database and refuses the configured'
       'source database or an existing target. Validate the restored database'
@@ -1733,6 +1738,23 @@ run_project_dump() {
   ok "PostgreSQL dump completed: $SOURCE_NAME"
 }
 
+run_project_snapshot() {
+  local snapshot_source_name
+
+  resolve_installed_postgres_source
+  snapshot_source_name="$SOURCE_NAME"
+  [[ -x "$BACKUP_EXECUTABLE" ]] || \
+    fail "Backup executable not found: $BACKUP_EXECUTABLE"
+
+  run_project_dump
+  log "Creating isolated backup snapshot for $snapshot_source_name"
+  "$BACKUP_EXECUTABLE" \
+    --config-root "$CONFIG_ROOT" \
+    --source "$snapshot_source_name" \
+    run
+  ok "Project backup snapshot completed: $snapshot_source_name"
+}
+
 run_project_status() {
   resolve_installed_postgres_source
   require_command systemctl
@@ -2297,6 +2319,10 @@ main() {
       else
         run_project_dump
       fi
+      ;;
+    snapshot)
+      parse_arguments "$@"
+      run_project_snapshot
       ;;
     status)
       parse_arguments "$@"

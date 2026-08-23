@@ -137,6 +137,10 @@ set -Eeuo pipefail
 printf '%s ' "$@" >> "$FAKE_BACKUP_RESTORE_LOG"
 printf '\n' >> "$FAKE_BACKUP_RESTORE_LOG"
 
+if [[ " $* " == *" run " ]]; then
+  exit 0
+fi
+
 target=""
 while (($# > 0)); do
   if [[ "$1" == "--target" ]]; then
@@ -332,6 +336,9 @@ assert_contains \
   "sudo server-infra-backup project dump"
 assert_contains \
   "$MANIFEST_DIR/README.md" \
+  "sudo server-infra-backup project snapshot"
+assert_contains \
+  "$MANIFEST_DIR/README.md" \
   "sudo server-infra-backup project restore-db"
 
 "$INTERNAL_HELPER" dump --source-config "$MANIFEST_DIR/source.conf"
@@ -448,6 +455,7 @@ chmod 0600 \
   "$CLI" project dump --config-root "$CONFIG_ROOT"
   "$CLI" project status --config-root "$CONFIG_ROOT"
   "$CLI" project logs --config-root "$CONFIG_ROOT"
+  "$CLI" project snapshot --config-root "$CONFIG_ROOT"
   "$CLI" project restore-db \
     --config-root "$CONFIG_ROOT" \
     --target-db test_restore \
@@ -496,6 +504,9 @@ assert_contains \
 assert_contains \
   "$JOURNALCTL_LOG" \
   "--unit server-infra-backup-project-my-app.service --lines 100"
+assert_contains \
+  "$BACKUP_RESTORE_LOG" \
+  "--config-root $CONFIG_ROOT --source my-app run"
 assert_contains \
   "$BACKUP_RESTORE_LOG" \
   "restore --kind data --snapshot abcdef12 --include $STAGING_ROOT/my-app/postgres.dump"
@@ -568,5 +579,16 @@ assert_contains "$RESTIC_LOG" "$STAGING_ROOT/my-app"
 assert_contains \
   "$RESTIC_LOG" \
   "--exclude-file $CONFIG_ROOT/backup/sources.d/my-app/excludes"
+
+touch -t 200001010000 "$STAGING_ROOT/my-app/postgres.complete"
+if "$CLI" --config-root "$CONFIG_ROOT" run; then
+  fail_test "Global backup unexpectedly accepted a stale project marker"
+fi
+: > "$RESTIC_LOG"
+"$CLI" --config-root "$CONFIG_ROOT" --source files-app run
+assert_contains "$RESTIC_LOG" "--tag server-infra-project-files-app"
+if grep -F -- "$PROJECT_ROOT/config" "$RESTIC_LOG" >/dev/null; then
+  fail_test "Targeted backup included an unrelated project source"
+fi
 
 printf '[backup-project-test][ok] wizard, dump, and source aggregation passed\n'
