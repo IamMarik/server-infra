@@ -197,7 +197,7 @@ mkdir -p "$TMPFILES_ROOT"
 printf '%s\n' \
   "d $LOCK_ROOT 0750 root root -" \
   > "$TMPFILES_CONFIG"
-configure_runtime_directory_persistence
+configure_runtime_directory_persistence "$LOCK_ROOT" "$TMPFILES_ROOT"
 prepare_runtime_roots
 for managed_root in "$LOCK_ROOT" "$STATE_ROOT" "$CACHE_ROOT"; do
   [[ -d "$managed_root" ]] || \

@@ -147,6 +147,13 @@ sudo ./scripts/deploy.sh --check
 sudo ./scripts/deploy.sh --apply
 ```
 
+Layout installation and host-module apply also install the shared
+`/etc/tmpfiles.d/server-infra.conf` rule and create `/run/server-infra` with
+owner `root:root` and mode `0750`. systemd-tmpfiles recreates this directory
+after reboot. Existing hosts receive the rule through the ordinary install or
+deploy path; rerunning the full clean-host bootstrap is unnecessary. Check
+mode does not install the rule or create directories.
+
 Apply installs the public CLI, internal helpers, and systemd units. Initialize
 the remote repository explicitly and create the first backup:
 
@@ -538,6 +545,11 @@ application that stages such a dump must own and document that import test.
 - `project restore-db` restores only into a new database; production cutover
   and application-level verification remain owned by the application.
 - A deployment or another backup operation prevents a concurrent backup.
+- `Runtime lock root not found: /run/server-infra` after reboot can indicate
+  an older installation without the tmpfiles rule. Update the checkout and
+  apply `sudo ./scripts/install.sh --module backup --apply` to install the rule
+  and prepare the shared root without starting backup jobs. Review a conflicting
+  existing rule explicitly; never remove active locks or bypass lock checks.
 - Push URLs must be HTTPS base URLs without query parameters.
 - `check` validates repository metadata only. A full `--read-data` scan is an
   intentionally separate operator decision because it downloads all pack

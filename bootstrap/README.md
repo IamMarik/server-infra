@@ -28,7 +28,10 @@ The implementation is `scripts/bootstrap.sh`. It provides:
 - shared roots under `/run`, `/var/lib`, and `/var/cache`.
 
 The `/run/server-infra` root is declared through
-`/etc/tmpfiles.d/server-infra.conf` so it is recreated after reboot.
+`/etc/tmpfiles.d/server-infra.conf` so it is recreated after reboot. The ordinary
+layout installer and host-module deployment install the same rule, including
+on existing hosts that have not run clean-host bootstrap. An existing different
+rule or symlink is rejected; active lock directories are never cleared.
 
 Docker is installed from the
 [official Docker apt repository](https://docs.docker.com/engine/install/)
@@ -99,11 +102,14 @@ Run the isolated contract test without package installation or network access:
 
 ```bash
 ./bootstrap/tests/test-bootstrap.sh
+./bootstrap/tests/test-runtime-directory.sh
 ```
 
 The test covers supported distribution detection, repeatable Docker repository
 configuration, runtime roots, and the guarantee that bootstrap does not create
-`/etc/server-infra` or operator accounts.
+`/etc/server-infra` or operator accounts. Runtime-directory tests use command
+doubles and temporary paths to cover boot-rule replay, active locks, conflicting
+rules, symlinks, and read-only check modes without changing host services.
 
 ## Troubleshooting
 

@@ -27,7 +27,8 @@ are read from that file without executing it.
 
 Operations:
   --check  Validate prerequisites and show the intended layout without changes.
-  --apply  Prepare the host layout. Requires Linux and root.
+  --apply  Prepare the host layout and reboot-persistent lock root.
+           Requires Linux, root, and systemd-tmpfiles.
 
 Options:
   --install-examples  Atomically install repository examples as *.example.
@@ -291,7 +292,7 @@ apply_install_plan() {
   require_command rmdir
   require_command rm
 
-  install_directory "$RUN_ROOT"
+  configure_runtime_directory_persistence "$RUN_ROOT"
   acquire_deployment_lock "$RUN_ROOT"
 
   install_directory "$CONFIG_ROOT"
@@ -400,4 +401,6 @@ main() {
   apply_install_plan
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

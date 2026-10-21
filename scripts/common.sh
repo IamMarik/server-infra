@@ -125,6 +125,50 @@ require_command() {
   command -v "$command_name" >/dev/null 2>&1 || fail "Required command not found: $command_name"
 }
 
+# Shared by bootstrap and ordinary install/deploy paths, including older hosts.
+# A subshell keeps temporary-file cleanup separate from the caller's lock trap.
+configure_runtime_directory_persistence() (
+  local lock_root="${1:-/run/server-infra}"
+  local tmpfiles_root="${2:-/etc/tmpfiles.d}"
+  local tmpfiles_config="$tmpfiles_root/server-infra.conf"
+  local temporary_file
+  local command_name
+
+  [[ "$lock_root" == /* && "$lock_root" != "/" && \
+    "$lock_root" != *[[:space:]%]* ]] || \
+    fail "Runtime lock root must be an absolute tmpfiles-safe directory path"
+  [[ ! -L "$lock_root" ]] || \
+    fail "Runtime lock root must not be a symlink: $lock_root"
+  [[ ! -e "$lock_root" || -d "$lock_root" ]] || \
+    fail "Runtime lock root is not a directory: $lock_root"
+  [[ "$tmpfiles_root" == /* && ! -L "$tmpfiles_root" ]] || \
+    fail "systemd-tmpfiles configuration directory must be absolute and not a symlink"
+  if [[ -e "$tmpfiles_config" || -L "$tmpfiles_config" ]]; then
+    [[ -f "$tmpfiles_config" && ! -L "$tmpfiles_config" ]] || \
+      fail "server-infra tmpfiles configuration is not a regular file"
+  fi
+  for command_name in install mktemp cmp chmod chown mv rm systemd-tmpfiles; do
+    require_command "$command_name"
+  done
+
+  install -d -o root -g root -m 0755 "$tmpfiles_root"
+  temporary_file="$(mktemp "$tmpfiles_root/.server-infra.conf.XXXXXX")"
+  trap 'rm -f -- "$temporary_file"' EXIT
+  printf '%s\n' "d $lock_root 0750 root root -" > "$temporary_file"
+
+  if [[ -f "$tmpfiles_config" ]]; then
+    cmp -s "$temporary_file" "$tmpfiles_config" || \
+      fail "Existing server-infra tmpfiles configuration differs from the runtime contract"
+  else
+    chown root:root "$temporary_file"
+    chmod 0644 "$temporary_file"
+    mv -f -- "$temporary_file" "$tmpfiles_config"
+  fi
+
+  # 'd' creates the shared root without removing active lock subdirectories.
+  systemd-tmpfiles --create "$tmpfiles_config"
+)
+
 release_deployment_lock() {
   if [[ -n "${DEPLOYMENT_LOCK_DIR:-}" && -d "$DEPLOYMENT_LOCK_DIR" ]]; then
     rmdir "$DEPLOYMENT_LOCK_DIR" 2>/dev/null || \

@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
 source "$SCRIPT_DIR/common.sh"
 
+RUN_ROOT="/run/server-infra"
 HOST_EXEC_ROOT="/usr/local/libexec/server-infra"
 HOST_COMMAND_ROOT="/usr/local/bin"
 SYSTEMD_UNIT_ROOT="/etc/systemd/system"
@@ -223,6 +224,8 @@ prepare_external_tools() {
     require_command mv
     require_command rm
     require_command systemctl
+    require_command systemd-tmpfiles
+    require_command cmp
 
     for module_name in "${EXTERNAL_MODULES[@]}"; do
       [[ "$(module_driver "$module_name")" == "host" ]] || continue
@@ -479,7 +482,10 @@ deploy_external_environment() {
     return
   fi
 
-  acquire_deployment_lock "/run/server-infra"
+  if [[ "$EXTERNAL_HAS_HOST" == "1" ]]; then
+    configure_runtime_directory_persistence "$RUN_ROOT"
+  fi
+  acquire_deployment_lock "$RUN_ROOT"
 
   if [[ "$EXTERNAL_HAS_COMPOSE" == "1" ]]; then
     ensure_docker_network "server-infra"
@@ -592,4 +598,6 @@ main() {
   deploy_legacy_environment "$environment_name"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

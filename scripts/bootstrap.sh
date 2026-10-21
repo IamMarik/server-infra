@@ -21,7 +21,6 @@ HOST_CODENAME=""
 HOST_ARCHITECTURE=""
 TEMP_KEY_FILE=""
 TEMP_SOURCE_FILE=""
-TEMP_TMPFILES_FILE=""
 
 usage() {
   cat <<'USAGE'
@@ -309,11 +308,6 @@ cleanup_bootstrap() {
   fi
   TEMP_SOURCE_FILE=""
 
-  if [[ -n "$TEMP_TMPFILES_FILE" && -f "$TEMP_TMPFILES_FILE" ]]; then
-    rm -f -- "$TEMP_TMPFILES_FILE"
-  fi
-  TEMP_TMPFILES_FILE=""
-
   release_deployment_lock
 }
 
@@ -394,25 +388,6 @@ install_docker_if_missing() {
     fail "Docker Engine or Docker Compose is unavailable after installation"
 }
 
-configure_runtime_directory_persistence() {
-  [[ ! -L "$TMPFILES_ROOT" ]] || \
-    fail "systemd-tmpfiles configuration directory must not be a symlink"
-  install -d -o root -g root -m 0755 "$TMPFILES_ROOT"
-  TEMP_TMPFILES_FILE="$(
-    mktemp "$TMPFILES_ROOT/.server-infra.conf.bootstrap.XXXXXX"
-  )"
-  printf '%s\n' \
-    "d $LOCK_ROOT 0750 root root -" \
-    > "$TEMP_TMPFILES_FILE"
-  chmod 0600 "$TEMP_TMPFILES_FILE"
-  install_or_validate_managed_file \
-    "$TEMP_TMPFILES_FILE" \
-    "$TMPFILES_CONFIG" \
-    "server-infra tmpfiles configuration"
-  TEMP_TMPFILES_FILE=""
-  systemd-tmpfiles --create "$TMPFILES_CONFIG"
-}
-
 prepare_runtime_roots() {
   install_managed_directory "$LOCK_ROOT"
   install_managed_directory "$STATE_ROOT"
@@ -452,7 +427,7 @@ run_apply() {
   install_repository_tools_if_missing
   require_command cmp
   install_docker_if_missing
-  configure_runtime_directory_persistence
+  configure_runtime_directory_persistence "$LOCK_ROOT" "$TMPFILES_ROOT"
   prepare_runtime_roots
 
   ensure_docker_service_ready

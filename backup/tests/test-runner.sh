@@ -268,4 +268,25 @@ fi
 assert_contains "$CURL_LOG" "status=down"
 assert_contains "$CURL_LOG" "Repository check failed on test-server"
 
+# Provisioning the boot rule must not make the backup CLI silently repair or
+# follow an unsafe runtime root. It still fails before any restic operation.
+write_runtime "" "" ""
+: > "$RESTIC_LOG"
+mv "$LOCK_ROOT" "$LOCK_ROOT.saved"
+if "$RUNNER" --config-root "$CONFIG_ROOT" check > "$TEST_ROOT/missing-lock.log" 2>&1; then
+  fail_test "Backup accepted a missing runtime root"
+fi
+assert_contains "$TEST_ROOT/missing-lock.log" "Runtime lock root not found"
+[[ ! -e "$LOCK_ROOT" && ! -s "$RESTIC_LOG" ]] || \
+  fail_test "Backup repaired a missing root or invoked restic"
+ln -s "$LOCK_ROOT.saved" "$LOCK_ROOT"
+if "$RUNNER" --config-root "$CONFIG_ROOT" check > "$TEST_ROOT/symlink-lock.log" 2>&1; then
+  fail_test "Backup accepted a symlink runtime root"
+fi
+assert_contains "$TEST_ROOT/symlink-lock.log" "Runtime lock root not found"
+[[ -L "$LOCK_ROOT" && ! -s "$RESTIC_LOG" ]] || \
+  fail_test "Backup changed a symlink root or invoked restic"
+rm "$LOCK_ROOT"
+mv "$LOCK_ROOT.saved" "$LOCK_ROOT"
+
 printf '[backup-test][ok] optional monitoring, safety, and lifecycle checks passed\n'
